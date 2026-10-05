@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Stop and destroy a client's devbox container. Only ever touches a container
 # tagged devbox, in the devbox VMID range, whose hostname is the client's.
+# First, inside the box, `devbox logout` deletes the box's SSH keys from
+# GitHub and logs it out of tailscale.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
@@ -9,17 +11,23 @@ source "$ROOT/lib/pve.sh"
 
 usage() {
   cat <<EOF
-Usage: devbox-destroy <client>
+Usage: devbox-destroy [--skip-logout] <client>
 
 Stop and destroy the devbox container for clients/<client>.yaml on
-\$DEVBOX_HOST (required). Exits 0 when there is none.
+\$DEVBOX_HOST (required). Exits 0 when there is none. First runs
+\`devbox logout\` in the box (starting it if stopped): deletes its SSH keys
+from GitHub and logs it out of tailscale.
+
+  --skip-logout  destroy without it, for a box too broken to run it; then
+                 delete its keys (titled with its hostname) on GitHub by hand
 EOF
 }
 
 main() {
-  local client=""
+  local client="" logout=true
   while (($#)); do
     case "$1" in
+      --skip-logout) logout=false ;;
       -h | --help) usage; exit 0 ;;
       -*) usage >&2; die "unknown option: $1" ;;
       *) [[ -z $client ]] || die "expected one client, got '$client' and '$1'"; client="$1" ;;
@@ -39,6 +47,17 @@ main() {
 
   assert_devbox "$vmid" "$hostname"
   status="$(pve pct status "$vmid")"
+  if $logout; then
+    if [[ $status != "status: running" ]]; then
+      say "starting $hostname (VMID $vmid) to log it out"
+      pve pct start "$vmid"
+      status="status: running"
+    fi
+    say "logging $hostname out: GitHub keys, tailscale"
+    # A box whose bootstrap never got as far as installing devbox has nothing to log out.
+    pve pct exec "$vmid" -- bash -c '[[ ! -x /usr/local/bin/devbox ]] || exec /usr/local/bin/devbox logout' ||
+      die "could not log $hostname out; fix it and retry, or pass --skip-logout"
+  fi
   if [[ $status != "status: stopped" ]]; then
     say "stopping $hostname (VMID $vmid)"
     pve pct stop "$vmid"

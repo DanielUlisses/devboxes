@@ -1,6 +1,7 @@
 # shellcheck shell=bash
 # Devbox shell, from dotfiles/bash in the devboxes repo (stowed by devbox
 # bootstrap). Machine-specific additions go in ~/.bashrc.local.
+export EDITOR=nvim VISUAL=nvim
 [[ $- != *i* ]] && return
 
 HISTSIZE=50000
@@ -10,6 +11,11 @@ shopt -s histappend checkwinsize
 
 export PATH="$HOME/.local/bin:$PATH"
 command -v mise >/dev/null && eval "$(mise activate bash)"
+# The client's 1Password service account, stored by `devbox login`.
+if [[ -r ~/.config/op/service-account-token ]]; then
+  OP_SERVICE_ACCOUNT_TOKEN="$(<~/.config/op/service-account-token)"
+  export OP_SERVICE_ACCOUNT_TOKEN
+fi
 
 [[ -r /usr/share/bash-completion/bash_completion ]] && source /usr/share/bash-completion/bash_completion
 if [[ -r /usr/share/git/completion/git-prompt.sh ]]; then
