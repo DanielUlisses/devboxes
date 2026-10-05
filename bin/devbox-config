@@ -1,31 +1,50 @@
 #!/usr/bin/env bash
-# Print a client's resolved devbox config: defaults.yaml merged with
-# clients/<client>.yaml. Exits non-zero, naming each bad field, when either
-# file is invalid.
+# Print a client's resolved devbox config: defaults.yaml merged with the
+# client's file, clients/<client>.yaml in the private devbox-clients checkout
+# ($DEVBOX_CLIENTS). Exits non-zero, naming each bad field, when either file
+# is invalid.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
 DEFAULTS="$ROOT/defaults.yaml"
-CLIENTS="$ROOT/clients"
+# Client files live in the private devbox-clients checkout; only
+# underscore-prefixed ones (the template) live in this public repo.
+CLIENTS_CHECKOUT="${DEVBOX_CLIENTS:-$ROOT/../devbox-clients}"
+CLIENTS="$CLIENTS_CHECKOUT/clients"
+PUBLIC_CLIENTS="$ROOT/clients"
 
 usage() {
   cat <<EOF
 Usage: devbox-config [--json] <client>
 
-Print the resolved config for clients/<client>.yaml, merged over
-defaults.yaml, as YAML (or JSON with --json).
+Print the resolved config for <client>, merged over defaults.yaml, as YAML
+(or JSON with --json). Client files are clients/<client>.yaml in the
+devbox-clients checkout at \$DEVBOX_CLIENTS (default ../devbox-clients next
+to this repo); _template resolves from this repo.
 
-Clients:
+Clients in $(display "$CLIENTS"):
 EOF
   local f
   for f in "$CLIENTS"/[!_]*.yaml; do
-    [[ -e $f ]] && printf '  %s\n' "$(basename "$f" .yaml)"
+    [[ ! -e $f ]] || printf '  %s\n' "$(basename "$f" .yaml)"
   done
 }
 
 die() {
   printf 'devbox-config: %s\n' "$*" >&2
   exit 1
+}
+
+# A path as messages show it: relative to this repo, or to the directory
+# holding the clients checkout (devbox-clients/clients/<client>.yaml).
+display() {
+  local path parent
+  path="$(readlink -m "$1")"
+  parent="$(dirname "$(readlink -m "$CLIENTS_CHECKOUT")")"
+  case "$path" in
+    "$ROOT"/*) printf '%s' "${path#"$ROOT"/}" ;;
+    *) printf '%s' "${path#"$parent"/}" ;;
+  esac
 }
 
 require_tools() {
@@ -39,9 +58,9 @@ require_tools() {
 # YAML file -> JSON on stdout. An empty file reads as null.
 to_json() {
   local out
-  out="$(yq -o=json '.' "$1" 2>&1)" || die "${1#"$ROOT"/}: invalid YAML: $out"
+  out="$(yq -o=json '.' "$1" 2>&1)" || die "$(display "$1"): invalid YAML: $out"
   [[ $(yq 'di' "$1" | wc -l) -le 1 ]] ||
-    die "${1#"$ROOT"/}: must hold a single YAML document (found a '---' separator)"
+    die "$(display "$1"): must hold a single YAML document (found a '---' separator)"
   printf '%s\n' "${out:-null}"
 }
 
@@ -103,7 +122,7 @@ if . == null then {} else . end
 
     (paths(type == "string") as $p | getpath($p)
       | select(test("[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}"))
-      | err($p | path_str; "looks like an email address; this repo is public"))
+      | err($p | path_str; "looks like an email address; config files hold none"))
   end
 '
 
@@ -118,11 +137,12 @@ def strip_nulls: if type == "object" then with_entries(select(.value != null) | 
 | {hostname, claude_account, resources, packages, tools, skills, repos}
 '
 
-# Prints the errors of one file, prefixed with its repo-relative path.
+# Prints the errors of one file, prefixed with its displayed path.
 validate() {
-  local file="$1" json="$2" required="$3"
+  local file="$1" json="$2" required="$3" prefix
+  prefix="$(display "$file")"
   jq -r --argjson required "$required" "$VALIDATE" <<<"$json" |
-    sed "s|^|${file#"$ROOT"/}: |"
+    sed "s|^|$prefix: |"
 }
 
 main() {
@@ -138,14 +158,25 @@ main() {
   done
   [[ -n $client ]] || { usage >&2; exit 1; }
 
-  local file="$CLIENTS/$client.yaml"
-  [[ -f $file ]] || { usage >&2; die "no such client: $client (looked for clients/$client.yaml)"; }
-
   # Underscore-prefixed files (the template) are not clients; their hostname
   # derives from the name without the underscore.
   local name="${client#_}"
   [[ $name =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ && ${#name} -le 59 ]] ||
     die "client name '$client' must be lowercase letters, digits and inner dashes, max 59 chars"
+
+  local file
+  if [[ $client == _* ]]; then
+    file="$PUBLIC_CLIENTS/$client.yaml"
+  else
+    # This repo is public: a client's file here would publish its name.
+    [[ ! -e $PUBLIC_CLIENTS/$client.yaml ]] ||
+      die "clients/$client.yaml is in the public devboxes repo; move it to the devbox-clients repo"
+    file="$CLIENTS/$client.yaml"
+  fi
+  [[ -f $file ]] || {
+    usage >&2
+    die "no such client: $client (looked for $(display "$file"); set DEVBOX_CLIENTS to the devbox-clients checkout)"
+  }
 
   require_tools
 
