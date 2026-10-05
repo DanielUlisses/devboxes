@@ -2,11 +2,13 @@
 # The devbox command, run inside a devbox. `devbox bootstrap` sets up a fresh
 # box (bootstrap.sh hands over to it) and ends with a sync. `devbox sync`
 # converges the box to its client's resolved config: pacman packages, mise
-# tools and cloned repos. Both run as root, re-running themselves under sudo
-# when needed. `devbox login`, `finish` and `logout` run as the box user (root
-# hands them over): the manual logins, then the per-box key, skills and repos,
-# and the cleanup bin/devbox-destroy runs before destroying the box. `devbox
-# rc` starts Claude Remote Control in a new herdr pane in ~/work.
+# tools and cloned repos, then (once `finish` has run) `devbox update`. Both
+# run as root, re-running themselves under sudo when needed. `devbox login`,
+# `finish`, `update` and `logout` run as the box user (root hands them over):
+# the manual logins, then the per-box key, skills and repos, bringing what
+# those installed current, and the cleanup bin/devbox-destroy runs before
+# destroying the box. `devbox rc` starts Claude Remote Control in a new herdr
+# pane in ~/work.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
@@ -48,13 +50,16 @@ SKILLS_OWNER=DanielUlisses
 # Skills that are Claude Code plugins from a marketplace, not repos to clone.
 declare -A SKILL_PLUGINS=([mattpocock-skills]=mattpocock-skills@claude-plugins-official)
 OFFICIAL_MARKETPLACE=anthropics/claude-plugins-official
+# Written by `devbox finish`; sync runs `devbox update` only once it exists.
+FINISHED=$USER_HOME/.local/state/devbox/finished
 
 usage() {
   cat <<EOF
 Usage: devbox bootstrap
-       devbox sync [--config-json <json>]
+       devbox sync [--config-json <json>] [--no-pacman-upgrade]
        devbox login
        devbox finish
+       devbox update [--config-json <json>] [--no-pacman-upgrade]
        devbox logout
        devbox rc [<name>]
 
@@ -64,13 +69,17 @@ Run inside a devbox.
              1Password CLI, gh, tailscale, mise, dotfiles), then sync
   sync       converge the box to its client's config: pull the devboxes
              repo, then install and remove pacman packages and mise tools,
-             and clone newly listed repos. --config-json applies a resolved
-             config (bin/devbox-config --json) instead, without pulling;
-             bin/devbox-sync uses it.
+             and clone newly listed repos, then run update once finish
+             has. --config-json applies a resolved config (bin/devbox-config
+             --json) instead, without pulling; bin/devbox-sync uses it.
   login      the manual logins, interactive: tailscale, gh, the client's
              1Password service-account token, Claude
   finish     after login: this box's SSH key on GitHub (auth and signing),
              git identity and signing, skills, the mattpocock plugin, repos
+  update     after finish: bring current what finish and bootstrap installed
+             (skills, plugins, pacman -Syu unless --no-pacman-upgrade, mise
+             "latest" tools, Claude Code, new gh/nvim config files, nvim
+             plugins to lazy-lock.json); sync runs it
   logout     remove this box's SSH keys from GitHub and log out of
              tailscale; bin/devbox-destroy runs it
   rc         inside herdr, as $USER_NAME: open a pane beside this one in
@@ -225,12 +234,19 @@ sync_repos() {
   ((cloned)) || say "repos: up to date"
 }
 
+# $2: --no-pacman-upgrade, passed on to update, or empty.
 sync() {
-  local config
+  local config no_upgrade="${2:-}"
   config="$(resolve_config "${1:-}")"
   sync_packages "$config"
   sync_tools "$config"
   sync_repos "$config"
+  if [[ ! -f $FINISHED ]]; then
+    say "update: skipped until devbox finish has run"
+  # The checkout's devbox, which the pull above may have just changed.
+  elif ! as_user "$ROOT/bin/devbox" update --config-json "$(jq -c . <<<"$config")" ${no_upgrade:+"$no_upgrade"}; then
+    die "synced, but some update steps failed (above)"
+  fi
   say "synced"
 }
 
@@ -339,13 +355,19 @@ git_signing() {
   say "git: signing commits as $(git config -f "$file" user.name) <$email> (${file/#$USER_HOME/\~})"
 }
 
+# Reports a change made by an update step (see run_step); outside update it
+# just says it.
+CHANGES=""
+changed() {
+  say "$*"
+  [[ -z $CHANGES ]] || printf '\n' >>"$CHANGES"
+}
+
 # Installs plugin $1 (<plugin>@<marketplace>) unless it is installed.
 install_plugin() {
-  if claude plugin list --json | jq -e --arg id "$1" '.[] | select(.id == $id)' >/dev/null; then
-    say "plugin: $1 already installed"
-  else
-    claude plugin install "$1"
-  fi
+  claude plugin list --json | jq -e --arg id "$1" '.[] | select(.id == $id)' >/dev/null && return
+  claude plugin install "$1" >/dev/null
+  changed "skills: installed plugin $1"
 }
 
 # Adds the marketplace at source $2 (named $1) unless it is configured.
@@ -354,12 +376,14 @@ add_marketplace() {
     claude plugin marketplace add "$2"
 }
 
-# Clones (or fast-forwards) a skill repo into ~/.claude/skill-repos and
-# installs it the way its layout says: its own install.sh, a plugin
-# marketplace, or a single skill (SKILL.md at the root) linked into
-# ~/.claude/skills.
+# Clones (or fast-forwards) a skill repo into ~/.claude/skill-repos and,
+# unless the commit it last installed is still its head, installs it the way
+# its layout says: its own install.sh, a plugin marketplace, or a single skill
+# (SKILL.md at the root) linked into ~/.claude/skills. The installed commit is
+# kept in the clone's .git/devbox-installed, so a failed install is retried.
 install_skill_repo() {
-  local repo="$1" dest="$SKILL_REPOS/${1#*/}" market plugin
+  local repo="$1" dest="$SKILL_REPOS/${1#*/}" market plugin head installed=""
+  local stamp="$dest/.git/devbox-installed"
   if [[ -d $dest/.git ]]; then
     git -C "$dest" pull -q --ff-only || say "skills: could not update ${dest/#$USER_HOME/\~}; using it as is"
   else
@@ -367,11 +391,17 @@ install_skill_repo() {
     mkdir -p "$SKILL_REPOS"
     gh repo clone "$repo" "$dest" -- -q
   fi
+  head="$(git -C "$dest" rev-parse HEAD)"
+  [[ ! -f $stamp ]] || installed="$(<"$stamp")"
+  [[ $installed != "$head" ]] || return 0
+
   if [[ -f $dest/install.sh ]]; then
     bash "$dest/install.sh" >/dev/null
   elif [[ -f $dest/.claude-plugin/marketplace.json ]]; then
     market="$(jq -r .name "$dest/.claude-plugin/marketplace.json")"
     add_marketplace "$market" "$dest"
+    # Already added: re-read it, so plugins new in the repo can be installed.
+    [[ -z $installed ]] || claude plugin marketplace update "$market" >/dev/null
     while IFS= read -r plugin; do
       install_plugin "$plugin@$market"
     done < <(jq -r '.plugins[].name' "$dest/.claude-plugin/marketplace.json")
@@ -381,7 +411,26 @@ install_skill_repo() {
   else
     die "skills: don't know how to install $repo (no install.sh, .claude-plugin/marketplace.json or SKILL.md)"
   fi
-  say "skills: installed $repo"
+  printf '%s\n' "$head" >"$stamp"
+  if [[ -z $installed ]]; then
+    changed "skills: installed $repo"
+  else
+    changed "skills: updated $repo (${installed:0:7}..${head:0:7})"
+  fi
+}
+
+# Installs one entry of the skills: list: a Claude plugin (SKILL_PLUGINS) or
+# a skill repo, <owner>/<repo> or a bare name under SKILLS_OWNER.
+install_skill() {
+  local skill="$1"
+  if [[ -n ${SKILL_PLUGINS[$skill]:-} ]]; then
+    add_marketplace "${SKILL_PLUGINS[$skill]#*@}" "$OFFICIAL_MARKETPLACE"
+    install_plugin "${SKILL_PLUGINS[$skill]}"
+  elif [[ $skill == */* ]]; then
+    install_skill_repo "$skill"
+  else
+    install_skill_repo "$SKILLS_OWNER/$skill"
+  fi
 }
 
 # After login: this box's own SSH key on GitHub for auth and signing, git
@@ -406,18 +455,160 @@ finish() {
   git_signing
 
   while IFS= read -r skill; do
-    if [[ -n ${SKILL_PLUGINS[$skill]:-} ]]; then
-      add_marketplace "${SKILL_PLUGINS[$skill]#*@}" "$OFFICIAL_MARKETPLACE"
-      install_plugin "${SKILL_PLUGINS[$skill]}"
-    elif [[ $skill == */* ]]; then
-      install_skill_repo "$skill"
-    else
-      install_skill_repo "$SKILLS_OWNER/$skill"
-    fi
+    install_skill "$skill"
   done < <(jq -r '.skills[]' <<<"$config")
+  say "skills: installed"
 
   sync_repos "$config"
+  mkdir -p "${FINISHED%/*}"
+  touch "$FINISHED"
   say "finished"
+}
+
+# Runs "$@" in a subshell with errexit on, so a failure ends only that
+# command; its exit status goes in $STATUS. Never call it where a status is
+# tested (if, ||, &&): bash ignores errexit there, subshell included.
+STATUS=0
+isolated() {
+  set +e
+  (
+    set -e
+    "$@"
+  )
+  STATUS=$?
+  set -e
+}
+
+# Runs update step $1, the function and arguments after it, isolated. Says
+# "<step>: up to date" when it reported no change, and adds failed steps to
+# FAILED.
+FAILED=()
+run_step() {
+  local name="$1" before
+  shift
+  before="$(wc -l <"$CHANGES")"
+  isolated "$@"
+  if ((STATUS)); then
+    say "$name: failed"
+    FAILED+=("$name")
+  elif (($(wc -l <"$CHANGES") == before)); then
+    say "$name: up to date"
+  fi
+}
+
+# Every skill repo pulled and re-installed when its head moved; skills newly
+# listed installed. One failing skill doesn't stop the others.
+update_skills() {
+  local config="$1" skill failed=0
+  while IFS= read -r skill; do
+    isolated install_skill "$skill" </dev/null
+    ((STATUS == 0)) || { say "skills: $skill failed"; failed=1; }
+  done < <(jq -r '.skills[]' <<<"$config")
+  ((failed == 0))
+}
+
+# User-scope plugins, "<id> <version>" sorted by id.
+plugin_versions() {
+  claude plugin list --json | jq -r '.[] | select(.scope == "user") | "\(.id) \(.version // "?")"' | sort
+}
+
+# Refreshes the marketplaces, then `claude plugin update`s every plugin
+# installed in user scope.
+update_plugins() {
+  local before id version old
+  claude plugin marketplace update >/dev/null
+  before="$(plugin_versions)"
+  while read -r id _; do
+    claude plugin update "$id" >/dev/null </dev/null
+  done <<<"$before"
+  while read -r id version; do
+    old="$(awk -v id="$id" '$1 == id { print $2 }' <<<"$before")"
+    [[ $old == "$version" ]] || changed "plugins: updated $id (${old:-none} -> $version)"
+  done < <(plugin_versions)
+}
+
+# pacman -Syu: Arch upgrades the whole system together, base packages with it.
+update_pacman() {
+  local before upgraded=()
+  before="$(pacman -Q)"
+  sudo pacman -Syu --noconfirm -q >/dev/null
+  mapfile -t upgraded < <(comm -13 <(printf '%s\n' "$before") <(pacman -Q) | cut -d' ' -f1)
+  ((${#upgraded[@]} == 0)) || changed "pacman: upgraded ${#upgraded[@]} package(s): ${upgraded[*]}"
+}
+
+# mise tools asked for as "latest" (herdr and 1password in the system config,
+# and any client tool@latest) upgraded; versions no config uses pruned.
+update_mise() {
+  local outdated name current latest tools=()
+  outdated="$(mise outdated --json | jq -r 'to_entries[] | select(.value.requested == "latest")
+    | "\(.key) \(.value.current // "none") \(.value.latest)"')"
+  [[ -n $outdated ]] || return 0
+  mapfile -t tools < <(cut -d' ' -f1 <<<"$outdated")
+  MISE_YES=1 mise upgrade "${tools[@]}"
+  MISE_YES=1 mise prune --yes
+  while read -r name current latest; do
+    changed "mise: upgraded $name ($current -> $latest)"
+  done <<<"$outdated"
+}
+
+update_claude() {
+  local before after
+  before="$(claude --version)"
+  claude update >/dev/null
+  after="$(claude --version)"
+  [[ $before == "$after" ]] || changed "claude: updated ${before%% *} -> ${after%% *}"
+}
+
+# The lazy.nvim plugins, "<name> <commit>", one per line.
+nvim_plugin_heads() {
+  local dir
+  for dir in "$USER_HOME"/.local/share/nvim/lazy/*/; do
+    [[ -d $dir.git ]] || continue
+    printf '%s %s\n' "$(basename "$dir")" "$(git -C "$dir" rev-parse --short HEAD)"
+  done
+}
+
+# Puts the nvim plugins at the commits in the box's lazy-lock.json (the one
+# copied from this repo, unless edited on the box).
+update_nvim() {
+  local before out moved=()
+  before="$(nvim_plugin_heads)"
+  # stdin from /dev/null: lazy.lua waits for a key when it can't clone lazy.nvim.
+  if ! out="$(timeout 900 nvim --headless '+Lazy! restore' +qa </dev/null 2>&1)"; then
+    printf '%s\n' "$out" >&2
+    return 1
+  fi
+  mapfile -t moved < <(comm -13 <(printf '%s\n' "$before") <(nvim_plugin_heads) | cut -d' ' -f1)
+  ((${#moved[@]} == 0)) || changed "nvim: ${#moved[@]} plugin(s) restored to lazy-lock.json: ${moved[*]}"
+}
+
+# After finish: brings current what finish and bootstrap installed. Each step
+# reports what it changed (or that it is up to date); a failing step doesn't
+# stop the others, and makes update exit 1 at the end. $2:
+# --no-pacman-upgrade skips pacman -Syu.
+update() {
+  local config="$1" no_upgrade="$2"
+  [[ -f $FINISHED ]] || die "devbox finish has not run on this box yet"
+  [[ -n $config ]] || config="$(local_config)" || exit 1
+  # mise and nvim read config from the current directory too.
+  cd "$USER_HOME"
+  CHANGES="$(mktemp)"
+  trap 'rm -f "$CHANGES"' EXIT
+
+  run_step skills update_skills "$config"
+  run_step plugins update_plugins
+  if [[ -n $no_upgrade ]]; then
+    say "pacman: skipped (--no-pacman-upgrade)"
+  else
+    run_step pacman update_pacman
+  fi
+  run_step mise update_mise
+  run_step claude update_claude
+  run_step configs copy_configs
+  run_step nvim update_nvim
+
+  ((${#FAILED[@]} == 0)) || die "update: failed: ${FAILED[*]}"
+  say "updated"
 }
 
 # Before the box is destroyed: deletes its SSH keys (auth and signing) from
@@ -490,18 +681,26 @@ dotfiles() {
   as_user mkdir -p "$USER_HOME/.config/git"
   as_user stow -d "$repo" -t "$USER_HOME" -R "${DOTFILES_PACKAGES[@]}"
 
-  # An older box has it stowed as a link into the checkout; replace that.
-  local gh_config="$USER_HOME/.config/gh/config.yml"
-  [[ ! -L $gh_config ]] || rm "$gh_config"
-  if [[ ! -e $gh_config ]]; then
-    as_user mkdir -p "${gh_config%/*}"
-    as_user install -m 644 "$ROOT/$GH_CONFIG" "$gh_config"
-  fi
+  # An older box has these stowed as links into the checkout; replace them.
+  [[ ! -L $USER_HOME/.config/gh/config.yml ]] || rm "$USER_HOME/.config/gh/config.yml"
+  [[ ! -L $USER_HOME/.config/nvim ]] || rm "$USER_HOME/.config/nvim"
+  copy_configs
+}
 
-  local nvim_config="$USER_HOME/.config/nvim"
-  [[ ! -L $nvim_config ]] || rm "$nvim_config"
-  as_user mkdir -p "$nvim_config"
-  as_user cp -r --update=none "$ROOT/$NVIM_CONFIG/." "$nvim_config/"
+# The copied configs (gh's config.yml, the nvim config): adds the files in
+# this repo that the box lacks, as the box user; files already there, edited
+# or not, are kept.
+copy_configs() {
+  local pkg rel added
+  for pkg in "$ROOT/${GH_CONFIG%/.config/*}" "$ROOT/${NVIM_CONFIG%/.config/*}"; do
+    added=()
+    while IFS= read -r rel; do
+      [[ -e $USER_HOME/$rel ]] && continue
+      as_user install -D -m 644 "$pkg/$rel" "$USER_HOME/$rel"
+      added+=("$rel")
+    done < <(cd "$pkg" && find . -type f -printf '%P\n' | sort)
+    ((${#added[@]} == 0)) || changed "configs: added ${added[*]/#/\~/}"
+  done
 }
 
 bootstrap() {
@@ -548,16 +747,17 @@ bootstrap() {
 }
 
 main() {
-  local args=("$@") cmd="${1:-}" config_json=""
+  local args=("$@") cmd="${1:-}" config_json="" no_upgrade=""
   [[ -n $cmd ]] || { usage >&2; exit 1; }
   shift
   case "$cmd" in
     -h | --help) usage; exit 0 ;;
     bootstrap | login | finish | logout) (($# == 0)) || die "$cmd takes no arguments" ;;
-    sync)
+    sync | update)
       while (($#)); do
         case "$1" in
           --config-json) (($# >= 2)) || die "--config-json needs a value"; config_json="$2"; shift ;;
+          --no-pacman-upgrade) no_upgrade="$1" ;;
           *) usage >&2; die "unknown argument: $1" ;;
         esac
         shift
@@ -569,8 +769,8 @@ main() {
   [[ -f $STATE/client ]] || die "no client recorded in $STATE/client: is this a devbox? (bootstrap.sh records it)"
 
   case "$cmd" in
-    login | finish | logout)
-      # The logins and keys belong to the box user.
+    login | finish | update | logout)
+      # The logins, keys and what finish installed belong to the box user.
       if ((EUID == 0)); then
         as_user "$0" "${args[@]}"
         exit
@@ -579,6 +779,7 @@ main() {
       case "$cmd" in
         login) login ;;
         finish) finish ;;
+        update) update "$config_json" "$no_upgrade" ;;
         logout) box_logout ;;
       esac
       ;;
@@ -591,7 +792,7 @@ main() {
       ((EUID == 0)) || exec sudo "$0" "${args[@]}"
       case "$cmd" in
         bootstrap) bootstrap ;;
-        sync) sync "$config_json" ;;
+        sync) sync "$config_json" "$no_upgrade" ;;
       esac
       ;;
   esac

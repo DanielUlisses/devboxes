@@ -12,7 +12,7 @@ bin/devbox-config      prints a client's resolved config, or fails naming the ba
 bin/devbox-create      creates, starts and bootstraps a client's container on the Proxmox host
 bin/devbox-sync        syncs a client's box to this checkout's config, from your machine
 bin/devbox-destroy     stops and destroys it
-bin/devbox             runs inside a box: `devbox bootstrap`, `sync`, `login`, `finish`, `logout`, `rc`
+bin/devbox             runs inside a box: `devbox bootstrap`, `sync`, `login`, `finish`, `update`, `logout`, `rc`
 bootstrap.sh           first thing a new box runs: clones this repo, hands over to devbox
 dotfiles/              bash, git, gh and nvim config stowed into every box (no identity, no secrets)
 lib/pve.sh             the one way bin/ scripts talk to the host
@@ -113,8 +113,8 @@ doesn't), clones this repo to
 Every step checks first, so re-running `devbox bootstrap` is safe.
 
 ```
-devbox sync                 # inside the box, as daniel or root
-bin/devbox-sync <client>    # from your machine
+devbox sync [--no-pacman-upgrade]                 # inside the box, as daniel or root
+bin/devbox-sync [--no-pacman-upgrade] <client>    # from your machine
 ```
 
 `devbox sync` pulls the box's branch of this repo and converges the box to
@@ -131,8 +131,40 @@ in your checkout (uncommitted edits included) and runs the sync with it over
   `mise prune`, which drops versions no config uses.
 - **repos:** once gh is logged in, clones listed repos that are missing into
   `~/work/<repo>`. Repos dropped from the list are reported, never deleted.
+- **update:** once `devbox finish` has run, `devbox update` as `daniel`
+  (below).
 
 With nothing changed, a sync installs and removes nothing.
+
+### Keeping a box current: `devbox update`
+
+```
+devbox update [--no-pacman-upgrade]    # inside the box; sync runs it for you
+```
+
+Brings current what `devbox finish` and bootstrap installed. It refuses to
+run before `finish` has (which leaves `~/.local/state/devbox/finished`; a
+box finished before `update` existed needs `devbox finish` once more). Each
+step reports what it changed, or `<step>: up to date`; a failing step is
+reported and the rest still run, then `update` (and the sync) exits 1:
+
+- **skills:** pulls each skill repo and re-runs its install (as `finish`
+  does) when its head moved since the last install, recorded in the clone's
+  `.git/devbox-installed`; a failed install is retried next time. Skills
+  newly listed in the client file are installed.
+- **plugins:** `claude plugin marketplace update`, then `claude plugin
+  update` for every user-scope plugin.
+- **pacman:** `pacman -Syu` (Arch upgrades the whole system together, base
+  packages included); `--no-pacman-upgrade` skips it.
+- **mise:** `mise upgrade` of the tools asked for as `latest` (herdr and
+  1password, plus any client `<tool>@latest`), then `mise prune`.
+- **claude:** `claude update`.
+- **configs:** gh's `config.yml` and the nvim config gain files new in this
+  repo; files already on the box, edited or not, are left alone. A
+  `bin/devbox-sync` doesn't pull the box's checkout, so new files reach it
+  once pushed and pulled by a `devbox sync` inside the box.
+- **nvim:** `nvim --headless "+Lazy! restore" +qa`, so the plugins match the
+  box's `lazy-lock.json` (the repo's, unless edited on the box).
 
 ### Logging in and finishing
 
