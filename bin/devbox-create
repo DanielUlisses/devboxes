@@ -1,0 +1,112 @@
+#!/usr/bin/env bash
+# Create and start a client's devbox: an unprivileged Arch container on the
+# Proxmox host, sized from the client's resolved config.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+# shellcheck source-path=SCRIPTDIR/.. source=lib/pve.sh
+source "$ROOT/lib/pve.sh"
+
+ROOTFS_STORAGE="${DEVBOX_STORAGE:-local-lvm}"
+TEMPLATE_STORAGE="${DEVBOX_TEMPLATE_STORAGE:-local}"
+BRIDGE="${DEVBOX_BRIDGE:-vmbr0}"
+MIN_FREE_MB=1024
+
+usage() {
+  cat <<EOF
+Usage: devbox-create [--light] [--dry-run] <client>
+
+Create and start the devbox container for clients/<client>.yaml on
+\$DEVBOX_HOST (required), using the first free VMID in
+$VMID_MIN-$VMID_MAX.
+
+  --light    cap it at 1 GB memory, 512 MB swap, 1 core and an 8 GB disk
+  --dry-run  run every check, then print the pct create command instead
+EOF
+}
+
+# "40G" -> 40, in whole GB as pct's rootfs size wants; M rounds up.
+disk_gb() {
+  local n="${1%?}"
+  case "$1" in
+    *M) echo $(((n + 1023) / 1024)) ;;
+    *G) echo "$n" ;;
+    *T) echo $((n * 1024)) ;;
+  esac
+}
+
+main() {
+  local light=false dry_run=false client=""
+  while (($#)); do
+    case "$1" in
+      --light) light=true ;;
+      --dry-run) dry_run=true ;;
+      -h | --help) usage; exit 0 ;;
+      -*) usage >&2; die "unknown option: $1" ;;
+      *) [[ -z $client ]] || die "expected one client, got '$client' and '$1'"; client="$1" ;;
+    esac
+    shift
+  done
+  [[ -n $client ]] || { usage >&2; exit 1; }
+
+  local config hostname memory swap cores disk onboot
+  config="$("$ROOT/bin/devbox-config" --json "$client")" || exit 1
+  hostname="$(jq -r .hostname <<<"$config")"
+  memory="$(jq -r .resources.memory_mb <<<"$config")"
+  swap="$(jq -r .resources.swap_mb <<<"$config")"
+  cores="$(jq -r .resources.cores <<<"$config")"
+  disk="$(disk_gb "$(jq -r .resources.disk <<<"$config")")"
+  onboot="$(jq -r 'if .resources.onboot then 1 else 0 end' <<<"$config")"
+  if $light; then
+    ((memory <= 1024)) || memory=1024
+    ((swap <= 512)) || swap=512
+    cores=1
+    ((disk <= 8)) || disk=8
+  fi
+
+  local free_kb
+  free_kb="$(pve cat /proc/meminfo | awk '/^MemAvailable:/ {print $2}')"
+  [[ $free_kb =~ ^[0-9]+$ ]] || die "could not read free memory on $DEVBOX_HOST"
+  ((free_kb / 1024 >= MIN_FREE_MB)) ||
+    die "refusing: $DEVBOX_HOST has $((free_kb / 1024)) MB available, needs at least $MIN_FREE_MB MB"
+
+  local all existing vmid
+  all="$(guests)"
+  existing="$(jq -r --arg h "$hostname" '[.[] | select(.name == $h) | "\(.type)/\(.vmid)"] | join(" ")' <<<"$all")"
+  [[ -z $existing ]] || die "$hostname already exists on $DEVBOX_HOST as $existing"
+  vmid="$(jq -r --argjson lo "$VMID_MIN" --argjson hi "$VMID_MAX" \
+    '[.[].vmid] as $used | first(range($lo; $hi + 1) | select(IN($used[]) | not)) // empty' <<<"$all")"
+  [[ -n $vmid ]] || die "no free VMID in $VMID_MIN-$VMID_MAX on $DEVBOX_HOST"
+
+  # Downloading a template is a host-level change, so it's left to a person.
+  local template
+  template="$(pve pveam list "$TEMPLATE_STORAGE" | awk '$1 ~ /\/archlinux-base_/ {print $1}' | sort -V | tail -n1)"
+  [[ -n $template ]] || die "no Arch template in $TEMPLATE_STORAGE on $DEVBOX_HOST; on the host, run:
+  pveam update && pveam available --section system | grep archlinux
+  pveam download $TEMPLATE_STORAGE <archlinux-base_...tar.zst>"
+
+  local create=(pct create "$vmid" "$template"
+    --hostname "$hostname"
+    --tags "$DEVBOX_TAG"
+    --unprivileged 1
+    --features nesting=1
+    --dev0 /dev/net/tun
+    --memory "$memory" --swap "$swap" --cores "$cores"
+    --rootfs "$ROOTFS_STORAGE:$disk"
+    --net0 "name=eth0,bridge=$BRIDGE,ip=dhcp"
+    --onboot "$onboot")
+
+  if $dry_run; then
+    printf '%q ' "${create[@]}"
+    printf '\n'
+    exit 0
+  fi
+
+  say "creating $hostname as VMID $vmid on $DEVBOX_HOST ($memory MB, $cores cores, ${disk}G)"
+  pve "${create[@]}"
+  assert_devbox "$vmid" "$hostname"
+  pve pct start "$vmid"
+  say "started $hostname (VMID $vmid)"
+}
+
+main "$@"

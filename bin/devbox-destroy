@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+# Stop and destroy a client's devbox container. Only ever touches a container
+# tagged devbox, in the devbox VMID range, whose hostname is the client's.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+# shellcheck source-path=SCRIPTDIR/.. source=lib/pve.sh
+source "$ROOT/lib/pve.sh"
+
+usage() {
+  cat <<EOF
+Usage: devbox-destroy <client>
+
+Stop and destroy the devbox container for clients/<client>.yaml on
+\$DEVBOX_HOST (required). Exits 0 when there is none.
+EOF
+}
+
+# Guests named $h that are devbox containers ("ours") and those that aren't.
+# shellcheck disable=SC2016 # jq program, not shell expansions
+SPLIT='
+[.[] | select(.name == $h)]
+| map(select(.type == "lxc" and .vmid >= $lo and .vmid <= $hi
+             and ((.tags // "") | [splits("[;, ]")] | index([$tag]))))  as $ours
+| {ours: [$ours[].vmid], others: [.[] | select(IN($ours[]) | not) | "\(.type)/\(.vmid)"]}
+'
+
+main() {
+  local client=""
+  while (($#)); do
+    case "$1" in
+      -h | --help) usage; exit 0 ;;
+      -*) usage >&2; die "unknown option: $1" ;;
+      *) [[ -z $client ]] || die "expected one client, got '$client' and '$1'"; client="$1" ;;
+    esac
+    shift
+  done
+  [[ -n $client ]] || { usage >&2; exit 1; }
+
+  local config hostname split ours others
+  config="$("$ROOT/bin/devbox-config" --json "$client")" || exit 1
+  hostname="$(jq -r .hostname <<<"$config")"
+  split="$(guests | jq -c --arg h "$hostname" --arg tag "$DEVBOX_TAG" \
+    --argjson lo "$VMID_MIN" --argjson hi "$VMID_MAX" "$SPLIT")"
+  ours="$(jq -r '.ours | join(" ")' <<<"$split")"
+  others="$(jq -r '.others | join(" ")' <<<"$split")"
+
+  [[ -z $others ]] ||
+    die "refusing: $hostname also names $others, not a $DEVBOX_TAG container in $VMID_MIN-$VMID_MAX"
+  if [[ -z $ours ]]; then
+    say "no $hostname on $DEVBOX_HOST; nothing to destroy"
+    exit 0
+  fi
+  [[ $ours != *" "* ]] || die "refusing: several containers named $hostname: $ours"
+
+  local vmid="$ours" status
+  assert_devbox "$vmid" "$hostname"
+  status="$(pve pct status "$vmid")"
+  if [[ $status != "status: stopped" ]]; then
+    say "stopping $hostname (VMID $vmid)"
+    pve pct stop "$vmid"
+  fi
+  say "destroying $hostname (VMID $vmid) on $DEVBOX_HOST"
+  pve pct destroy "$vmid"
+  say "destroyed $hostname"
+}
+
+main "$@"

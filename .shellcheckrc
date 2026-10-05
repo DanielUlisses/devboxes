@@ -1,0 +1,2 @@
+# Follow `source`d files (bin/* source lib/pve.sh).
+external-sources=true
