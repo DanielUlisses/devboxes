@@ -12,9 +12,10 @@ usage() {
   cat <<EOF
 Usage: devbox-sync <client>
 
-Converge the devbox for clients/<client>.yaml on \$DEVBOX_HOST (required)
-to this checkout's resolved config: install and remove pacman packages and
-mise tools to match it.
+Converge the devbox for <client> on \$DEVBOX_HOST (required) to its
+resolved config on this machine (see devbox-config): install and remove
+pacman packages and mise tools to match it, and clone newly listed repos.
+The box keeps that config for its own syncs until gh is logged in there.
 EOF
 }
 

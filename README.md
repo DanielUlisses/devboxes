@@ -1,13 +1,15 @@
 # devboxes
 
-One dev VM per client, each described by a small YAML file in this repo.
+One dev VM per client, each described by a small YAML file. The code,
+defaults and template are here; the client files themselves live in a
+private repo, `DanielUlisses/devbox-clients`, so client names, orgs and repo
+names stay out of this public one.
 
 ## Layout
 
 ```
 defaults.yaml          defaults every client inherits (resources, base skills)
-clients/_template.yaml documented template; every field explained
-clients/<client>.yaml  one file per client
+clients/_template.yaml documented template; every field explained (the only file in clients/)
 bin/devbox-config      prints a client's resolved config, or fails naming the bad field
 bin/devbox-create      creates, starts and bootstraps a client's container on the Proxmox host
 bin/devbox-sync        syncs a client's box to this checkout's config, from your machine
@@ -19,12 +21,43 @@ lib/pve.sh             the one way bin/ scripts talk to the host
 host/setup.sh          prepares the dedicated Proxmox host (run on the host)
 ```
 
+## Client files: the devbox-clients repo
+
+Client files are `clients/<client>.yaml` in the private
+`DanielUlisses/devbox-clients` repo, checked out next to this one:
+
+```
+devboxes/           this repo
+devbox-clients/     clients/<client>.yaml, one per client
+```
+
+`bin/devbox-config`, `devbox-create`, `devbox-sync` and `devbox-destroy` read
+clients from `$DEVBOX_CLIENTS`, by default `../devbox-clients` next to this
+checkout; `_template` still resolves from this repo. A client file in this
+repo's `clients/` is ignored by git, and `devbox-config` refuses it.
+
+Creating the private repo (once; already done):
+
+```
+gh repo create DanielUlisses/devbox-clients --private --clone
+mkdir devbox-clients/clients
+```
+
+then add the first client (below) and push: a box that syncs from the repo
+needs at least one commit on it.
+
+Run it in the directory holding this checkout. On another machine, clone it
+there with `gh repo clone DanielUlisses/devbox-clients`, or point
+`DEVBOX_CLIENTS` at wherever it is.
+
 ## Adding a client
 
-1. `cp clients/_template.yaml clients/<client>.yaml` (name: lowercase letters, digits, dashes).
+From this checkout:
+
+1. `cp clients/_template.yaml ../devbox-clients/clients/<client>.yaml` (name: lowercase letters, digits, dashes).
 2. Edit it. Delete anything you don't need; it falls back to `defaults.yaml`.
 3. `bin/devbox-config <client>` and check the output.
-4. Commit.
+4. Commit and push it in `devbox-clients`.
 
 ## devbox-config
 
@@ -32,8 +65,9 @@ host/setup.sh          prepares the dedicated Proxmox host (run on the host)
 bin/devbox-config [--json] <client>
 ```
 
-Prints `defaults.yaml` merged with `clients/<client>.yaml`, as YAML (or JSON
-with `--json`). Mappings merge key by key, lists replace, except `skills`, which
+Prints `defaults.yaml` merged with the client's file
+(`$DEVBOX_CLIENTS/clients/<client>.yaml`), as YAML (or JSON with
+`--json`). Mappings merge key by key, lists replace, except `skills`, which
 appends the client's extras to the base list (duplicates dropped). `hostname` defaults to
 `dev-<client>`.
 
@@ -41,8 +75,8 @@ On an invalid file it prints one line per problem, each naming the field, and
 exits 1:
 
 ```
-clients/acme.yaml: resources.cores: must be an integer >= 1 (got 2.5)
-clients/acme.yaml: tools[0]: must be <tool>@<version> (got "terraform")
+devbox-clients/clients/acme.yaml: resources.cores: must be an integer >= 1 (got 2.5)
+devbox-clients/clients/acme.yaml: tools[0]: must be <tool>@<version> (got "terraform")
 ```
 
 Needs `jq` and [mikefarah/yq](https://github.com/mikefarah/yq) v4
@@ -64,8 +98,12 @@ every check and prints the `pct create` and `pct exec` commands instead of runni
 
 Once started, the box bootstraps itself: `devbox-create` looks up the pushed
 head of the repo's `main` on GitHub (`DEVBOX_BRANCH` picks another branch)
-and `pct exec`s a fetch of `bootstrap.sh` at that commit. The box clones this
-public repo, so the client file and any script changes must be pushed first.
+and `pct exec`s a fetch of `bootstrap.sh` at that commit, handing it the
+client's resolved config (`devbox-config --json`, from your machine). The box
+clones this public repo anonymously, so script changes must be pushed first;
+the client file only needs pushing to `devbox-clients` before a sync inside
+the box after `devbox login`, as the box never reads the private repo before
+that.
 
 The test host is shared, so the scripts never change the host itself:
 `lib/pve.sh` only lets through `pct create/start/stop/destroy/exec/list`
@@ -91,8 +129,9 @@ Overrides: `DEVBOX_HOST`, `DEVBOX_BRANCH` (default `main`), `DEVBOX_STORAGE` (ro
 `bootstrap.sh` gets pacman working (keyring, mirror, and pacman's download
 sandbox turned off when the kernel has no Landlock, as the stock Proxmox one
 doesn't), clones this repo to
-`/opt/devboxes` at the pinned commit, records the client and branch in
-`/var/lib/devbox/`, then runs `devbox bootstrap`, which:
+`/opt/devboxes` at the pinned commit, records the client, branch and the
+resolved config it was handed in `/var/lib/devbox/`, then runs `devbox
+bootstrap`, which:
 
 - installs the base packages (`base-devel git openssh sudo stow jq go-yq
   unzip mise github-cli tailscale bash-completion neovim ripgrep fd`), generates the `en_US.UTF-8` locale and enables
@@ -118,9 +157,16 @@ bin/devbox-sync <client>    # from your machine
 ```
 
 `devbox sync` pulls the box's branch of this repo and converges the box to
-the client's resolved config; `bin/devbox-sync` instead resolves the config
-in your checkout (uncommitted edits included) and runs the sync with it over
-`ssh` and `pct exec`, without pulling. A sync:
+the client's resolved config. Until gh is logged in, the box can't read the
+private clients repo, so that config is the last one it was given
+(`/var/lib/devbox/config.json`, from `devbox-create` or `bin/devbox-sync`);
+once it is, `devbox sync` clones or pulls `devbox-clients` with gh into
+`/opt/devbox-clients` and resolves the client from there, failing if it
+can't (not pushed, no network) rather than falling back. `bin/devbox-sync`
+instead resolves the config on your machine (uncommitted edits included) and
+runs the sync with it over `ssh` and `pct exec`, without pulling. Each sync
+stores the config it applied, which `devbox login`, `finish` and `logout`
+also read. A sync:
 
 - **packages:** installs listed packages that are missing. Packages dropped
   from the list since the last sync (recorded in `/var/lib/devbox/packages`)
@@ -341,7 +387,8 @@ If the firewall ever locks you out, log in on the physical console and run
 
 ## No secrets
 
-This repo is public. Client files hold names, sizes and lists only: no
-tokens, passwords, keys or email addresses. `claude_account` is a label, not
+This repo is public, so client files live in the private `devbox-clients`
+repo. They still hold names, sizes and lists only: no tokens, passwords,
+keys or email addresses. `claude_account` is a label, not
 the account's email. `devbox-config` rejects any value that looks like an
 email address.

@@ -1,11 +1,12 @@
 # Devbox client template.
 #
-# New client: copy this file to clients/<client>.yaml (lowercase letters,
-# digits and dashes), edit it, check it with `bin/devbox-config <client>`,
-# and commit. Anything left out falls back to defaults.yaml.
+# New client: copy this file to clients/<client>.yaml in the private
+# devbox-clients repo (lowercase letters, digits and dashes), edit it, check
+# it with `bin/devbox-config <client>`, and commit it there, never here.
+# Anything left out falls back to defaults.yaml.
 #
-# This repo is public. No secrets, tokens, passwords or email addresses
-# go in here; devbox-config rejects any value that looks like an email.
+# Client files hold no secrets, tokens, passwords or email addresses;
+# devbox-config rejects any value that looks like an email.
 
 # VM hostname. Default: dev-<client>.
 # hostname: dev-example
