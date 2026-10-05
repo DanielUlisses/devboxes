@@ -83,7 +83,9 @@ Overrides: `DEVBOX_HOST`, `DEVBOX_BRANCH` (default `main`), `DEVBOX_STORAGE` (ro
 
 ## Inside a box
 
-`bootstrap.sh` gets pacman working (keyring, mirror), clones this repo to
+`bootstrap.sh` gets pacman working (keyring, mirror, and pacman's download
+sandbox turned off when the kernel has no Landlock, as the stock Proxmox one
+doesn't), clones this repo to
 `/opt/devboxes` at the pinned commit, records the client and branch in
 `/var/lib/devbox/`, then runs `devbox bootstrap`, which:
 

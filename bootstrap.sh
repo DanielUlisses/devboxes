@@ -19,6 +19,16 @@ die() {
 client="$1" url="$2" branch="$3" commit="$4"
 ((EUID == 0)) || die "must run as root"
 
+# pacman 7 downloads as user alpm inside a Landlock sandbox. The stock Proxmox
+# kernel doesn't enable Landlock, so in a container every download fails; turn
+# the download sandbox off then. It only confines pacman's own downloader:
+# signatures are still checked, and the container stays unprivileged.
+if ! grep -qw landlock /sys/kernel/security/lsm 2>/dev/null; then
+  sed -i -e 's/^DownloadUser/#DownloadUser/' \
+    -e 's/^#DisableSandboxFilesystem/DisableSandboxFilesystem/' \
+    -e 's/^#DisableSandboxSyscalls/DisableSandboxSyscalls/' /etc/pacman.conf
+fi
+
 # Fresh containers can ship with an empty keyring and no mirror enabled.
 pacman-key --init
 pacman-key --populate archlinux >/dev/null
