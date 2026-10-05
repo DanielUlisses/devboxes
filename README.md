@@ -235,6 +235,14 @@ What it sets up:
   plus Tailscale's apt repo.
 - **Storage:** checks for active LVM-thin or ZFS container storage; with ZFS,
   caps the ARC at 2 GB now and from boot.
+- **Landlock:** adds `landlock` to the front of the kernel's `lsm=` list,
+  keeping the other modules in order, so pacman's download sandbox works
+  inside Arch boxes. On systemd-boot (ZFS on UEFI) it edits
+  `/etc/kernel/cmdline`; on GRUB it edits `GRUB_CMDLINE_LINUX_DEFAULT` in
+  `/etc/default/grub`. Then it runs `proxmox-boot-tool refresh` where that
+  tool manages the boot partitions (ZFS installs), `update-grub` otherwise. **It takes a reboot:** until
+  `cat /sys/kernel/security/lsm` lists `landlock`, every run says so, and
+  boxes created before then get the sandbox turned off by `bootstrap.sh`.
 - **Root SSH key:** adds the `--ssh-key` keys to root's `authorized_keys`, then
   turns off password login over SSH.
 - **Tailscale:** installs it, starts `tailscaled`, joins the tailnet.

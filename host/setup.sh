@@ -9,6 +9,9 @@ SUITE=trixie # Debian release under Proxmox VE 9
 ZFS_ARC_MAX=$((2 * 1024 * 1024 * 1024))
 TEMPLATE_STORAGE=local
 TAILNET_CIDR=100.64.0.0/10
+# The kernel's LSM order on stock Proxmox VE 9, used when neither the boot
+# config nor /sys/kernel/security/lsm says otherwise.
+STOCK_LSM=lockdown,capability,yama,apparmor,ima,evm
 
 APPLY=0
 SSH_KEY_FILE=""
@@ -16,6 +19,7 @@ PVE=0      # running on a Proxmox VE host
 CHANGED=0  # whether the last ensure_file call changed (or would change) its file
 CHANGES=0
 PROBLEMS=0
+REBOOT=0   # Landlock is set at boot but not running yet
 
 # The whole datacenter firewall config. Inbound traffic is dropped unless it
 # comes over Tailscale. Proxmox opens SSH and the web UI to "local_network"
@@ -43,9 +47,10 @@ usage() {
 Usage: setup.sh [--dry-run|--apply] [--ssh-key <file>]
 
 Prepare this machine, a fresh Proxmox VE 9 install, as the devbox host:
-no-subscription repo, thin container storage (ZFS ARC capped at 2 GB), root
-SSH key, Tailscale, a firewall that only lets the tailnet in, and the Arch
-Linux LXC template. Runs on the host, as root.
+no-subscription repo, thin container storage (ZFS ARC capped at 2 GB), the
+Landlock LSM (for pacman's download sandbox in Arch boxes), root SSH key,
+Tailscale, a firewall that only lets the tailnet in, and the Arch Linux LXC
+template. Runs on the host, as root.
 
   --dry-run         print each change without making it (the default)
   --apply           make the changes; refused on a host already running
@@ -64,6 +69,7 @@ die() {
 
 step() { printf '\n== %s\n' "$*"; }
 ok() { printf '  ok: %s\n' "$*"; }
+note() { printf '  note: %s\n' "$*"; }
 skip() { printf '  skip: %s\n' "$*"; }
 problem() {
   PROBLEMS=$((PROBLEMS + 1))
@@ -220,6 +226,74 @@ setup_storage() {
     ok "ZFS ARC capped at 2 GB"
   else
     change "cap the ZFS ARC at 2 GB now, without a reboot (write $arc)" set_arc_max "$arc"
+  fi
+}
+
+# with_landlock <cmdline>: print <cmdline> with landlock first in its lsm=
+# list. Without an lsm= parameter, the list starts from the running kernel's
+# order (or STOCK_LSM), so the other modules keep theirs.
+with_landlock() {
+  local word words out=() found=0 running
+  read -ra words <<<"$1"
+  for word in "${words[@]}"; do
+    if [[ $word == lsm=* ]]; then
+      found=1
+      [[ ,${word#lsm=}, == *,landlock,* ]] || word="lsm=landlock,${word#lsm=}"
+    fi
+    out+=("$word")
+  done
+  if ((!found)); then
+    running="$(cat /sys/kernel/security/lsm 2>/dev/null)" || true
+    out+=("lsm=landlock,${running:-$STOCK_LSM}")
+  fi
+  printf '%s' "${out[*]}"
+}
+
+# Copy a changed command line to the boot partitions.
+refresh_boot() {
+  if [[ -s /etc/kernel/proxmox-boot-uuids ]]; then
+    change "copy the new command line to the boot partitions" proxmox-boot-tool refresh
+  else
+    change "regenerate the GRUB config" update-grub
+  fi
+}
+
+setup_landlock() {
+  step "Landlock LSM"
+  # systemd-boot (UEFI installs managed by proxmox-boot-tool) reads
+  # /etc/kernel/cmdline; GRUB, including legacy-BIOS ZFS installs that
+  # proxmox-boot-tool also manages, reads /etc/default/grub.
+  local file
+  if [[ -s /etc/kernel/proxmox-boot-uuids && -d /sys/firmware/efi ]]; then
+    file=/etc/kernel/cmdline
+    local have
+    have="$(cat "$file" 2>/dev/null)" || true
+    if [[ -z $have ]]; then
+      problem "$file is empty or unreadable; proxmox-boot-tool needs it to hold root= and the rest"
+      return
+    fi
+    ensure_file "$file" "$(with_landlock "$have")"
+  elif [[ -r /etc/default/grub ]]; then
+    file=/etc/default/grub
+    local value want
+    value="$(sed -n 's/^GRUB_CMDLINE_LINUX_DEFAULT=//p' "$file" | head -n1)"
+    value="${value#[\"\']}"
+    value="${value%[\"\']}"
+    want="$(NEW="GRUB_CMDLINE_LINUX_DEFAULT=\"$(with_landlock "$value")\"" awk '
+      /^GRUB_CMDLINE_LINUX_DEFAULT=/ && !done { print ENVIRON["NEW"]; done = 1; next }
+      { print }
+      END { if (!done) print ENVIRON["NEW"] }' "$file")"
+    ensure_file "$file" "$want"
+  else
+    skip "no /etc/kernel/proxmox-boot-uuids or /etc/default/grub, so no boot loader to configure"
+    return
+  fi
+  if ((CHANGED)); then refresh_boot; fi
+  if grep -qw landlock /sys/kernel/security/lsm 2>/dev/null; then
+    ok "running kernel has Landlock"
+  else
+    REBOOT=1
+    note "the running kernel has no Landlock until the host reboots"
   fi
 }
 
@@ -390,6 +464,7 @@ main() {
 
   setup_repos
   setup_storage
+  setup_landlock
   setup_root_ssh
   setup_tailscale
   setup_firewall
@@ -400,6 +475,9 @@ main() {
     printf '%d change(s) made.\n' "$CHANGES"
   else
     printf '%d change(s) pending; run with --apply to make them.\n' "$CHANGES"
+  fi
+  if ((REBOOT)); then
+    printf 'Reboot the host to turn on Landlock (cat /sys/kernel/security/lsm should then list it).\n'
   fi
   if ((PROBLEMS)); then
     printf '%d problem(s) need attention (see PROBLEM above).\n' "$PROBLEMS" >&2
