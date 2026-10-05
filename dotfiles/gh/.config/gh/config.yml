@@ -1,5 +1,6 @@
 # Devbox gh config, from dotfiles/gh in the devboxes repo. The token lives in
-# hosts.yml next to this link, written by gh auth login, never in the repo.
+# hosts.yml next to it, written by gh auth login, never in the repo. Copied
+# into a box once (gh rewrites it), not linked like the bash and git files.
 version: 1
 git_protocol: https
 prompt: enabled

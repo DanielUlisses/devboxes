@@ -13,7 +13,7 @@ resources:
 packages: []
 tools: []
 
-# Base skills every devbox gets.
+# Base skills every devbox gets: skill repos, plus the mattpocock plugin.
 skills:
   - ticket-skill
   - tdd-skill

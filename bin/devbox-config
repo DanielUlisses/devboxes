@@ -98,7 +98,7 @@ if . == null then {} else . end
 
     (.packages | str_list("packages"; "^[a-z0-9@._+-]+$"; "a pacman package name")),
     (.tools | str_list("tools"; "^[^@[:space:]]+@[^@[:space:]]+$"; "<tool>@<version>")),
-    (.skills | str_list("skills"; "^[A-Za-z0-9._:/-]+$"; "a skill name")),
+    (.skills | str_list("skills"; "^([A-Za-z0-9-]+/)?[A-Za-z0-9._-]+$"; "a skill repo, <owner>/<repo> or <repo>")),
     (.repos | str_list("repos"; "^[A-Za-z0-9-]+/[A-Za-z0-9._-]+$"; "a GitHub <owner>/<repo>")),
 
     (paths(type == "string") as $p | getpath($p)

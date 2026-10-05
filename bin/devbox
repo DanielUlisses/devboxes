@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
 # The devbox command, run inside a devbox. `devbox bootstrap` sets up a fresh
 # box (bootstrap.sh hands over to it) and ends with a sync. `devbox sync`
-# converges the box to its client's resolved config: pacman packages and mise
-# tools. Both run as root, re-running themselves under sudo when needed.
+# converges the box to its client's resolved config: pacman packages, mise
+# tools and cloned repos. Both run as root, re-running themselves under sudo
+# when needed. `devbox login`, `finish` and `logout` run as the box user (root
+# hands them over): the manual logins, then the per-box key, skills and repos,
+# and the cleanup bin/devbox-destroy runs before destroying the box.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
@@ -12,7 +15,7 @@ USER_HOME=/home/$USER_NAME
 export LC_ALL=C # one collation for sort and comm
 
 # Installed by bootstrap; sync never removes them.
-BASE_PACKAGES=(base-devel git openssh sudo stow jq go-yq unzip mise github-cli tailscale bash-completion)
+BASE_PACKAGES=(base-devel git openssh sudo stow jq go-yq unzip mise github-cli tailscale bash-completion neovim ripgrep fd)
 
 # mise tools every box gets, kept in the system config so the client's tools:
 # list (the user config) can't drop them.
@@ -22,21 +25,52 @@ herdr = "latest"
 1password = "latest"'
 
 # Stow packages under dotfiles/ in this repo.
-DOTFILES_PACKAGES=(bash git gh)
+DOTFILES_PACKAGES=(bash git)
+# gh rewrites its own config.yml (gh auth login sets git_protocol), so it is
+# copied once rather than linked into the root-owned checkout.
+GH_CONFIG=dotfiles/gh/.config/gh/config.yml
+# LazyVim writes into its config directory (lazy-lock.json, lazyvim.json), so
+# it is copied too: files missing from the box are added, edits there are kept.
+NVIM_CONFIG=dotfiles/nvim/.config/nvim
+
+# GitHub scopes beyond gh's defaults: add and delete this box's SSH keys.
+GH_SCOPES=(admin:public_key admin:ssh_signing_key)
+TAILSCALE_TAG=tag:devbox
+# Where `devbox login` keeps the client's 1Password service-account token.
+OP_TOKEN_FILE=$USER_HOME/.config/op/service-account-token
+SSH_KEY=$USER_HOME/.ssh/id_ed25519
+WORK=$USER_HOME/work
+# Clones of the skill repos, installed from there into ~/.claude.
+SKILL_REPOS=$USER_HOME/.claude/skill-repos
+# Owner of skill repos named without one.
+SKILLS_OWNER=DanielUlisses
+# Skills that are Claude Code plugins from a marketplace, not repos to clone.
+declare -A SKILL_PLUGINS=([mattpocock-skills]=mattpocock-skills@claude-plugins-official)
+OFFICIAL_MARKETPLACE=anthropics/claude-plugins-official
 
 usage() {
   cat <<EOF
 Usage: devbox bootstrap
        devbox sync [--config-json <json>]
+       devbox login
+       devbox finish
+       devbox logout
 
 Run inside a devbox.
 
   bootstrap  set up a fresh box (user $USER_NAME, base packages, claude, herdr,
              1Password CLI, gh, tailscale, mise, dotfiles), then sync
   sync       converge the box to its client's config: pull the devboxes
-             repo, then install and remove pacman packages and mise tools.
-             --config-json applies a resolved config (bin/devbox-config
-             --json) instead, without pulling; bin/devbox-sync uses it.
+             repo, then install and remove pacman packages and mise tools,
+             and clone newly listed repos. --config-json applies a resolved
+             config (bin/devbox-config --json) instead, without pulling;
+             bin/devbox-sync uses it.
+  login      the manual logins, interactive: tailscale, gh, the client's
+             1Password service-account token, Claude
+  finish     after login: this box's SSH key on GitHub (auth and signing),
+             git identity and signing, skills, the mattpocock plugin, repos
+  logout     remove this box's SSH keys from GitHub and log out of
+             tailscale; bin/devbox-destroy runs it
 EOF
 }
 
@@ -50,7 +84,9 @@ say() {
 }
 
 # Runs a command as the box user, in their home, with their tools on PATH.
+# Already the box user: runs it as is.
 as_user() {
+  ((EUID == 0)) || { "$@"; return; }
   runuser -u "$USER_NAME" -- env -C "$USER_HOME" HOME="$USER_HOME" USER="$USER_NAME" LOGNAME="$USER_NAME" \
     PATH="$USER_HOME/.local/bin:$USER_HOME/.local/share/mise/shims:/usr/local/bin:/usr/bin" \
     MISE_YES=1 "$@"
@@ -75,7 +111,7 @@ resolve_config() {
     git -C "$ROOT" -c advice.detachedHead=false checkout -q --detach FETCH_HEAD || die "could not check out $branch"
     json="$("$ROOT/bin/devbox-config" --json "$client")" || exit 1
   fi
-  jq -e '(.packages | type) == "array" and (.tools | type) == "array"' <<<"$json" >/dev/null 2>&1 ||
+  jq -e '[.packages, .tools, .repos] | all(type == "array")' <<<"$json" >/dev/null 2>&1 ||
     die "not a resolved config (want the output of devbox-config --json)"
   printf '%s\n' "$json"
 }
@@ -148,12 +184,271 @@ sync_tools() {
   as_user mise prune --yes
 }
 
+# owner/repo of a clone's origin, lowercased (GitHub names ignore case).
+origin_repo() {
+  git -C "$1" remote get-url origin 2>/dev/null |
+    sed -E 's#^(https://github\.com/|git@github\.com:)##; s#\.git$##' | tr '[:upper:]' '[:lower:]'
+}
+
+# repos: clones listed repos missing from ~/work (as <repo>); clones no longer
+# listed are only reported, never removed. Needs gh logged in.
+sync_repos() {
+  local config="$1" repo dest dir cloned=0 listed
+  if ! as_user gh auth status -h github.com &>/dev/null; then
+    say "repos: skipped, gh is not logged in (devbox login, then devbox finish)"
+    return
+  fi
+  as_user mkdir -p "$WORK"
+  listed="$(jq -r '.repos[] | ascii_downcase' <<<"$config")"
+  while IFS= read -r repo; do
+    dest="$WORK/${repo#*/}"
+    if [[ -e $dest ]]; then
+      [[ $(origin_repo "$dest") == "${repo,,}" ]] ||
+        say "repos: not cloning $repo: ${dest/#$USER_HOME/\~} holds $(origin_repo "$dest" || echo "something else")"
+      continue
+    fi
+    say "repos: cloning $repo into ${dest/#$USER_HOME/\~}"
+    as_user gh repo clone "$repo" "$dest" -- -q
+    cloned=$((cloned + 1))
+  done < <(jq -r '.repos[]' <<<"$config")
+  for dir in "$WORK"/*; do
+    [[ -d $dir/.git ]] || continue
+    repo="$(origin_repo "$dir")"
+    grep -qxF -- "$repo" <<<"$listed" ||
+      say "repos: ${dir/#$USER_HOME/\~} ($repo) is no longer listed; left in place"
+  done
+  ((cloned)) || say "repos: up to date"
+}
+
 sync() {
   local config
   config="$(resolve_config "${1:-}")"
   sync_packages "$config"
   sync_tools "$config"
+  sync_repos "$config"
   say "synced"
+}
+
+# The client's resolved config from this checkout, without pulling (the box
+# user can't write the root-owned checkout).
+local_config() {
+  "$ROOT/bin/devbox-config" --json "$(<"$STATE/client")"
+}
+
+gh_logged_in() {
+  gh auth status -h github.com &>/dev/null
+}
+
+tailscale_up() {
+  tailscale status --json 2>/dev/null | jq -e '.BackendState == "Running"' >/dev/null
+}
+
+# Whether gh's token has every scope in GH_SCOPES.
+gh_has_scopes() {
+  local have scope
+  have="$(gh api -i user 2>/dev/null | tr -d '\r' | sed -n 's/^[Xx]-[Oo][Aa]uth-[Ss]copes: //p' | tr -d ' ' | tr ',' '\n')"
+  for scope in "${GH_SCOPES[@]}"; do
+    grep -qxF "$scope" <<<"$have" || return 1
+  done
+}
+
+# The manual logins. Each step skips when already done, so re-running only
+# asks for what's missing.
+login() {
+  local config account token scopes
+  config="$(local_config)" || exit 1
+  account="$(jq -r .claude_account <<<"$config")"
+  scopes="$(IFS=,; echo "${GH_SCOPES[*]}")"
+
+  if tailscale_up; then
+    say "tailscale: already up"
+  else
+    say "tailscale: open the URL below to add this box to the tailnet"
+    sudo tailscale up --ssh --advertise-tags="$TAILSCALE_TAG"
+  fi
+
+  if ! gh_logged_in; then
+    say "gh: log in to GitHub"
+    gh auth login -h github.com -p https -w -s "$scopes"
+  elif ! gh_has_scopes; then
+    say "gh: adding the $scopes scopes (for this box's SSH keys)"
+    gh auth refresh -h github.com -s "$scopes"
+  else
+    say "gh: already logged in"
+  fi
+
+  if [[ -s $OP_TOKEN_FILE ]]; then
+    say "1password: service-account token already stored"
+  else
+    say "1password: paste the $(<"$STATE/client") service-account token (hidden; empty skips)"
+    IFS= read -rs token
+    printf '\n' >&2
+    if [[ -z $token ]]; then
+      say "1password: skipped"
+    else
+      OP_SERVICE_ACCOUNT_TOKEN="$token" op whoami >/dev/null || die "1password: op rejected the token; not stored"
+      (umask 077 && mkdir -p "${OP_TOKEN_FILE%/*}" && printf '%s\n' "$token" >"$OP_TOKEN_FILE")
+      chmod 600 "$OP_TOKEN_FILE"
+      say "1password: token stored in ${OP_TOKEN_FILE/#$USER_HOME/\~}"
+    fi
+  fi
+
+  if claude auth status --json 2>/dev/null | jq -e .loggedIn >/dev/null; then
+    say "claude: logged in as $(claude auth status --json | jq -r '.email // "?"'); this box's account is '$account'"
+  else
+    say "claude: log in with the '$account' account"
+    claude auth login
+  fi
+  say "logged in; next: devbox finish"
+}
+
+# Registers this box's public key on GitHub as $1 (keys or ssh_signing_keys)
+# unless it's there already.
+register_key() {
+  local kind="$1" type="$2" title="$3" key
+  key="$(cut -d' ' -f1,2 "$SSH_KEY.pub")"
+  if gh api --paginate "user/$kind" | jq -e --arg k "$key" '.[] | select(.key == $k)' >/dev/null; then
+    say "ssh key: already on GitHub for $type"
+  else
+    gh ssh-key add "$SSH_KEY.pub" --title "$title" --type "$type"
+  fi
+}
+
+# Git identity (kept when already set) and SSH signing, in ~/.gitconfig.local.
+git_signing() {
+  local file=$USER_HOME/.gitconfig.local signers=$USER_HOME/.config/git/allowed_signers user email
+  if ! git config -f "$file" user.name >/dev/null; then
+    git config -f "$file" user.name "$(gh api user --jq 'if (.name // "") == "" then .login else .name end')"
+  fi
+  if ! git config -f "$file" user.email >/dev/null; then
+    user="$(gh api user --jq '"\(.id)+\(.login)"')"
+    git config -f "$file" user.email "$user@users.noreply.github.com"
+  fi
+  email="$(git config -f "$file" user.email)"
+  git config -f "$file" gpg.format ssh
+  git config -f "$file" user.signingkey "$SSH_KEY.pub"
+  git config -f "$file" commit.gpgsign true
+  git config -f "$file" tag.gpgsign true
+  git config -f "$file" gpg.ssh.allowedSignersFile "$signers"
+  write_if_changed "$signers" "$email $(cut -d' ' -f1,2 "$SSH_KEY.pub")" 644 || true
+  say "git: signing commits as $(git config -f "$file" user.name) <$email> (${file/#$USER_HOME/\~})"
+}
+
+# Installs plugin $1 (<plugin>@<marketplace>) unless it is installed.
+install_plugin() {
+  if claude plugin list --json | jq -e --arg id "$1" '.[] | select(.id == $id)' >/dev/null; then
+    say "plugin: $1 already installed"
+  else
+    claude plugin install "$1"
+  fi
+}
+
+# Adds the marketplace at source $2 (named $1) unless it is configured.
+add_marketplace() {
+  claude plugin marketplace list --json | jq -e --arg n "$1" '.[] | select(.name == $n)' >/dev/null ||
+    claude plugin marketplace add "$2"
+}
+
+# Clones (or fast-forwards) a skill repo into ~/.claude/skill-repos and
+# installs it the way its layout says: its own install.sh, a plugin
+# marketplace, or a single skill (SKILL.md at the root) linked into
+# ~/.claude/skills.
+install_skill_repo() {
+  local repo="$1" dest="$SKILL_REPOS/${1#*/}" market plugin
+  if [[ -d $dest/.git ]]; then
+    git -C "$dest" pull -q --ff-only || say "skills: could not update ${dest/#$USER_HOME/\~}; using it as is"
+  else
+    say "skills: cloning $repo"
+    mkdir -p "$SKILL_REPOS"
+    gh repo clone "$repo" "$dest" -- -q
+  fi
+  if [[ -f $dest/install.sh ]]; then
+    bash "$dest/install.sh" >/dev/null
+  elif [[ -f $dest/.claude-plugin/marketplace.json ]]; then
+    market="$(jq -r .name "$dest/.claude-plugin/marketplace.json")"
+    add_marketplace "$market" "$dest"
+    while IFS= read -r plugin; do
+      install_plugin "$plugin@$market"
+    done < <(jq -r '.plugins[].name' "$dest/.claude-plugin/marketplace.json")
+  elif [[ -f $dest/SKILL.md ]]; then
+    mkdir -p "$USER_HOME/.claude/skills"
+    ln -sfn "$dest" "$USER_HOME/.claude/skills/$(basename "$dest" -skill)"
+  else
+    die "skills: don't know how to install $repo (no install.sh, .claude-plugin/marketplace.json or SKILL.md)"
+  fi
+  say "skills: installed $repo"
+}
+
+# After login: this box's own SSH key on GitHub for auth and signing, git
+# signing, the base and client skills, the mattpocock plugin, then repos.
+finish() {
+  local config title skill
+  config="$(local_config)" || exit 1
+  title="$(jq -r .hostname <<<"$config")" # dev-<client> unless the client file sets one
+  gh_logged_in || die "gh is not logged in: run devbox login first"
+  gh_has_scopes || die "gh lacks the ${GH_SCOPES[*]} scopes: run devbox login again"
+  claude auth status --json 2>/dev/null | jq -e .loggedIn >/dev/null || die "claude is not logged in: run devbox login first"
+
+  if [[ -f $SSH_KEY ]]; then
+    say "ssh key: ${SSH_KEY/#$USER_HOME/\~} exists"
+  else
+    install -d -m 700 "${SSH_KEY%/*}"
+    ssh-keygen -q -t ed25519 -N '' -C "$title" -f "$SSH_KEY"
+    say "ssh key: generated ${SSH_KEY/#$USER_HOME/\~}"
+  fi
+  register_key keys authentication "$title"
+  register_key ssh_signing_keys signing "$title"
+  git_signing
+
+  while IFS= read -r skill; do
+    if [[ -n ${SKILL_PLUGINS[$skill]:-} ]]; then
+      add_marketplace "${SKILL_PLUGINS[$skill]#*@}" "$OFFICIAL_MARKETPLACE"
+      install_plugin "${SKILL_PLUGINS[$skill]}"
+    elif [[ $skill == */* ]]; then
+      install_skill_repo "$skill"
+    else
+      install_skill_repo "$SKILLS_OWNER/$skill"
+    fi
+  done < <(jq -r '.skills[]' <<<"$config")
+
+  sync_repos "$config"
+  say "finished"
+}
+
+# Before the box is destroyed: deletes its SSH keys (auth and signing) from
+# GitHub, matched by key or by the box's title (in case the key file is
+# gone), and logs out of tailscale. Named so it doesn't shadow bash's logout.
+box_logout() {
+  local title key="" kind ids id state
+  title="$(local_config | jq -r .hostname)"
+  [[ ! -f $SSH_KEY.pub ]] || key="$(cut -d' ' -f1,2 "$SSH_KEY.pub")"
+  if ! gh_logged_in; then
+    [[ -z $key ]] || die "gh is not logged in; can't remove this box's keys from GitHub"
+    say "github: gh not logged in and no SSH key; nothing to remove"
+  else
+    gh_has_scopes || die "gh lacks the ${GH_SCOPES[*]} scopes; can't remove this box's keys (devbox login adds them)"
+    for kind in keys ssh_signing_keys; do
+      # Listed first, so a failed listing stops here instead of deleting nothing.
+      ids="$(gh api --paginate "user/$kind" |
+        jq -r --arg k "$key" --arg t "$title" '.[] | select(.key == $k or .title == $t) | .id')"
+      for id in $ids; do
+        gh api -X DELETE "user/$kind/$id" --silent
+        say "github: deleted ${kind//_/ } $id"
+      done
+    done
+  fi
+  # On a box destroy has just started, tailscaled may still be starting up.
+  for _ in {1..15}; do
+    state="$(tailscale status --json 2>/dev/null | jq -r .BackendState || true)"
+    [[ $state == "" || $state == NoState || $state == Starting ]] || break
+    sleep 1
+  done
+  if tailscale_up; then
+    sudo tailscale logout
+    say "tailscale: logged out"
+  else
+    say "tailscale: not logged in"
+  fi
 }
 
 # Stows this repo's dotfiles/ packages (bash, git, gh) into the user's home.
@@ -169,10 +464,23 @@ dotfiles() {
       fi
     done < <(cd "$repo/$pkg" && find . -type f -printf '%P\n')
   done
-  # Real directories, so stow links the files inside them: otherwise gh would
-  # write its token (hosts.yml) into the repo checkout.
-  as_user mkdir -p "$USER_HOME/.config/gh" "$USER_HOME/.config/git"
+  # A real directory, so stow links the file inside it rather than the whole
+  # directory.
+  as_user mkdir -p "$USER_HOME/.config/git"
   as_user stow -d "$repo" -t "$USER_HOME" -R "${DOTFILES_PACKAGES[@]}"
+
+  # An older box has it stowed as a link into the checkout; replace that.
+  local gh_config="$USER_HOME/.config/gh/config.yml"
+  [[ ! -L $gh_config ]] || rm "$gh_config"
+  if [[ ! -e $gh_config ]]; then
+    as_user mkdir -p "${gh_config%/*}"
+    as_user install -m 644 "$ROOT/$GH_CONFIG" "$gh_config"
+  fi
+
+  local nvim_config="$USER_HOME/.config/nvim"
+  [[ ! -L $nvim_config ]] || rm "$nvim_config"
+  as_user mkdir -p "$nvim_config"
+  as_user cp -r --update=none "$ROOT/$NVIM_CONFIG/." "$nvim_config/"
 }
 
 bootstrap() {
@@ -181,6 +489,13 @@ bootstrap() {
   # Explicit, so removing a client package never takes a base one along.
   pacman -D --asexplicit -q -- "${BASE_PACKAGES[@]}" >/dev/null
   "$ROOT/bin/devbox-config" --json "$(<"$STATE/client")" >/dev/null || exit 1
+
+  say "locale"
+  # The template sets LANG=en_US.UTF-8 without generating it.
+  if ! locale -a 2>/dev/null | grep -qix 'en_US.utf8'; then
+    sed -i 's/^#\(en_US.UTF-8 UTF-8\)/\1/' /etc/locale.gen
+    locale-gen >/dev/null
+  fi
 
   say "user $USER_NAME"
   id "$USER_NAME" &>/dev/null || useradd -m -G wheel -s /bin/bash "$USER_NAME"
@@ -217,7 +532,7 @@ main() {
   shift
   case "$cmd" in
     -h | --help) usage; exit 0 ;;
-    bootstrap) (($# == 0)) || die "bootstrap takes no arguments" ;;
+    bootstrap | login | finish | logout) (($# == 0)) || die "$cmd takes no arguments" ;;
     sync)
       while (($#)); do
         case "$1" in
@@ -230,11 +545,28 @@ main() {
     *) usage >&2; die "unknown command: $cmd" ;;
   esac
   [[ -f $STATE/client ]] || die "no client recorded in $STATE/client: is this a devbox? (bootstrap.sh records it)"
-  ((EUID == 0)) || exec sudo "$0" "${args[@]}"
 
   case "$cmd" in
-    bootstrap) bootstrap ;;
-    sync) sync "$config_json" ;;
+    login | finish | logout)
+      # The logins and keys belong to the box user.
+      if ((EUID == 0)); then
+        as_user "$0" "${args[@]}"
+        exit
+      fi
+      [[ $(id -un) == "$USER_NAME" ]] || die "$cmd runs as $USER_NAME"
+      case "$cmd" in
+        login) login ;;
+        finish) finish ;;
+        logout) box_logout ;;
+      esac
+      ;;
+    *)
+      ((EUID == 0)) || exec sudo "$0" "${args[@]}"
+      case "$cmd" in
+        bootstrap) bootstrap ;;
+        sync) sync "$config_json" ;;
+      esac
+      ;;
   esac
 }
 

@@ -12,9 +12,9 @@ bin/devbox-config      prints a client's resolved config, or fails naming the ba
 bin/devbox-create      creates, starts and bootstraps a client's container on the Proxmox host
 bin/devbox-sync        syncs a client's box to this checkout's config, from your machine
 bin/devbox-destroy     stops and destroys it
-bin/devbox             runs inside a box: `devbox bootstrap`, `devbox sync`
+bin/devbox             runs inside a box: `devbox bootstrap`, `sync`, `login`, `finish`, `logout`
 bootstrap.sh           first thing a new box runs: clones this repo, hands over to devbox
-dotfiles/              bash, git and gh config stowed into every box (no identity, no secrets)
+dotfiles/              bash, git, gh and nvim config stowed into every box (no identity, no secrets)
 lib/pve.sh             the one way bin/ scripts talk to the host
 host/setup.sh          prepares the dedicated Proxmox host (run on the host)
 ```
@@ -52,7 +52,7 @@ Needs `jq` and [mikefarah/yq](https://github.com/mikefarah/yq) v4
 
 ```
 bin/devbox-create [--light] [--dry-run] <client>
-bin/devbox-destroy <client>
+bin/devbox-destroy [--skip-logout] <client>
 ```
 
 Both run `ssh root@$DEVBOX_HOST pct ...`. `DEVBOX_HOST` has no default and
@@ -75,6 +75,11 @@ and read-only queries (`pct config/status`, `pvesh get /cluster/resources`,
 available, or when the hostname is already taken. `devbox-destroy` only
 touches a container tagged `devbox`, in range, with the client's hostname,
 re-read from its live config just before; with no such container it exits 0.
+Before stopping it, `devbox-destroy` runs `devbox logout` inside the box
+(starting it first if it is stopped), which deletes the box's SSH keys from
+GitHub and logs it out of tailscale; if that fails it stops, and
+`--skip-logout` destroys anyway (then delete the keys titled with its
+hostname on GitHub by hand).
 
 The Arch template must already be on the host (downloading it is a host
 change, left to a person): `pveam download local archlinux-base_<date>_amd64.tar.zst`.
@@ -90,12 +95,17 @@ doesn't), clones this repo to
 `/var/lib/devbox/`, then runs `devbox bootstrap`, which:
 
 - installs the base packages (`base-devel git openssh sudo stow jq go-yq
-  unzip mise github-cli tailscale bash-completion`) and enables `tailscaled`;
+  unzip mise github-cli tailscale bash-completion neovim ripgrep fd`), generates the `en_US.UTF-8` locale and enables
+  `tailscaled`;
 - adds user `daniel` with passwordless sudo, and `devbox` on the PATH;
 - installs Claude Code (native installer) and puts herdr and the 1Password
   CLI (`op`) in mise's system config, `/etc/mise/config.toml`;
-- stows this repo's `dotfiles/` packages (`bash`, `git`, `gh`) into the
-  user's home (files in the way are moved to `<file>.bak`). They hold no
+- stows this repo's `dotfiles/` `bash` and `git` packages into the user's
+  home (files in the way are moved to `<file>.bak`), and copies gh's
+  `config.yml` and the nvim config, since both tools write there (a re-run
+  only adds files missing from the box). The nvim config is LazyVim with the
+  plugin versions pinned in `lazy-lock.json`; its clipboard goes over OSC 52,
+  so yanks reach your local clipboard through ssh and herdr. They hold no
   identity: git's `user.name`/`user.email` go in `~/.gitconfig.local`, shell
   extras in `~/.bashrc.local`, and git authenticates through `gh`;
 - ends with `devbox sync`.
@@ -119,8 +129,57 @@ in your checkout (uncommitted edits included) and runs the sync with it over
 - **tools:** writes `~/.config/mise/config.toml` from `tools:` (a tool listed
   twice gets both versions, the first the default), then `mise install` and
   `mise prune`, which drops versions no config uses.
+- **repos:** once gh is logged in, clones listed repos that are missing into
+  `~/work/<repo>`. Repos dropped from the list are reported, never deleted.
 
 With nothing changed, a sync installs and removes nothing.
+
+### Logging in and finishing
+
+A new box needs a person once. Get a shell in it (`pct enter <vmid>` on the
+host, or as `daniel` once it's on the tailnet), then:
+
+```
+devbox login     # interactive; run as daniel (root hands it over)
+devbox finish
+```
+
+`devbox login` skips what's already done, so re-running it only asks for
+what's missing:
+
+- **tailscale:** `sudo tailscale up --ssh --advertise-tags=tag:devbox`;
+  open the URL it prints.
+- **gh:** `gh auth login` in the browser, with the extra `admin:public_key`
+  and `admin:ssh_signing_key` scopes `finish` and `logout` need for the box's
+  key (`gh auth refresh` adds them when gh is already logged in).
+- **1Password:** paste the client's service-account token (hidden input;
+  `op whoami` checks it). Stored in `~/.config/op/service-account-token`,
+  mode 600, and exported as `OP_SERVICE_ACCOUNT_TOKEN` by `.bashrc`.
+- **Claude:** `claude auth login`, telling you which account the client
+  file's `claude_account` names; when already logged in it prints the
+  logged-in account to compare.
+
+`devbox finish` then, again skipping what's done:
+
+- generates `~/.ssh/id_ed25519`, unique to the box, and adds it to GitHub
+  for authentication and for signing, titled with the box's hostname
+  (`dev-<client>` by default);
+- writes git's identity (kept when already set; by default your GitHub name
+  and `<id>+<login>@users.noreply.github.com`) and SSH commit and tag signing
+  into `~/.gitconfig.local`, with `~/.config/git/allowed_signers` so
+  `git log --show-signature` verifies locally;
+- installs the `skills:` list: `mattpocock-skills` is the
+  `mattpocock-skills@claude-plugins-official` plugin; every other entry is a
+  GitHub repo (`<owner>/<repo>`, or a bare name under `DanielUlisses`) cloned
+  with gh into `~/.claude/skill-repos/` and installed by its layout: its
+  `install.sh`, a plugin marketplace (`.claude-plugin/marketplace.json`), or
+  a `SKILL.md` at its root linked into `~/.claude/skills/` (`-skill` dropped
+  from the name);
+- clones `repos:` into `~/work`, as a sync does.
+
+`devbox logout` undoes the outward-facing part: deletes the GitHub keys that
+match the box's public key or carry its title, and `tailscale logout`. `bin/devbox-destroy` runs
+it for you.
 
 ## The Proxmox host
 
