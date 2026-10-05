@@ -1,0 +1,171 @@
+#!/usr/bin/env bash
+# Print a client's resolved devbox config: defaults.yaml merged with
+# clients/<client>.yaml. Exits non-zero, naming each bad field, when either
+# file is invalid.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+DEFAULTS="$ROOT/defaults.yaml"
+CLIENTS="$ROOT/clients"
+
+usage() {
+  cat <<EOF
+Usage: devbox-config [--json] <client>
+
+Print the resolved config for clients/<client>.yaml, merged over
+defaults.yaml, as YAML (or JSON with --json).
+
+Clients:
+EOF
+  local f
+  for f in "$CLIENTS"/[!_]*.yaml; do
+    [[ -e $f ]] && printf '  %s\n' "$(basename "$f" .yaml)"
+  done
+}
+
+die() {
+  printf 'devbox-config: %s\n' "$*" >&2
+  exit 1
+}
+
+require_tools() {
+  command -v jq >/dev/null || die "jq is required (pacman -S jq)"
+  command -v yq >/dev/null || die "yq is required (pacman -S go-yq)"
+  # Arch's `yq` package is a different tool (a Python jq wrapper).
+  yq --version 2>&1 | grep -q mikefarah ||
+    die "yq must be mikefarah/yq v4 (pacman -S go-yq), found: $(yq --version 2>&1)"
+}
+
+# YAML file -> JSON on stdout. An empty file reads as null.
+to_json() {
+  local out
+  out="$(yq -o=json '.' "$1" 2>&1)" || die "${1#"$ROOT"/}: invalid YAML: $out"
+  [[ $(yq 'di' "$1" | wc -l) -le 1 ]] ||
+    die "${1#"$ROOT"/}: must hold a single YAML document (found a '---' separator)"
+  printf '%s\n' "${out:-null}"
+}
+
+# Reads one config document as JSON, prints one "<field>: <problem>" line per
+# error. $required: whether fields with no default must be present.
+# shellcheck disable=SC2016 # jq program, not shell expansions
+VALIDATE='
+def path_str: reduce .[] as $k (""; if ($k|type) == "number" then "\(.)[\($k)]" elif . == "" then $k else "\(.).\($k)" end);
+def err($p; $msg): "\($p): \($msg)";
+def got: "(got \(tojson))";
+
+def is_int: type == "number" and . == floor;
+def int_min($p; $min):
+  if . == null or (is_int and . >= $min) then empty
+  else err($p; "must be an integer >= \($min) \(got)") end;
+
+def str_match($p; $re; $what):
+  if . == null then empty
+  elif type != "string" or (test($re) | not) then err($p; "must be \($what) \(got)")
+  else empty end;
+
+def str_list($p; $re; $what):
+  if . == null then empty
+  elif type != "array" then err($p; "must be a list \(got)")
+  else to_entries[] | .key as $i | .value | str_match("\($p)[\($i)]"; $re; $what) end;
+
+def unknown_keys($prefix; $allowed):
+  keys[] | select(IN($allowed[]) | not) | err($prefix + .; "unknown field");
+
+if . == null then {} else . end
+| if type != "object" then err("(top level)"; "must be a mapping of fields \(got)")
+  else
+    unknown_keys(""; ["hostname", "claude_account", "resources", "packages", "tools", "skills", "repos"]),
+
+    (.hostname | str_match("hostname"; "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$";
+      "a lowercase hostname (letters, digits, inner dashes, max 63)")),
+
+    (if $required and .claude_account == null then err("claude_account"; "required")
+     else .claude_account | str_match("claude_account"; "^[A-Za-z0-9._-]+$";
+       "an account label (letters, digits, . _ -), not an email") end),
+
+    (.resources |
+      if . == null then empty
+      elif type != "object" then err("resources"; "must be a mapping \(got)")
+      else
+        unknown_keys("resources."; ["memory_mb", "swap_mb", "cores", "disk", "onboot"]),
+        (.memory_mb | int_min("resources.memory_mb"; 1)),
+        (.swap_mb | int_min("resources.swap_mb"; 0)),
+        (.cores | int_min("resources.cores"; 1)),
+        (.disk | str_match("resources.disk"; "^[1-9][0-9]*[MGT]$"; "a size like 40G")),
+        (.onboot | if . == null or type == "boolean" then empty
+                   else err("resources.onboot"; "must be true or false \(got)") end)
+      end),
+
+    (.packages | str_list("packages"; "^[a-z0-9@._+-]+$"; "a pacman package name")),
+    (.tools | str_list("tools"; "^[^@[:space:]]+@[^@[:space:]]+$"; "<tool>@<version>")),
+    (.skills | str_list("skills"; "^[A-Za-z0-9._:/-]+$"; "a skill name")),
+    (.repos | str_list("repos"; "^[A-Za-z0-9-]+/[A-Za-z0-9._-]+$"; "a GitHub <owner>/<repo>")),
+
+    (paths(type == "string") as $p | getpath($p)
+      | select(test("[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}"))
+      | err($p | path_str; "looks like an email address; this repo is public"))
+  end
+'
+
+# Defaults first, client second: mappings merge, lists replace, skills append.
+# shellcheck disable=SC2016 # jq program, not shell expansions
+MERGE='
+def strip_nulls: if type == "object" then with_entries(select(.value != null) | .value |= strip_nulls) else . end;
+($defaults | strip_nulls) as $d | ($client // {} | strip_nulls) as $c
+| ($d * $c)
+| .hostname //= "dev-\($name)"
+| .skills = (reduce (($d.skills // []) + ($c.skills // []))[] as $s ([]; if IN(.[]; $s) then . else . + [$s] end))
+| {hostname, claude_account, resources, packages, tools, skills, repos}
+'
+
+# Prints the errors of one file, prefixed with its repo-relative path.
+validate() {
+  local file="$1" json="$2" required="$3"
+  jq -r --argjson required "$required" "$VALIDATE" <<<"$json" |
+    sed "s|^|${file#"$ROOT"/}: |"
+}
+
+main() {
+  local format=yaml client=""
+  while (($#)); do
+    case "$1" in
+      --json) format=json ;;
+      -h | --help) usage; exit 0 ;;
+      -*) usage >&2; die "unknown option: $1" ;;
+      *) [[ -z $client ]] || die "expected one client, got '$client' and '$1'"; client="$1" ;;
+    esac
+    shift
+  done
+  [[ -n $client ]] || { usage >&2; exit 1; }
+
+  local file="$CLIENTS/$client.yaml"
+  [[ -f $file ]] || { usage >&2; die "no such client: $client (looked for clients/$client.yaml)"; }
+
+  # Underscore-prefixed files (the template) are not clients; their hostname
+  # derives from the name without the underscore.
+  local name="${client#_}"
+  [[ $name =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ && ${#name} -le 59 ]] ||
+    die "client name '$client' must be lowercase letters, digits and inner dashes, max 59 chars"
+
+  require_tools
+
+  local defaults_json client_json errors
+  defaults_json="$(to_json "$DEFAULTS")"
+  client_json="$(to_json "$file")"
+  errors="$(validate "$DEFAULTS" "$defaults_json" false; validate "$file" "$client_json" true)"
+  if [[ -n $errors ]]; then
+    printf '%s\n' "$errors" >&2
+    die "invalid config for client '$client'"
+  fi
+
+  local merged
+  merged="$(jq -n --argjson defaults "$defaults_json" --argjson client "$client_json" \
+    --arg name "$name" "$MERGE")"
+  if [[ $format == json ]]; then
+    printf '%s\n' "$merged"
+  else
+    yq -p=json -o=yaml -P '.' <<<"$merged"
+  fi
+}
+
+main "$@"

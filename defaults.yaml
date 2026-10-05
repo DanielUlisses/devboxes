@@ -1,0 +1,23 @@
+# Defaults every client inherits. bin/devbox-config merges a client file
+# over this one: mappings merge key by key, lists replace, except `skills`,
+# where the client's list is appended to the base list below.
+# `hostname` has no entry here: it defaults to dev-<client>.
+
+resources:
+  memory_mb: 10240   # memory ceiling
+  swap_mb: 2048
+  cores: 8
+  disk: 40G
+  onboot: true
+
+packages: []
+tools: []
+
+# Base skills every devbox gets.
+skills:
+  - ticket-skill
+  - tdd-skill
+  - humanizer-skill
+  - mattpocock-skills
+
+repos: []
