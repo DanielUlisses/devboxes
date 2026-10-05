@@ -12,10 +12,14 @@ add-a-client flow.
 
 ## Checks
 
+One-time setup per clone: `git config core.hooksPath .githooks`. The
+pre-commit hook runs the checks below on staged content and refuses secrets,
+emails and deny-listed host names (`.git/devbox-deny-hosts`).
+
 No test suite. After changing `bin/`, `host/`, `lib/`, `bootstrap.sh` or the schema:
 
 ```
-shellcheck bin/* host/* bootstrap.sh
+shellcheck bin/* lib/*.sh host/* bootstrap.sh .githooks/* dotfiles/bash/.[!.]*
 bin/devbox-config _template
 ```
 

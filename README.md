@@ -17,7 +17,34 @@ bootstrap.sh           first thing a new box runs: clones this repo, hands over 
 dotfiles/              bash, git, gh and nvim config stowed into every box (no identity, no secrets)
 lib/pve.sh             the one way bin/ scripts talk to the host
 host/setup.sh          prepares the dedicated Proxmox host (run on the host)
+.githooks/pre-commit   refuses commits that fail the checks or leak secrets
 ```
+
+## Pre-commit checks
+
+Once per clone:
+
+```
+git config core.hooksPath .githooks
+```
+
+The hook checks the staged content (not the working tree) and refuses the
+commit, naming the file and the reason, when:
+
+- `shellcheck` fails on a staged shell file (`bin/*`, `lib/*.sh`,
+  `bootstrap.sh`, `host/*.sh`, `.githooks/*`, `dotfiles/bash/*`);
+- `bin/devbox-config` rejects a staged client file or `_template` (a staged
+  `defaults.yaml` checks every client);
+- a staged file holds an email address (other than `users.noreply.github.com`,
+  or a `git@<host>` SSH remote),
+  a private key block, a 1Password token (`ops_…`), a GitHub token (`ghp_`,
+  `gho_`, `github_pat_`), or a host name listed in `.git/devbox-deny-hosts`.
+
+The deny-list is local and untracked, one host name per line (`#` comments
+allowed), so the names it blocks never have to be written into this repo.
+`DEVBOX_DENY_HOSTS` points the hook at another file. `shellcheck`, `yq` and
+`jq` come from PATH or, failing that, `mise exec`; a missing tool refuses the
+commit rather than skipping the check.
 
 ## Adding a client
 

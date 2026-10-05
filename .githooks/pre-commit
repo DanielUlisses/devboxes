@@ -1,0 +1,133 @@
+#!/usr/bin/env bash
+# Refuse a commit whose staged content fails shellcheck, fails
+# bin/devbox-config, or holds something this public repo must never hold.
+# Enable once per clone: git config core.hooksPath .githooks
+set -euo pipefail
+
+# Versions used through `mise exec` when a tool is not on PATH.
+MISE_TOOLS=(shellcheck@0.11.0 yq@4.54.1 jq@1.8.1)
+
+GIT_DIR_COMMON="$(git rev-parse --git-common-dir)"
+DENY_HOSTS="${DEVBOX_DENY_HOSTS:-$GIT_DIR_COMMON/devbox-deny-hosts}"
+
+failed=0
+refuse() {
+  printf 'pre-commit: %s\n' "$*" >&2
+  failed=1
+}
+
+mapfile -d '' staged < <(git diff --cached --name-only --diff-filter=ACMR -z)
+((${#staged[@]})) || exit 0
+
+# Check the index, not the working tree: export every staged file.
+tree="$(mktemp -d)"
+trap 'rm -rf "$tree"' EXIT
+git checkout-index -a --prefix="$tree/"
+
+# Succeeds (and refuses the commit, naming the tool) when <tool> is neither
+# runnable from PATH nor available through mise; queues it for mise otherwise.
+missing_tool() {
+  local tool="$1" spec
+  # A mise shim with no version set is on PATH but fails to run.
+  "$tool" --version &>/dev/null && return 1
+  if command -v mise >/dev/null; then
+    for spec in "${MISE_TOOLS[@]}"; do
+      [[ ${spec%@*} == "$tool" ]] && mise_specs+=("$spec") && return 1
+    done
+  fi
+  refuse "$tool not found on PATH or via mise; install it to commit"
+  return 0
+}
+mise_specs=()
+with_tools() {
+  if ((${#mise_specs[@]})); then
+    mise exec "${mise_specs[@]}" -- "$@"
+  else
+    "$@"
+  fi
+}
+
+# --- shellcheck ---------------------------------------------------------
+shell_files=()
+for f in "${staged[@]}"; do
+  case "$f" in
+    bin/* | lib/*.sh | bootstrap.sh | host/*.sh | .githooks/* | dotfiles/bash/*)
+      shell_files+=("$f") ;;
+  esac
+done
+if ((${#shell_files[@]})) && ! missing_tool shellcheck; then
+  # From the exported tree, so .shellcheckrc and sourced files are the staged ones.
+  if ! out="$(cd "$tree" && with_tools shellcheck -f gcc "${shell_files[@]}" 2>&1)"; then
+    printf '%s\n' "$out" >&2
+    refuse "shellcheck failed on staged files (above)"
+  fi
+fi
+
+# --- devbox-config ------------------------------------------------------
+clients=()
+defaults_staged=0
+for f in "${staged[@]}"; do
+  case "$f" in
+    defaults.yaml) defaults_staged=1 ;;
+    clients/[!_]*.yaml) clients+=("$(basename "$f" .yaml)") ;;
+  esac
+done
+if ((defaults_staged)); then
+  # A default change can break any client: check them all.
+  clients=()
+  for f in "$tree"/clients/[!_]*.yaml; do
+    [[ -e $f ]] && clients+=("$(basename "$f" .yaml)")
+  done
+  clients+=(_template)
+elif ((${#clients[@]})); then
+  clients+=(_template)
+fi
+if ((${#clients[@]})); then
+  mise_specs=()
+  missing=0
+  missing_tool jq && missing=1
+  missing_tool yq && missing=1
+  if ((!missing)); then
+    for c in $(printf '%s\n' "${clients[@]}" | sort -u); do
+      if ! out="$(with_tools "$tree/bin/devbox-config" "$c" 2>&1 >/dev/null)"; then
+        printf '%s\n' "$out" >&2
+        refuse "clients/$c.yaml$( ((defaults_staged)) && echo " with the staged defaults.yaml"): devbox-config rejected it (above)"
+      fi
+    done
+  fi
+fi
+
+# --- things the public repo must never hold -----------------------------
+# The line is not printed, so the secret does not land in a terminal log.
+scan() {
+  local file="$1" reason="$2" n
+  shift 2
+  while IFS=: read -r n _; do
+    refuse "$file:$n: $reason"
+  done < <(grep -nI "$@" "$tree/$file" || true)
+}
+deny=()
+if [[ -f $DENY_HOSTS ]]; then
+  while IFS= read -r h; do
+    h="${h%%#*}"; h="${h//[[:space:]]/}"
+    [[ -n $h ]] && deny+=("$h")
+  done <"$DENY_HOSTS"
+fi
+for f in "${staged[@]}"; do
+  [[ -f $tree/$f ]] || continue
+  while IFS=: read -r n _; do
+    refuse "$f:$n: email address (only users.noreply.github.com, and git@<host> remotes, are allowed)"
+  done < <(grep -noIE '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}' "$tree/$f" |
+    grep -vE '@users\.noreply\.github\.com$|^[0-9]+:git@' || true)
+  scan "$f" "private key block" -E -e '-----BEGIN [A-Z ]*PRIVATE KEY'
+  scan "$f" "1Password token (ops_...)" -E -e 'ops_[A-Za-z0-9_-]{16,}'
+  scan "$f" "GitHub token" -E -e '(ghp|gho)_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}'
+  for h in "${deny[@]}"; do
+    scan "$f" "deny-listed host name (from $DENY_HOSTS)" -iwF -e "$h"
+  done
+done
+
+if ((failed)); then
+  printf 'pre-commit: commit refused\n' >&2
+  exit 1
+fi
