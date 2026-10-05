@@ -1,0 +1,24 @@
+# Devbox git config, from dotfiles/git in the devboxes repo. This repo is
+# public: identity (user.name, user.email) and anything else per box goes in
+# ~/.gitconfig.local, which is included last.
+[alias]
+	co = checkout
+	br = branch
+	ci = commit
+	st = status
+[init]
+	defaultBranch = main
+[pull]
+	rebase = true
+[push]
+	autoSetupRemote = true
+[core]
+	excludesfile = ~/.config/git/ignore
+[credential "https://github.com"]
+	helper =
+	helper = !gh auth git-credential
+[credential "https://gist.github.com"]
+	helper =
+	helper = !gh auth git-credential
+[include]
+	path = ~/.gitconfig.local

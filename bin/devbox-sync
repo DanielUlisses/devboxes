@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# Sync a client's devbox from this machine: resolves the client's config here
+# (uncommitted edits included) and runs `devbox sync` with it inside the box,
+# over ssh to the Proxmox host and pct exec.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+# shellcheck source-path=SCRIPTDIR/.. source=lib/pve.sh
+source "$ROOT/lib/pve.sh"
+
+usage() {
+  cat <<EOF
+Usage: devbox-sync <client>
+
+Converge the devbox for clients/<client>.yaml on \$DEVBOX_HOST (required)
+to this checkout's resolved config: install and remove pacman packages and
+mise tools to match it.
+EOF
+}
+
+main() {
+  local client=""
+  while (($#)); do
+    case "$1" in
+      -h | --help) usage; exit 0 ;;
+      -*) usage >&2; die "unknown option: $1" ;;
+      *) [[ -z $client ]] || die "expected one client, got '$client' and '$1'"; client="$1" ;;
+    esac
+    shift
+  done
+  [[ -n $client ]] || { usage >&2; exit 1; }
+
+  local config hostname vmid
+  config="$("$ROOT/bin/devbox-config" --json "$client")" || exit 1
+  hostname="$(jq -r .hostname <<<"$config")"
+  vmid="$(find_devbox "$hostname")"
+  [[ -n $vmid ]] || die "no $hostname on $DEVBOX_HOST; create it with bin/devbox-create $client"
+  assert_devbox "$vmid" "$hostname"
+  [[ $(pve pct status "$vmid") == "status: running" ]] || die "$hostname (VMID $vmid) is not running"
+
+  say "syncing $hostname (VMID $vmid)"
+  pve pct exec "$vmid" -- /usr/local/bin/devbox sync --config-json "$(jq -c . <<<"$config")"
+}
+
+main "$@"

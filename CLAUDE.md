@@ -12,10 +12,10 @@ add-a-client flow.
 
 ## Checks
 
-No test suite. After changing `bin/`, `host/` or the schema:
+No test suite. After changing `bin/`, `host/`, `lib/`, `bootstrap.sh` or the schema:
 
 ```
-shellcheck bin/* host/*
+shellcheck bin/* host/* bootstrap.sh
 bin/devbox-config _template
 ```
 

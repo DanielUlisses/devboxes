@@ -1,0 +1,7 @@
+# Devbox gh config, from dotfiles/gh in the devboxes repo. The token lives in
+# hosts.yml next to this link, written by gh auth login, never in the repo.
+version: 1
+git_protocol: https
+prompt: enabled
+aliases:
+    co: pr checkout

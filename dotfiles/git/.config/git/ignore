@@ -1,0 +1,7 @@
+*~
+*.log
+.DS_Store
+Thumbs.db
+.idea/
+.cursor/
+**/.claude/settings.local.json

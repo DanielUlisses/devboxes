@@ -9,8 +9,12 @@ defaults.yaml          defaults every client inherits (resources, base skills)
 clients/_template.yaml documented template; every field explained
 clients/<client>.yaml  one file per client
 bin/devbox-config      prints a client's resolved config, or fails naming the bad field
-bin/devbox-create      creates and starts a client's container on the Proxmox host
+bin/devbox-create      creates, starts and bootstraps a client's container on the Proxmox host
+bin/devbox-sync        syncs a client's box to this checkout's config, from your machine
 bin/devbox-destroy     stops and destroys it
+bin/devbox             runs inside a box: `devbox bootstrap`, `devbox sync`
+bootstrap.sh           first thing a new box runs: clones this repo, hands over to devbox
+dotfiles/              bash, git and gh config stowed into every box (no identity, no secrets)
 lib/pve.sh             the one way bin/ scripts talk to the host
 host/setup.sh          prepares the dedicated Proxmox host (run on the host)
 ```
@@ -56,7 +60,12 @@ must be exported (host names stay out of this public repo). `devbox-create` make
 with `nesting=1` and `/dev/net/tun`, hostname from the config, tag `devbox`,
 the first free VMID in 2000-2099, sized from `resources`, then starts it.
 `--light` caps it at 1 GB memory, 512 MB swap, 1 core and an 8 GB disk; `--dry-run` runs
-every check and prints the `pct create` command instead of running it.
+every check and prints the `pct create` and `pct exec` commands instead of running them.
+
+Once started, the box bootstraps itself: `devbox-create` looks up the pushed
+head of the repo's `main` on GitHub (`DEVBOX_BRANCH` picks another branch)
+and `pct exec`s a fetch of `bootstrap.sh` at that commit. The box clones this
+public repo, so the client file and any script changes must be pushed first.
 
 The test host is shared, so the scripts never change the host itself:
 `lib/pve.sh` only lets through `pct create/start/stop/destroy/exec/list`
@@ -69,8 +78,47 @@ re-read from its live config just before; with no such container it exits 0.
 
 The Arch template must already be on the host (downloading it is a host
 change, left to a person): `pveam download local archlinux-base_<date>_amd64.tar.zst`.
-Overrides: `DEVBOX_HOST`, `DEVBOX_STORAGE` (rootfs, default `local-lvm`),
+Overrides: `DEVBOX_HOST`, `DEVBOX_BRANCH` (default `main`), `DEVBOX_STORAGE` (rootfs, default `local-lvm`),
 `DEVBOX_TEMPLATE_STORAGE` (default `local`), `DEVBOX_BRIDGE` (default `vmbr0`).
+
+## Inside a box
+
+`bootstrap.sh` gets pacman working (keyring, mirror), clones this repo to
+`/opt/devboxes` at the pinned commit, records the client and branch in
+`/var/lib/devbox/`, then runs `devbox bootstrap`, which:
+
+- installs the base packages (`base-devel git openssh sudo stow jq go-yq
+  unzip mise github-cli tailscale bash-completion`) and enables `tailscaled`;
+- adds user `daniel` with passwordless sudo, and `devbox` on the PATH;
+- installs Claude Code (native installer) and puts herdr and the 1Password
+  CLI (`op`) in mise's system config, `/etc/mise/config.toml`;
+- stows this repo's `dotfiles/` packages (`bash`, `git`, `gh`) into the
+  user's home (files in the way are moved to `<file>.bak`). They hold no
+  identity: git's `user.name`/`user.email` go in `~/.gitconfig.local`, shell
+  extras in `~/.bashrc.local`, and git authenticates through `gh`;
+- ends with `devbox sync`.
+
+Every step checks first, so re-running `devbox bootstrap` is safe.
+
+```
+devbox sync                 # inside the box, as daniel or root
+bin/devbox-sync <client>    # from your machine
+```
+
+`devbox sync` pulls the box's branch of this repo and converges the box to
+the client's resolved config; `bin/devbox-sync` instead resolves the config
+in your checkout (uncommitted edits included) and runs the sync with it over
+`ssh` and `pct exec`, without pulling. A sync:
+
+- **packages:** installs listed packages that are missing. Packages dropped
+  from the list since the last sync (recorded in `/var/lib/devbox/packages`)
+  are marked as dependencies and removed with `pacman -Rns` unless another
+  package still needs them. Base packages are never removed.
+- **tools:** writes `~/.config/mise/config.toml` from `tools:` (a tool listed
+  twice gets both versions, the first the default), then `mise install` and
+  `mise prune`, which drops versions no config uses.
+
+With nothing changed, a sync installs and removes nothing.
 
 ## The Proxmox host
 

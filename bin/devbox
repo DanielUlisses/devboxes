@@ -1,0 +1,241 @@
+#!/usr/bin/env bash
+# The devbox command, run inside a devbox. `devbox bootstrap` sets up a fresh
+# box (bootstrap.sh hands over to it) and ends with a sync. `devbox sync`
+# converges the box to its client's resolved config: pacman packages and mise
+# tools. Both run as root, re-running themselves under sudo when needed.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+STATE=/var/lib/devbox
+USER_NAME=daniel
+USER_HOME=/home/$USER_NAME
+export LC_ALL=C # one collation for sort and comm
+
+# Installed by bootstrap; sync never removes them.
+BASE_PACKAGES=(base-devel git openssh sudo stow jq go-yq unzip mise github-cli tailscale bash-completion)
+
+# mise tools every box gets, kept in the system config so the client's tools:
+# list (the user config) can't drop them.
+BASE_TOOLS='# Written by devbox bootstrap: tools every devbox gets.
+[tools]
+herdr = "latest"
+1password = "latest"'
+
+# Stow packages under dotfiles/ in this repo.
+DOTFILES_PACKAGES=(bash git gh)
+
+usage() {
+  cat <<EOF
+Usage: devbox bootstrap
+       devbox sync [--config-json <json>]
+
+Run inside a devbox.
+
+  bootstrap  set up a fresh box (user $USER_NAME, base packages, claude, herdr,
+             1Password CLI, gh, tailscale, mise, dotfiles), then sync
+  sync       converge the box to its client's config: pull the devboxes
+             repo, then install and remove pacman packages and mise tools.
+             --config-json applies a resolved config (bin/devbox-config
+             --json) instead, without pulling; bin/devbox-sync uses it.
+EOF
+}
+
+die() {
+  printf 'devbox: %s\n' "$*" >&2
+  exit 1
+}
+
+say() {
+  printf 'devbox: %s\n' "$*" >&2
+}
+
+# Runs a command as the box user, in their home, with their tools on PATH.
+as_user() {
+  runuser -u "$USER_NAME" -- env -C "$USER_HOME" HOME="$USER_HOME" USER="$USER_NAME" LOGNAME="$USER_NAME" \
+    PATH="$USER_HOME/.local/bin:$USER_HOME/.local/share/mise/shims:/usr/local/bin:/usr/bin" \
+    MISE_YES=1 "$@"
+}
+
+# Writes $2 to file $1 (mode $3) when its content differs; returns 1 when unchanged.
+write_if_changed() {
+  local file="$1" content="$2" mode="$3"
+  [[ -f $file && $(<"$file") == "$content" ]] && return 1
+  install -D -m "$mode" /dev/stdin "$file" <<<"$content"
+}
+
+# The client's resolved config, as JSON: from --config-json, or by pulling the
+# repo's branch and resolving the client recorded at bootstrap.
+resolve_config() {
+  local json="$1" client branch
+  if [[ -z $json ]]; then
+    client="$(<"$STATE/client")"
+    branch="$(<"$STATE/branch")"
+    # Called in $(...), where set -e doesn't reach, so each step checks itself.
+    git -C "$ROOT" fetch -q origin "$branch" || die "could not fetch $branch of the devboxes repo"
+    git -C "$ROOT" -c advice.detachedHead=false checkout -q --detach FETCH_HEAD || die "could not check out $branch"
+    json="$("$ROOT/bin/devbox-config" --json "$client")" || exit 1
+  fi
+  jq -e '(.packages | type) == "array" and (.tools | type) == "array"' <<<"$json" >/dev/null 2>&1 ||
+    die "not a resolved config (want the output of devbox-config --json)"
+  printf '%s\n' "$json"
+}
+
+# Pacman packages: install the listed ones that are missing; for the ones
+# dropped since the last sync (recorded in $STATE/packages), mark them as
+# dependencies and `pacman -Rns` those nothing else needs. Base packages stay.
+sync_packages() {
+  local config="$1" want had missing=() dropped=() orphans=()
+  want="$(jq -r '.packages[]' <<<"$config" | sort -u)"
+  had="$(sort -u "$STATE/packages" 2>/dev/null || true)"
+  local -a wanted=()
+  [[ -z $want ]] || mapfile -t wanted <<<"$want"
+
+  if ((${#wanted[@]})); then
+    # pacman -T prints the ones not installed.
+    mapfile -t missing < <(pacman -T -- "${wanted[@]}" || true)
+    if ((${#missing[@]})); then
+      say "packages: installing ${missing[*]}"
+      pacman -Syu --needed --noconfirm -- "${missing[@]}"
+    fi
+    # A listed package already there as a dependency becomes explicit, so a
+    # later -Rns can't take it along.
+    { pacman -Qdq -- "${wanted[@]}" 2>/dev/null || true; } | xargs -r pacman -D --asexplicit -q -- >/dev/null
+  fi
+
+  mapfile -t dropped < <(comm -13 <(printf '%s\n' "$want") <(printf '%s\n' "$had") |
+    grep -vxF -f <(printf '%s\n' "${BASE_PACKAGES[@]}") | grep . || true)
+  ((${#dropped[@]} == 0)) || mapfile -t dropped < <(pacman -Qq -- "${dropped[@]}" 2>/dev/null || true)
+  if ((${#dropped[@]})); then
+    pacman -D --asdeps -q -- "${dropped[@]}" >/dev/null
+    mapfile -t orphans < <(pacman -Qdtq | grep -xF -f <(printf '%s\n' "${dropped[@]}") || true)
+    if ((${#orphans[@]})); then
+      say "packages: removing ${orphans[*]}"
+      pacman -Rns --noconfirm -- "${orphans[@]}"
+    fi
+    mapfile -t dropped < <(pacman -Qq -- "${dropped[@]}" 2>/dev/null || true)
+    ((${#dropped[@]} == 0)) || say "packages: kept ${dropped[*]}: other packages need them"
+  fi
+
+  ((${#missing[@]} + ${#orphans[@]} + ${#dropped[@]})) || say "packages: up to date"
+  mkdir -p "$STATE"
+  printf '%s\n' "$want" | grep . >"$STATE/packages.new" || true
+  mv "$STATE/packages.new" "$STATE/packages"
+}
+
+# The client's tools: list as a mise [tools] table. Repeated tools become a
+# list of versions, the first one the default.
+# shellcheck disable=SC2016 # jq program, not shell expansions
+MISE_TOML='
+"# Written by devbox sync from the client'"'"'s tools: list; edits are overwritten.",
+"[tools]",
+(reduce (.tools[] | capture("^(?<n>[^@]+)@(?<v>.+)$")) as $t ({}; .[$t.n] += [$t.v])
+ | to_entries[]
+ | "\(.key | tojson) = \(if (.value | length) == 1 then .value[0] else .value end | tojson)")
+'
+
+# mise tools: write the user config from tools:, then install what's missing
+# and prune what no config references any more.
+sync_tools() {
+  local config="$1" toml file="$USER_HOME/.config/mise/config.toml"
+  toml="$(jq -r "$MISE_TOML" <<<"$config")"
+  if [[ ! -f $file || $(<"$file") != "$toml" ]]; then
+    as_user mkdir -p "${file%/*}"
+    # tee reads the here-string on its stdin; the user can't reopen root's /dev/stdin.
+    as_user tee "$file" >/dev/null <<<"$toml"
+    say "tools: wrote ${file/#$USER_HOME/\~}"
+  fi
+  as_user mise install
+  as_user mise prune --yes
+}
+
+sync() {
+  local config
+  config="$(resolve_config "${1:-}")"
+  sync_packages "$config"
+  sync_tools "$config"
+  say "synced"
+}
+
+# Stows this repo's dotfiles/ packages (bash, git, gh) into the user's home.
+# Real files in the way (the skeleton .bashrc) are moved aside.
+dotfiles() {
+  local repo="$ROOT/dotfiles" pkg rel target
+  for pkg in "${DOTFILES_PACKAGES[@]}"; do
+    while IFS= read -r rel; do
+      target="$USER_HOME/$rel"
+      if [[ -e $target && ! -L $target ]]; then
+        mv "$target" "$target.bak"
+        say "dotfiles: moved ${target/#$USER_HOME/\~} aside to $rel.bak"
+      fi
+    done < <(cd "$repo/$pkg" && find . -type f -printf '%P\n')
+  done
+  # Real directories, so stow links the files inside them: otherwise gh would
+  # write its token (hosts.yml) into the repo checkout.
+  as_user mkdir -p "$USER_HOME/.config/gh" "$USER_HOME/.config/git"
+  as_user stow -d "$repo" -t "$USER_HOME" -R "${DOTFILES_PACKAGES[@]}"
+}
+
+bootstrap() {
+  say "base packages"
+  pacman -Syu --needed --noconfirm -- "${BASE_PACKAGES[@]}"
+  # Explicit, so removing a client package never takes a base one along.
+  pacman -D --asexplicit -q -- "${BASE_PACKAGES[@]}" >/dev/null
+  "$ROOT/bin/devbox-config" --json "$(<"$STATE/client")" >/dev/null || exit 1
+
+  say "user $USER_NAME"
+  id "$USER_NAME" &>/dev/null || useradd -m -G wheel -s /bin/bash "$USER_NAME"
+  if write_if_changed /etc/sudoers.d/devbox "$USER_NAME ALL=(ALL:ALL) NOPASSWD: ALL" 440; then
+    visudo -cqf /etc/sudoers.d/devbox || { rm -f /etc/sudoers.d/devbox; die "invalid sudoers entry"; }
+  fi
+  ln -sfn "$ROOT/bin/devbox" /usr/local/bin/devbox
+  # Login shells (ssh <box> claude) find the user's tools without .bashrc.
+  # shellcheck disable=SC2016 # expanded at login, not here
+  write_if_changed /etc/profile.d/devbox.sh \
+    'PATH="$HOME/.local/bin:$HOME/.local/share/mise/shims:$PATH"' 644 || true
+
+  say "tailscale"
+  # Containers boot systemd; skip when there is none (a plain chroot or image).
+  if [[ -d /run/systemd/system ]]; then
+    systemctl enable --now tailscaled
+  else
+    say "tailscale: no systemd, tailscaled not started"
+  fi
+
+  say "claude, herdr, 1Password CLI"
+  [[ -x $USER_HOME/.local/bin/claude ]] || as_user bash -c 'curl -fsSL https://claude.ai/install.sh | bash'
+  write_if_changed /etc/mise/config.toml "$BASE_TOOLS" 644 || true # installed by the sync below
+
+  say "dotfiles"
+  dotfiles
+
+  sync
+}
+
+main() {
+  local args=("$@") cmd="${1:-}" config_json=""
+  [[ -n $cmd ]] || { usage >&2; exit 1; }
+  shift
+  case "$cmd" in
+    -h | --help) usage; exit 0 ;;
+    bootstrap) (($# == 0)) || die "bootstrap takes no arguments" ;;
+    sync)
+      while (($#)); do
+        case "$1" in
+          --config-json) (($# >= 2)) || die "--config-json needs a value"; config_json="$2"; shift ;;
+          *) usage >&2; die "unknown argument: $1" ;;
+        esac
+        shift
+      done
+      ;;
+    *) usage >&2; die "unknown command: $cmd" ;;
+  esac
+  [[ -f $STATE/client ]] || die "no client recorded in $STATE/client: is this a devbox? (bootstrap.sh records it)"
+  ((EUID == 0)) || exec sudo "$0" "${args[@]}"
+
+  case "$cmd" in
+    bootstrap) bootstrap ;;
+    sync) sync "$config_json" ;;
+  esac
+}
+
+main "$@"

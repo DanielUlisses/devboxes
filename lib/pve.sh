@@ -1,5 +1,5 @@
 # shellcheck shell=bash
-# Proxmox access shared by bin/devbox-create and bin/devbox-destroy. Sourced,
+# Proxmox access shared by the bin/devbox-* scripts. Sourced,
 # not run. Every call to the host goes through pve(), which only lets through
 # the commands listed there: the host is shared, so no host-level changes.
 
@@ -53,4 +53,28 @@ assert_devbox() {
     die "VMID $vmid's hostname is not $hostname; not touching it"
   grep '^tags:' <<<"$config" | sed 's/^tags: *//' | tr ';, ' '\n' | grep -qxF "$DEVBOX_TAG" ||
     die "VMID $vmid is not tagged $DEVBOX_TAG; not touching it"
+}
+
+# Guests named $h that are devbox containers ("ours") and those that aren't.
+# shellcheck disable=SC2016 # jq program, not shell expansions
+DEVBOX_GUESTS_JQ='
+[.[] | select(.name == $h)]
+| map(select(.type == "lxc" and .vmid >= $lo and .vmid <= $hi
+             and ((.tags // "") | [splits("[;, ]")] | index([$tag]))))  as $ours
+| {ours: [$ours[].vmid], others: [.[] | select(IN($ours[]) | not) | "\(.type)/\(.vmid)"]}
+'
+
+# Prints the VMID of the devbox container named $1, or nothing when there is
+# none. Fails when the name also belongs to another guest, or to several.
+# Called in $(...), where set -e doesn't reach, so each step checks itself.
+find_devbox() {
+  local hostname="$1" split ours others
+  split="$(guests | jq -c --arg h "$hostname" --arg tag "$DEVBOX_TAG" \
+    --argjson lo "$VMID_MIN" --argjson hi "$VMID_MAX" "$DEVBOX_GUESTS_JQ")" || exit 1 # pve or jq said why
+  ours="$(jq -r '.ours | join(" ")' <<<"$split")"
+  others="$(jq -r '.others | join(" ")' <<<"$split")"
+  [[ -z $others ]] ||
+    die "refusing: $hostname also names $others, not a $DEVBOX_TAG container in $VMID_MIN-$VMID_MAX"
+  [[ $ours != *" "* ]] || die "refusing: several containers named $hostname: $ours"
+  printf '%s' "$ours"
 }

@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Create and start a client's devbox: an unprivileged Arch container on the
-# Proxmox host, sized from the client's resolved config.
+# Proxmox host, sized from the client's resolved config, then bootstrapped
+# from bootstrap.sh at the pushed commit of the repo's branch.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
@@ -11,6 +12,18 @@ ROOTFS_STORAGE="${DEVBOX_STORAGE:-local-lvm}"
 TEMPLATE_STORAGE="${DEVBOX_TEMPLATE_STORAGE:-local}"
 BRIDGE="${DEVBOX_BRIDGE:-vmbr0}"
 MIN_FREE_MB=1024
+REPO=DanielUlisses/devboxes
+BRANCH="${DEVBOX_BRANCH:-main}"
+
+# Runs inside the new container: fetches bootstrap.sh ($1), retrying while its
+# network comes up, and runs it with the remaining arguments.
+# shellcheck disable=SC2016 # expanded in the container, not here
+FETCH_BOOTSTRAP='for _ in {1..30}; do
+  curl -fsSL "$1" -o /root/bootstrap.sh && exec bash /root/bootstrap.sh "${@:2}"
+  sleep 2
+done
+echo "could not fetch $1" >&2
+exit 1'
 
 usage() {
   cat <<EOF
@@ -18,10 +31,12 @@ Usage: devbox-create [--light] [--dry-run] <client>
 
 Create and start the devbox container for clients/<client>.yaml on
 \$DEVBOX_HOST (required), using the first free VMID in
-$VMID_MIN-$VMID_MAX.
+$VMID_MIN-$VMID_MAX, then bootstrap it from bootstrap.sh at the pushed
+head of $REPO's \$DEVBOX_BRANCH (default main). The client file
+must be pushed there too.
 
   --light    cap it at 1 GB memory, 512 MB swap, 1 core and an 8 GB disk
-  --dry-run  run every check, then print the pct create command instead
+  --dry-run  run every check, then print the pct commands instead
 EOF
 }
 
@@ -85,6 +100,11 @@ main() {
   pveam update && pveam available --section system | grep archlinux
   pveam download $TEMPLATE_STORAGE <archlinux-base_...tar.zst>"
 
+  # The box clones the public repo, so it can only follow what's pushed.
+  local commit
+  commit="$(git ls-remote "https://github.com/$REPO.git" "refs/heads/$BRANCH" | cut -f1)"
+  [[ $commit =~ ^[0-9a-f]{40}$ ]] || die "could not find branch $BRANCH on github.com/$REPO: is it pushed?"
+
   local create=(pct create "$vmid" "$template"
     --hostname "$hostname"
     --tags "$DEVBOX_TAG"
@@ -95,9 +115,14 @@ main() {
     --rootfs "$ROOTFS_STORAGE:$disk"
     --net0 "name=eth0,bridge=$BRIDGE,ip=dhcp"
     --onboot "$onboot")
+  local bootstrap=(pct exec "$vmid" -- bash -c "$FETCH_BOOTSTRAP" bootstrap
+    "https://raw.githubusercontent.com/$REPO/$commit/bootstrap.sh"
+    "$client" "https://github.com/$REPO.git" "$BRANCH" "$commit")
 
   if $dry_run; then
     printf '%q ' "${create[@]}"
+    printf '\n'
+    printf '%q ' "${bootstrap[@]}"
     printf '\n'
     exit 0
   fi
@@ -106,7 +131,10 @@ main() {
   pve "${create[@]}"
   assert_devbox "$vmid" "$hostname"
   pve pct start "$vmid"
-  say "started $hostname (VMID $vmid)"
+  say "started $hostname (VMID $vmid); bootstrapping from $REPO@${commit:0:12}"
+  pve "${bootstrap[@]}" ||
+    die "bootstrap failed in $hostname (VMID $vmid); fix it, then bin/devbox-destroy $client and create again"
+  say "bootstrapped $hostname"
 }
 
 main "$@"

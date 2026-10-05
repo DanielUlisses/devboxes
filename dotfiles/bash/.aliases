@@ -1,0 +1,23 @@
+# shellcheck shell=bash
+alias g='git'
+alias gaa='git add -A'
+alias gco='git checkout'
+alias gcb='git checkout -b'
+alias gp='git push'
+alias gl='git pull'
+alias gcm='git commit -m'
+alias gcam='git commit -a -m'
+alias gcad='git commit -a --amend'
+alias d='docker'
+alias k='kubectl'
+alias kga='kubectl get all'
+alias kgs='kubectl get svc'
+alias kgp='kubectl get pods'
+alias decompress='tar -xzf'
+alias review='herdr plugin action invoke open --plugin persiyanov.reviewr'
+
+gaap() { git add -A && git commit -m "$*" && git push; }
+gpsup() { git push --set-upstream origin "$(git rev-parse --abbrev-ref HEAD)"; }
+gaapsup() { git add -A && git commit -m "$*" && gpsup; }
+kd() { kubectl describe "$@"; }
+compress() { tar -czf "${1%/}.tar.gz" "${1%/}"; }
