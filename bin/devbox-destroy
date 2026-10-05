@@ -2,7 +2,7 @@
 # Stop and destroy a client's devbox container. Only ever touches a container
 # tagged devbox, in the devbox VMID range, whose hostname is the client's.
 # First, inside the box, `devbox logout` deletes the box's SSH keys from
-# GitHub and logs it out of tailscale.
+# GitHub and logs it out of tailscale. Its backup job, if any, goes first.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
@@ -16,7 +16,8 @@ Usage: devbox-destroy [--skip-logout] <client>
 Stop and destroy the devbox container for <client> (see devbox-config) on
 \$DEVBOX_HOST (required). Exits 0 when there is none. First runs
 \`devbox logout\` in the box (starting it if stopped): deletes its SSH keys
-from GitHub and logs it out of tailscale.
+from GitHub and logs it out of tailscale. Removes the box's backup job
+first, if it has one (its backups stay on the storage).
 
   --skip-logout  destroy without it, for a box too broken to run it; then
                  delete its keys (titled with its hostname) on GitHub by hand
@@ -46,6 +47,9 @@ main() {
   fi
 
   assert_devbox "$vmid" "$hostname"
+  # Left behind, the job would back up whichever box gets this VMID next.
+  sync_backup_job "$hostname" "$vmid" '{"backup": false}' ||
+    die "could not remove backup job $(backup_job_id "$hostname"); not destroying $hostname"
   status="$(pve pct status "$vmid")"
   if $logout; then
     if [[ $status != "status: running" ]]; then
