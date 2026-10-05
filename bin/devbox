@@ -2,17 +2,25 @@
 # The devbox command, run inside a devbox. `devbox bootstrap` sets up a fresh
 # box (bootstrap.sh hands over to it) and ends with a sync. `devbox sync`
 # converges the box to its client's resolved config: pacman packages, mise
-# tools and cloned repos, then (once `finish` has run) `devbox update`. Both
-# run as root, re-running themselves under sudo when needed. `devbox login`,
-# `finish`, `update` and `logout` run as the box user (root hands them over):
-# the manual logins, then the per-box key, skills and repos, bringing what
-# those installed current, and the cleanup bin/devbox-destroy runs before
-# destroying the box. `devbox rc` starts Claude Remote Control in a new herdr
-# pane in ~/work.
+# tools and cloned repos, then (once `finish` has run) `devbox update`. That
+# config comes from the machine that created or last synced the box (kept in
+# /var/lib/devbox/config.json), or, once gh is logged in, from the private
+# devbox-clients repo. Both run as root, re-running themselves under sudo
+# when needed. `devbox login`, `finish`, `update` and `logout` run as the box
+# user (root hands them over): the manual logins, then the per-box key,
+# skills and repos, bringing what those installed current, and the cleanup
+# bin/devbox-destroy runs before destroying the box. `devbox rc` starts
+# Claude Remote Control in a new herdr pane in ~/work.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
 STATE=/var/lib/devbox
+# The last resolved config this box was given or resolved, as JSON.
+CONFIG=$STATE/config.json
+# The private repo holding the client files, cloned with gh once it is logged
+# in.
+CLIENTS_REPO=DanielUlisses/devbox-clients
+CLIENTS_DIR=/opt/devbox-clients
 USER_NAME=daniel
 USER_HOME=/home/$USER_NAME
 export LC_ALL=C # one collation for sort and comm
@@ -68,10 +76,12 @@ Run inside a devbox.
   bootstrap  set up a fresh box (user $USER_NAME, base packages, claude, herdr,
              1Password CLI, gh, tailscale, mise, dotfiles), then sync
   sync       converge the box to its client's config: pull the devboxes
-             repo, then install and remove pacman packages and mise tools,
-             and clone newly listed repos, then run update once finish
-             has. --config-json applies a resolved config (bin/devbox-config
-             --json) instead, without pulling; bin/devbox-sync uses it.
+             repo and, once gh is logged in, $CLIENTS_REPO (before
+             that, the last config the box was given), then install and
+             remove pacman packages and mise tools, clone newly listed
+             repos, and run update once finish has. --config-json applies
+             a resolved config (bin/devbox-config --json) instead, without
+             pulling; bin/devbox-sync uses it.
   login      the manual logins, interactive: tailscale, gh, the client's
              1Password service-account token, Claude
   finish     after login: this box's SSH key on GitHub (auth and signing),
@@ -113,8 +123,37 @@ write_if_changed() {
   install -D -m "$mode" /dev/stdin "$file" <<<"$content"
 }
 
+# Fails unless $1 is a resolved config (devbox-config --json output).
+check_config() {
+  jq -e '(.hostname | type == "string") and ([.packages, .tools, .skills, .repos] | all(type == "array"))' \
+    <<<"$1" >/dev/null 2>&1 || die "not a resolved config (want the output of devbox-config --json)"
+}
+
+# The last config this box was given or resolved, as JSON. Readable by the
+# box user, without gh.
+stored_config() {
+  [[ -f $CONFIG ]] ||
+    die "no config in $CONFIG: run bin/devbox-sync <client> from your machine, or devbox login then devbox sync"
+  check_config "$(<"$CONFIG")"
+  cat "$CONFIG"
+}
+
+# Clones or updates $CLIENTS_REPO in $CLIENTS_DIR, as the box user, with gh.
+# Read only here, so it follows the remote's default branch, detached.
+pull_clients() {
+  if [[ ! -d $CLIENTS_DIR/.git ]]; then
+    install -d -o "$USER_NAME" -g "$USER_NAME" "$CLIENTS_DIR"
+    as_user gh repo clone "$CLIENTS_REPO" "$CLIENTS_DIR" -- -q || die "could not clone $CLIENTS_REPO"
+  fi
+  as_user git -C "$CLIENTS_DIR" fetch -q origin HEAD || die "could not fetch $CLIENTS_REPO"
+  as_user git -C "$CLIENTS_DIR" -c advice.detachedHead=false checkout -q --detach FETCH_HEAD ||
+    die "could not check out $CLIENTS_REPO"
+}
+
 # The client's resolved config, as JSON: from --config-json, or by pulling the
-# repo's branch and resolving the client recorded at bootstrap.
+# repo's branch and resolving the client recorded at bootstrap from the
+# private clients repo, which needs gh logged in; until then, the stored
+# config. Whatever it resolves to is stored for the next sync.
 resolve_config() {
   local json="$1" client branch
   if [[ -z $json ]]; then
@@ -123,10 +162,16 @@ resolve_config() {
     # Called in $(...), where set -e doesn't reach, so each step checks itself.
     git -C "$ROOT" fetch -q origin "$branch" || die "could not fetch $branch of the devboxes repo"
     git -C "$ROOT" -c advice.detachedHead=false checkout -q --detach FETCH_HEAD || die "could not check out $branch"
-    json="$("$ROOT/bin/devbox-config" --json "$client")" || exit 1
+    if as_user gh auth status -h github.com &>/dev/null; then
+      pull_clients
+      json="$(DEVBOX_CLIENTS="$CLIENTS_DIR" "$ROOT/bin/devbox-config" --json "$client")" || exit 1
+    else
+      say "config: gh is not logged in, so using the last config this box was given ($CONFIG)"
+      json="$(stored_config)" || exit 1
+    fi
   fi
-  jq -e '[.packages, .tools, .repos] | all(type == "array")' <<<"$json" >/dev/null 2>&1 ||
-    die "not a resolved config (want the output of devbox-config --json)"
+  check_config "$json"
+  write_if_changed "$CONFIG" "$json" 644 || true
   printf '%s\n' "$json"
 }
 
@@ -241,19 +286,13 @@ sync() {
   sync_packages "$config"
   sync_tools "$config"
   sync_repos "$config"
+  # Runs the checkout's devbox, which the pull above may have just changed.
   if [[ ! -f $FINISHED ]]; then
     say "update: skipped until devbox finish has run"
-  # The checkout's devbox, which the pull above may have just changed.
   elif ! as_user "$ROOT/bin/devbox" update --config-json "$(jq -c . <<<"$config")" ${no_upgrade:+"$no_upgrade"}; then
     die "synced, but some update steps failed (above)"
   fi
   say "synced"
-}
-
-# The client's resolved config from this checkout, without pulling (the box
-# user can't write the root-owned checkout).
-local_config() {
-  "$ROOT/bin/devbox-config" --json "$(<"$STATE/client")"
 }
 
 gh_logged_in() {
@@ -277,7 +316,7 @@ gh_has_scopes() {
 # asks for what's missing.
 login() {
   local config account token scopes
-  config="$(local_config)" || exit 1
+  config="$(stored_config)" || exit 1
   account="$(jq -r .claude_account <<<"$config")"
   scopes="$(IFS=,; echo "${GH_SCOPES[*]}")"
 
@@ -437,7 +476,7 @@ install_skill() {
 # signing, the base and client skills, the mattpocock plugin, then repos.
 finish() {
   local config title skill
-  config="$(local_config)" || exit 1
+  config="$(stored_config)" || exit 1
   title="$(jq -r .hostname <<<"$config")" # dev-<client> unless the client file sets one
   gh_logged_in || die "gh is not logged in: run devbox login first"
   gh_has_scopes || die "gh lacks the ${GH_SCOPES[*]} scopes: run devbox login again"
@@ -457,7 +496,7 @@ finish() {
   while IFS= read -r skill; do
     install_skill "$skill"
   done < <(jq -r '.skills[]' <<<"$config")
-  say "skills: installed"
+  say "skills: all installed"
 
   sync_repos "$config"
   mkdir -p "${FINISHED%/*}"
@@ -530,9 +569,9 @@ update_plugins() {
 # pacman -Syu: Arch upgrades the whole system together, base packages with it.
 update_pacman() {
   local before upgraded=()
-  before="$(pacman -Q)"
+  before="$(pacman -Q | sort)"
   sudo pacman -Syu --noconfirm -q >/dev/null
-  mapfile -t upgraded < <(comm -13 <(printf '%s\n' "$before") <(pacman -Q) | cut -d' ' -f1)
+  mapfile -t upgraded < <(comm -13 <(printf '%s\n' "$before") <(pacman -Q | sort) | cut -d' ' -f1)
   ((${#upgraded[@]} == 0)) || changed "pacman: upgraded ${#upgraded[@]} package(s): ${upgraded[*]}"
 }
 
@@ -574,6 +613,7 @@ update_nvim() {
   local before out moved=()
   before="$(nvim_plugin_heads)"
   # stdin from /dev/null: lazy.lua waits for a key when it can't clone lazy.nvim.
+  # The timeout bounds a hang (seen once on a first install) to 15 minutes.
   if ! out="$(timeout 900 nvim --headless '+Lazy! restore' +qa </dev/null 2>&1)"; then
     printf '%s\n' "$out" >&2
     return 1
@@ -589,7 +629,7 @@ update_nvim() {
 update() {
   local config="$1" no_upgrade="$2"
   [[ -f $FINISHED ]] || die "devbox finish has not run on this box yet"
-  [[ -n $config ]] || config="$(local_config)" || exit 1
+  [[ -n $config ]] || config="$(stored_config)" || exit 1
   # mise and nvim read config from the current directory too.
   cd "$USER_HOME"
   CHANGES="$(mktemp)"
@@ -616,7 +656,7 @@ update() {
 # gone), and logs out of tailscale. Named so it doesn't shadow bash's logout.
 box_logout() {
   local title key="" kind ids id state
-  title="$(local_config | jq -r .hostname)"
+  title="$(stored_config | jq -r .hostname)"
   [[ ! -f $SSH_KEY.pub ]] || key="$(cut -d' ' -f1,2 "$SSH_KEY.pub")"
   if ! gh_logged_in; then
     [[ -z $key ]] || die "gh is not logged in; can't remove this box's keys from GitHub"
@@ -708,7 +748,7 @@ bootstrap() {
   pacman -Syu --needed --noconfirm -- "${BASE_PACKAGES[@]}"
   # Explicit, so removing a client package never takes a base one along.
   pacman -D --asexplicit -q -- "${BASE_PACKAGES[@]}" >/dev/null
-  "$ROOT/bin/devbox-config" --json "$(<"$STATE/client")" >/dev/null || exit 1
+  stored_config >/dev/null
 
   say "locale"
   # The template sets LANG=en_US.UTF-8 without generating it.

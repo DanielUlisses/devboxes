@@ -1,1 +1,5 @@
 .scratch/
+# Client files live in the private devbox-clients repo; only the template
+# belongs here.
+/clients/*
+!/clients/_template.yaml

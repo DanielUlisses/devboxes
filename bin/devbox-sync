@@ -12,11 +12,13 @@ usage() {
   cat <<EOF
 Usage: devbox-sync [--no-pacman-upgrade] <client>
 
-Converge the devbox for clients/<client>.yaml on \$DEVBOX_HOST (required)
-to this checkout's resolved config: install and remove pacman packages and
-mise tools to match it, clone new repos, then (once devbox finish has run)
-bring skills, plugins, packages, tools, Claude Code and configs current.
---no-pacman-upgrade skips the pacman -Syu of that last step.
+Converge the devbox for <client> on \$DEVBOX_HOST (required) to its
+resolved config on this machine (see devbox-config): install and remove
+pacman packages and mise tools to match it, clone newly listed repos, then
+(once devbox finish has run) bring skills, plugins, packages, tools, Claude
+Code and configs current. --no-pacman-upgrade skips the pacman -Syu of that
+last step. The box keeps that config for its own syncs until gh is logged
+in there.
 EOF
 }
 

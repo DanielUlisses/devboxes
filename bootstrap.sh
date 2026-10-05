@@ -2,7 +2,9 @@
 # Stage one of a devbox's setup, run as root inside a fresh Arch container
 # (bin/devbox-create fetches it at a pinned commit and runs it with pct exec).
 # Gets pacman working, clones the devboxes repo at that commit, records the
-# client, then hands over to `devbox bootstrap`. Safe to re-run.
+# client and the resolved config devbox-create handed in (the client files
+# are in a private repo the box can't read yet), then hands over to
+# `devbox bootstrap`. Safe to re-run.
 set -euo pipefail
 
 DIR=/opt/devboxes
@@ -15,8 +17,8 @@ die() {
   exit 1
 }
 
-(($# == 4)) || die "usage: bootstrap.sh <client> <repo-url> <branch> <commit>"
-client="$1" url="$2" branch="$3" commit="$4"
+(($# == 5)) || die "usage: bootstrap.sh <client> <repo-url> <branch> <commit> <config-json>"
+client="$1" url="$2" branch="$3" commit="$4" config="$5"
 ((EUID == 0)) || die "must run as root"
 
 # pacman 7 downloads as user alpm inside a Landlock sandbox. The stock Proxmox
@@ -45,5 +47,7 @@ git -C "$DIR" -c advice.detachedHead=false checkout -q --detach "$commit"
 mkdir -p "$STATE"
 printf '%s\n' "$client" >"$STATE/client"
 printf '%s\n' "$branch" >"$STATE/branch"
+# Readable by the box user: login, finish and logout read it. No secrets in it.
+install -m 644 /dev/stdin "$STATE/config.json" <<<"$config"
 
 exec "$DIR/bin/devbox" bootstrap

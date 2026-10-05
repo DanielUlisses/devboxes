@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Create and start a client's devbox: an unprivileged Arch container on the
 # Proxmox host, sized from the client's resolved config, then bootstrapped
-# from bootstrap.sh at the pushed commit of the repo's branch.
+# from bootstrap.sh at the pushed commit of the repo's branch, with that
+# resolved config handed in (the box can't read the private clients repo).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
@@ -29,11 +30,11 @@ usage() {
   cat <<EOF
 Usage: devbox-create [--light] [--dry-run] <client>
 
-Create and start the devbox container for clients/<client>.yaml on
-\$DEVBOX_HOST (required), using the first free VMID in
-$VMID_MIN-$VMID_MAX, then bootstrap it from bootstrap.sh at the pushed
-head of $REPO's \$DEVBOX_BRANCH (default main). The client file
-must be pushed there too.
+Create and start the devbox container for <client> (its file in the
+devbox-clients checkout, see devbox-config) on \$DEVBOX_HOST (required),
+using the first free VMID in $VMID_MIN-$VMID_MAX, then bootstrap it from
+bootstrap.sh at the pushed head of $REPO's \$DEVBOX_BRANCH (default
+main), handing it the client's resolved config from this machine.
 
   --light    cap it at 1 GB memory, 512 MB swap, 1 core and an 8 GB disk
   --dry-run  run every check, then print the pct commands instead
@@ -117,7 +118,7 @@ main() {
     --onboot "$onboot")
   local bootstrap=(pct exec "$vmid" -- bash -c "$FETCH_BOOTSTRAP" bootstrap
     "https://raw.githubusercontent.com/$REPO/$commit/bootstrap.sh"
-    "$client" "https://github.com/$REPO.git" "$BRANCH" "$commit")
+    "$client" "https://github.com/$REPO.git" "$BRANCH" "$commit" "$(jq -c . <<<"$config")")
 
   if $dry_run; then
     printf '%q ' "${create[@]}"
