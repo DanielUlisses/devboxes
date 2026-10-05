@@ -18,7 +18,8 @@ pacman packages and mise tools to match it, clone newly listed repos, then
 (once devbox finish has run) bring skills, plugins, packages, tools, Claude
 Code and configs current. --no-pacman-upgrade skips the pacman -Syu of that
 last step. The box keeps that config for its own syncs until gh is logged
-in there.
+in there. First adds, updates or removes the box's Proxmox backup job to
+match \`backup\` (refused on a host running guests that aren't devboxes).
 EOF
 }
 
@@ -41,6 +42,7 @@ main() {
   vmid="$(find_devbox "$hostname")"
   [[ -n $vmid ]] || die "no $hostname on $DEVBOX_HOST; create it with bin/devbox-create $client"
   assert_devbox "$vmid" "$hostname"
+  sync_backup_job "$hostname" "$vmid" "$config" || say "backup job not synced; syncing the box anyway"
   [[ $(pve pct status "$vmid") == "status: running" ]] || die "$hostname (VMID $vmid) is not running"
 
   say "syncing $hostname (VMID $vmid)"

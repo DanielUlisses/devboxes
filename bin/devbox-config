@@ -96,7 +96,8 @@ def unknown_keys($prefix; $allowed):
 if . == null then {} else . end
 | if type != "object" then err("(top level)"; "must be a mapping of fields \(got)")
   else
-    unknown_keys(""; ["hostname", "claude_account", "git_name", "git_email", "resources", "packages", "tools", "skills", "repos"]),
+    unknown_keys(""; ["hostname", "claude_account", "git_name", "git_email", "resources", "packages", "tools", "skills", "repos",
+                     "backup", "backup_schedule", "backup_keep"]),
 
     (.hostname | str_match("hostname"; "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$";
       "a lowercase hostname (letters, digits, inner dashes, max 63)")),
@@ -128,6 +129,12 @@ if . == null then {} else . end
     (.repos | str_list("repos"; "^([A-Za-z0-9-]+/[A-Za-z0-9._-]+|\($ado_re))$";
       "a GitHub <owner>/<repo> or an Azure DevOps git@ssh.dev.azure.com:v3/<org>/<project>/<repo>")),
 
+    (.backup | if . == null or type == "boolean" then empty
+               else err("backup"; "must be true or false \(got)") end),
+    (.backup_schedule | str_match("backup_schedule"; "^[A-Za-z0-9][A-Za-z0-9 :.,*/~+-]*$";
+      "a Proxmox calendar event like 02:00 or \"mon..fri 21:00\"")),
+    (.backup_keep | int_min("backup_keep"; 1)),
+
     # git_email is the one email; an Azure DevOps SSH URL only looks like one.
     (paths(type == "string") as $p | getpath($p)
       | select($p != ["git_email"] and ($p[0] != "repos" or (test("^\($ado_re)$") | not)))
@@ -144,7 +151,7 @@ def strip_nulls: if type == "object" then with_entries(select(.value != null) | 
 | ($d * $c)
 | .hostname //= "dev-\($name)"
 | .skills = (reduce (($d.skills // []) + ($c.skills // []))[] as $s ([]; if IN(.[]; $s) then . else . + [$s] end))
-| {hostname, claude_account, git_name, git_email, resources, packages, tools, skills, repos}
+| {hostname, claude_account, git_name, git_email, resources, packages, tools, skills, repos, backup, backup_schedule, backup_keep}
 '
 
 # Prints the errors of one file, prefixed with its displayed path.

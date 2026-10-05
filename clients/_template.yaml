@@ -54,3 +54,12 @@ skills: []
 repos:
   - example-org/example-repo
   - git@ssh.dev.azure.com:v3/example-org/example-project/example-ado-repo
+
+# Proxmox backup job for this box: vzdump in snapshot mode, zstd, to the
+# storage in $DEVBOX_BACKUP_STORAGE (default local). devbox-create adds it,
+# bin/devbox-sync adds, updates or removes it when these change, and
+# devbox-destroy removes it. Refused (the box still works, without backups)
+# on a host running guests that aren't devboxes. Shown values are the defaults.
+# backup: false
+# backup_schedule: "02:00"   # Proxmox calendar event, e.g. "mon..fri 21:00"
+# backup_keep: 7             # how many backups to keep

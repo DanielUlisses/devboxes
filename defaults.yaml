@@ -26,3 +26,9 @@ skills:
   - mattpocock-skills
 
 repos: []
+
+# Proxmox backup job for the box (vzdump, snapshot mode, zstd), to the
+# storage in $DEVBOX_BACKUP_STORAGE (default local). Off by default.
+backup: false
+backup_schedule: "02:00"   # Proxmox calendar event: daily at 02:00
+backup_keep: 7             # backups kept (keep-last)

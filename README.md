@@ -121,7 +121,8 @@ must be exported (host names stay out of this public repo). `devbox-create` make
 with `nesting=1` and `/dev/net/tun`, hostname from the config, tag `devbox`,
 the first free VMID in 2000-2099, sized from `resources`, then starts it.
 `--light` caps it at 1 GB memory, 512 MB swap, 1 core and an 8 GB disk; `--dry-run` runs
-every check and prints the `pct create` and `pct exec` commands instead of running them.
+every check and prints the `pct create` and `pct exec` commands, and the
+backup job's `pvesh` command (see [Backups](#backups)), instead of running them.
 
 Once started, the box bootstraps itself: `devbox-create` looks up the pushed
 head of the repo's `main` on GitHub (`DEVBOX_BRANCH` picks another branch)
@@ -136,9 +137,11 @@ that pushed commit; `--allow-unpushed` creates anyway.
 
 The test host is shared, so the scripts never change the host itself:
 `lib/pve.sh` only lets through `pct create/start/stop/destroy/exec/list`
-and read-only queries (`pct config/status`, `pvesh get /cluster/resources`,
-`pveam list`, `/proc/meminfo`), and refuses any `pct` call on a VMID outside
-2000-2099. `devbox-create` refuses when the host has under 1 GB memory
+and read-only queries (`pct config/status`, `pvesh get /cluster/resources`
+and `/cluster/backup`, `pveam list`, `/proc/meminfo`), and refuses any `pct`
+call on a VMID outside 2000-2099. The one exception is a box's backup job,
+which `lib/pve.sh` only creates, changes or deletes on a dedicated host
+(below). `devbox-create` refuses when the host has under 1 GB memory
 available, or when the hostname is already taken. `devbox-destroy` only
 touches a container tagged `devbox`, in range, with the client's hostname,
 re-read from its live config just before; with no such container it exits 0.
@@ -151,7 +154,51 @@ hostname on GitHub by hand).
 The Arch template must already be on the host (downloading it is a host
 change, left to a person): `pveam download local archlinux-base_<date>_amd64.tar.zst`.
 Overrides: `DEVBOX_HOST`, `DEVBOX_BRANCH` (default `main`), `DEVBOX_STORAGE` (rootfs, default `local-lvm`),
-`DEVBOX_TEMPLATE_STORAGE` (default `local`), `DEVBOX_BRIDGE` (default `vmbr0`).
+`DEVBOX_TEMPLATE_STORAGE` (default `local`), `DEVBOX_BRIDGE` (default `vmbr0`),
+`DEVBOX_BACKUP_STORAGE` (backups, default `local`).
+
+### Backups
+
+With `backup: true` in the client file, `devbox-create` adds a Proxmox
+backup job for the box: vzdump of its VMID in snapshot mode, zstd, to
+`$DEVBOX_BACKUP_STORAGE` (default `local`), on `backup_schedule` (a Proxmox
+calendar event, default `02:00`, daily), keeping the last `backup_keep`
+(default 7). The job's id is `devbox-<hostname>` and its comment starts with
+`devbox <hostname>`; the scripts touch no other job.
+
+- `bin/devbox-sync` adds the job when `backup` turns on, removes it when it
+  turns off, and updates its schedule, retention, storage (from
+  `$DEVBOX_BACKUP_STORAGE` on the machine running it) or VMID when they
+  differ.
+- `devbox-destroy` removes the job before anything else, and refuses to
+  destroy the box when it can't, since the job would back up whichever box
+  gets that VMID next. The backups already taken stay on the storage.
+
+A backup job is a host-level change. `lib/pve.sh` only allows it on a
+dedicated host, where every guest is a devbox (a container in 2000-2099
+tagged `devbox`), the same rule `host/setup.sh --apply` uses. On a host
+running anything else it refuses, naming the other guests: `devbox-create`
+still creates and bootstraps the box, without a job, and `--dry-run` prints
+the job with a note that it would be refused.
+
+**Restoring a box**, on the host as root (a person's job, like the
+template):
+
+```
+pvesm list local --content backup --vmid <vmid>     # pick the archive
+pct stop <vmid>                                     # if the box still exists
+pct restore <vmid> local:backup/vzdump-lxc-<vmid>-<date>.tar.zst --storage local-lvm --force
+pct start <vmid>
+```
+
+`--force` overwrites the existing container; leave it out to restore a
+destroyed box into a free VMID in 2000-2099 (the archive keeps the hostname
+and the `devbox` tag). Run `bin/devbox-sync <client>` afterwards so the job
+follows a new VMID. The box comes back as it was at backup time, with the
+SSH key, gh and tailscale logins inside it; those may no longer be valid
+(`devbox-destroy` deletes the box's keys from GitHub and logs it out of
+tailscale), so get a shell in it and run `devbox login`, then `devbox
+finish`, which re-adds its key to GitHub.
 
 ## Inside a box
 

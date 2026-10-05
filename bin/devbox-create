@@ -34,11 +34,14 @@ Create and start the devbox container for <client> (its file in the
 devbox-clients checkout, see devbox-config) on \$DEVBOX_HOST (required),
 using the first free VMID in $VMID_MIN-$VMID_MAX, then bootstrap it from
 bootstrap.sh at the pushed head of $REPO's \$DEVBOX_BRANCH (default
-main), handing it the client's resolved config from this machine. Refuses
-when this checkout's HEAD is not that pushed commit.
+main), handing it the client's resolved config from this machine. With
+\`backup: true\`, adds the box's Proxmox backup job (to
+\$DEVBOX_BACKUP_STORAGE, default local); refused, the box still created, on
+a host running guests that aren't devboxes. Refuses when this checkout's
+HEAD is not that pushed commit.
 
   --light           cap it at 1 GB memory, 512 MB swap, 1 core and an 8 GB disk
-  --dry-run         run every check, then print the pct commands instead
+  --dry-run         run every check, then print the pct and pvesh commands instead
   --allow-unpushed  create even though this checkout's HEAD differs from
                     the pushed commit the box bootstraps from
 EOF
@@ -138,6 +141,7 @@ main() {
     printf '\n'
     printf '%q ' "${bootstrap[@]}"
     printf '\n'
+    sync_backup_job "$hostname" "$vmid" "$config" true
     exit 0
   fi
 
@@ -149,6 +153,8 @@ main() {
   pve "${bootstrap[@]}" ||
     die "bootstrap failed in $hostname (VMID $vmid); fix it, then bin/devbox-destroy $client and create again"
   say "bootstrapped $hostname"
+  sync_backup_job "$hostname" "$vmid" "$config" ||
+    say "created $hostname without a backup job; bin/devbox-sync $client adds it once the host allows it"
 }
 
 main "$@"
