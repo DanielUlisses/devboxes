@@ -112,7 +112,7 @@ Needs `jq` and [mikefarah/yq](https://github.com/mikefarah/yq) v4
 ## devbox-create / devbox-destroy
 
 ```
-bin/devbox-create [--light] [--dry-run] <client>
+bin/devbox-create [--light] [--dry-run] [--allow-unpushed] <client>
 bin/devbox-destroy [--skip-logout] <client>
 ```
 
@@ -130,7 +130,9 @@ client's resolved config (`devbox-config --json`, from your machine). The box
 clones this public repo anonymously, so script changes must be pushed first;
 the client file only needs pushing to `devbox-clients` before a sync inside
 the box after `devbox login`, as the box never reads the private repo before
-that.
+that. Since the box runs the pushed `bootstrap.sh` while your machine runs
+its local scripts, `devbox-create` refuses when this checkout's HEAD is not
+that pushed commit; `--allow-unpushed` creates anyway.
 
 The test host is shared, so the scripts never change the host itself:
 `lib/pve.sh` only lets through `pct create/start/stop/destroy/exec/list`
@@ -202,8 +204,13 @@ also read. A sync:
 - **tools:** writes `~/.config/mise/config.toml` from `tools:` (a tool listed
   twice gets both versions, the first the default), then `mise install` and
   `mise prune`, which drops versions no config uses.
-- **repos:** once gh is logged in, clones listed repos that are missing into
-  `~/work/<repo>`. Repos dropped from the list are reported, never deleted.
+- **repos:** clones listed repos that are missing into `~/work/<repo>`:
+  GitHub ones once gh is logged in, Azure DevOps ones once the box's Azure
+  DevOps key is added there (below); until then those are reported pending
+  and the rest still clone. Repos dropped from the list are reported, never
+  deleted.
+- **git identity:** once `devbox finish` has run, re-applies the client's
+  `git_name` and `git_email` when they changed.
 - **update:** once `devbox finish` has run, `devbox update` as `daniel`
   (below).
 
@@ -269,10 +276,23 @@ what's missing:
 - generates `~/.ssh/id_ed25519`, unique to the box, and adds it to GitHub
   for authentication and for signing, titled with the box's hostname
   (`dev-<client>` by default);
-- writes git's identity (kept when already set; by default your GitHub name
-  and `<id>+<login>@users.noreply.github.com`) and SSH commit and tag signing
-  into `~/.gitconfig.local`, with `~/.config/git/allowed_signers` so
-  `git log --show-signature` verifies locally;
+- writes git's identity and SSH commit and tag signing into
+  `~/.gitconfig.local`, with `~/.config/git/allowed_signers` (kept in step
+  with the email) so `git log --show-signature` verifies locally. The
+  identity is the client's `git_name` and `git_email`, overriding what is
+  there; left empty, what is there is kept, or your GitHub name and
+  `<id>+<login>@users.noreply.github.com` are set. GitHub shows a signed
+  commit as Verified only when its email is a verified address on the
+  GitHub account; Azure DevOps doesn't check signatures;
+- with Azure DevOps repos (`git@ssh.dev.azure.com:v3/<org>/<project>/<repo>`
+  in `repos:`), makes a second key, `~/.ssh/id_rsa_ado` (Azure DevOps only
+  takes RSA keys), which ssh uses for `ssh.dev.azure.com` alone, and pins
+  that host's key in `~/.ssh/known_hosts` (the RSA key whose fingerprint
+  Microsoft documents, `SHA256:ohD8VZEXGWo6Ez8GSEJQ9WpafgLFsOfLOtGGQCQo6Og`;
+  never trusted on first use). It does not register the key: until you add
+  it in Azure DevOps (User settings -> SSH public keys -> + New Key, titled
+  with the box's hostname), `finish` and `sync` print the key and the
+  settings page of each org, and report those repos pending;
 - installs the `skills:` list: `mattpocock-skills` is the
   `mattpocock-skills@claude-plugins-official` plugin; every other entry is a
   GitHub repo (`<owner>/<repo>`, or a bare name under `DanielUlisses`) cloned
@@ -280,10 +300,13 @@ what's missing:
   `install.sh`, a plugin marketplace (`.claude-plugin/marketplace.json`), or
   a `SKILL.md` at its root linked into `~/.claude/skills/` (`-skill` dropped
   from the name);
-- clones `repos:` into `~/work`, as a sync does.
+- clones `repos:` into `~/work`, as a sync does. Once the Azure DevOps key
+  is added, `devbox sync` (or `finish` again) clones the pending ones.
 
 `devbox logout` undoes the outward-facing part: deletes the GitHub keys that
-match the box's public key or carry its title, and `tailscale logout`. `bin/devbox-destroy` runs
+match the box's public key or carry its title, and `tailscale logout`. The
+Azure DevOps key has to be removed by hand: it prints the key's title and
+fingerprint to delete under User settings -> SSH public keys. `bin/devbox-destroy` runs
 it for you.
 
 ## Working in a box
@@ -448,6 +471,7 @@ If the firewall ever locks you out, log in on the physical console and run
 
 This repo is public, so client files live in the private `devbox-clients`
 repo. They still hold names, sizes and lists only: no tokens, passwords,
-keys or email addresses. `claude_account` is a label, not
-the account's email. `devbox-config` rejects any value that looks like an
-email address.
+keys or email addresses, except `git_email`, the address commits are made
+with. `claude_account` is a label, not the account's email. `devbox-config`
+rejects any other value that looks like an email address (an Azure DevOps
+SSH URL, `git@ssh.dev.azure.com:...`, is not one).

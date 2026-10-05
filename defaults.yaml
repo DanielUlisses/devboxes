@@ -3,6 +3,11 @@
 # where the client's list is appended to the base list below.
 # `hostname` has no entry here: it defaults to dev-<client>.
 
+# Git identity for commits in the box; empty means your GitHub name and
+# noreply address.
+git_name: ""
+git_email: ""
+
 resources:
   memory_mb: 10240   # memory ceiling
   swap_mb: 2048

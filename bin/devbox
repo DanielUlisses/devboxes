@@ -50,6 +50,14 @@ TAILSCALE_TAG=tag:devbox
 # Where `devbox login` keeps the client's 1Password service-account token.
 OP_TOKEN_FILE=$USER_HOME/.config/op/service-account-token
 SSH_KEY=$USER_HOME/.ssh/id_ed25519
+# Azure DevOps takes only RSA keys for SSH, so boxes with Azure DevOps repos get
+# a second key for it, registered there by hand.
+ADO_HOST=ssh.dev.azure.com
+ADO_KEY=$USER_HOME/.ssh/id_rsa_ado
+# ssh.dev.azure.com's host key, pinned rather than trusted on first use. Its
+# fingerprint, SHA256:ohD8VZEXGWo6Ez8GSEJQ9WpafgLFsOfLOtGGQCQo6Og, is the one
+# Microsoft documents in "Use SSH key authentication" (Azure Repos).
+ADO_HOST_KEY="$ADO_HOST ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQC7Hr1oTWqNqOlzGJOfGJ4NakVyIzf1rXYd4d7wo6jBlkLvCA4odBlL0mDUyZ0/QUfTTqeu+tm22gOsv+VrVTMk6vwRU75gY/y9ut5Mb3bR5BV58dKXyq9A9UeB5Cakehn5Zgm6x1mKoVyf+FFn26iYqXJRgzIZZcZ5V6hrE0Qg39kZm4az48o0AUbf6Sp4SLdvnuMa2sVNwHBboS7EJkm57XQPVU3/QpyNLHbWDdzwtrlS+ez30S3AdYhLKEOxAG8weOnyrtLJAUen9mTkol8oII1edf7mWWbWVf0nBmly21+nZcmCTISQBtdcyPaEno7fFQMDD26/s0lfKob4Kw8H"
 WORK=$USER_HOME/work
 # Clones of the skill repos, installed from there into ~/.claude.
 SKILL_REPOS=$USER_HOME/.claude/skill-repos
@@ -85,13 +93,15 @@ Run inside a devbox.
   login      the manual logins, interactive: tailscale, gh, the client's
              1Password service-account token, Claude
   finish     after login: this box's SSH key on GitHub (auth and signing),
-             git identity and signing, skills, the mattpocock plugin, repos
+             git identity and signing, skills, the mattpocock plugin, repos;
+             with Azure DevOps repos, a key for it to add there by hand
   update     after finish: bring current what finish and bootstrap installed
              (skills, plugins, pacman -Syu unless --no-pacman-upgrade, mise
              "latest" tools, Claude Code, new gh/nvim config files, nvim
              plugins to lazy-lock.json); sync runs it
   logout     remove this box's SSH keys from GitHub and log out of
-             tailscale; bin/devbox-destroy runs it
+             tailscale (the Azure DevOps key is removed by hand; it says
+             which); bin/devbox-destroy runs it
   rc         inside herdr, as $USER_NAME: open a pane beside this one in
              ~/work running Claude with Remote Control (claude
              --remote-control [<name>]), to pick up from the Claude app
@@ -243,40 +253,100 @@ sync_tools() {
   as_user mise prune --yes
 }
 
-# owner/repo of a clone's origin, lowercased (GitHub names ignore case).
+# Whether repos: entry $1 is an Azure DevOps SSH URL (else GitHub owner/repo).
+is_ado() {
+  [[ $1 == "git@$ADO_HOST:"* ]]
+}
+
+# The Azure DevOps orgs in the config's repos, one per line.
+ado_orgs() {
+  jq -r --arg h "git@$ADO_HOST:v3/" '.repos[] | select(startswith($h)) | ltrimstr($h) | split("/")[0]' <<<"$1" | sort -u
+}
+
+# Tells the person to add the Azure DevOps key ($ADO_KEY.pub) in each org.
+ado_key_instructions() {
+  local config="$1" title org
+  title="$(jq -r .hostname <<<"$config")"
+  say "azure devops: add this box's key by hand: Azure DevOps -> User settings -> SSH public keys -> + New Key,"
+  say "azure devops: titled '$title', with this public key:"
+  cat "$ADO_KEY.pub" >&2
+  while IFS= read -r org; do
+    say "azure devops: $org: https://dev.azure.com/$org/_usersSettings/keys"
+  done < <(ado_orgs "$config")
+  say "azure devops: then run devbox sync (or devbox finish) to clone its repos"
+}
+
+# Clones Azure DevOps repo $1 into $2 over SSH with the box's Azure DevOps key.
+# Returns 2, leaving nothing behind, when Azure DevOps refuses the key (not
+# added there yet); 1 on any other failure, with git's error shown.
+clone_ado() {
+  local repo="$1" dest="$2" err
+  # BatchMode: fail rather than prompt, as sync runs with no one to answer.
+  if err="$(as_user env GIT_SSH_COMMAND="ssh -o BatchMode=yes" git clone -q "$repo" "$dest" 2>&1)"; then
+    return 0
+  fi
+  if grep -qE 'Public key authentication failed|Permission denied \(publickey' <<<"$err"; then
+    return 2
+  fi
+  printf '%s\n' "$err" >&2
+  return 1
+}
+
+# owner/repo of a clone's origin, lowercased (GitHub names ignore case). An
+# Azure DevOps origin stays its SSH URL, lowercased.
 origin_repo() {
   git -C "$1" remote get-url origin 2>/dev/null |
     sed -E 's#^(https://github\.com/|git@github\.com:)##; s#\.git$##' | tr '[:upper:]' '[:lower:]'
 }
 
 # repos: clones listed repos missing from ~/work (as <repo>); clones no longer
-# listed are only reported, never removed. Needs gh logged in.
+# listed are only reported, never removed. GitHub repos need gh logged in;
+# Azure DevOps ones need the box's Azure DevOps key, made by `devbox finish`
+# and added there by hand: until then they are reported pending, and the
+# GitHub ones still clone. Fails, after trying every repo, when an Azure
+# DevOps clone fails for another reason.
 sync_repos() {
-  local config="$1" repo dest dir cloned=0 listed
-  if ! as_user gh auth status -h github.com &>/dev/null; then
-    say "repos: skipped, gh is not logged in (devbox login, then devbox finish)"
-    return
-  fi
+  local config="$1" repo dest dir cloned=0 listed gh_ok=true pending=() failed=0 status
+  as_user gh auth status -h github.com &>/dev/null || gh_ok=false
   as_user mkdir -p "$WORK"
   listed="$(jq -r '.repos[] | ascii_downcase' <<<"$config")"
   while IFS= read -r repo; do
-    dest="$WORK/${repo#*/}"
+    dest="$WORK/${repo##*/}"
     if [[ -e $dest ]]; then
       [[ $(origin_repo "$dest") == "${repo,,}" ]] ||
         say "repos: not cloning $repo: ${dest/#$USER_HOME/\~} holds $(origin_repo "$dest" || echo "something else")"
       continue
     fi
-    say "repos: cloning $repo into ${dest/#$USER_HOME/\~}"
-    as_user gh repo clone "$repo" "$dest" -- -q
-    cloned=$((cloned + 1))
+    if ! is_ado "$repo"; then
+      if ! $gh_ok; then
+        say "repos: skipped $repo, gh is not logged in (devbox login, then devbox finish)"
+        continue
+      fi
+      say "repos: cloning $repo into ${dest/#$USER_HOME/\~}"
+      as_user gh repo clone "$repo" "$dest" -- -q
+      cloned=$((cloned + 1))
+    elif [[ ! -f $ADO_KEY ]]; then
+      say "repos: pending $repo: no Azure DevOps key yet (devbox finish makes it)"
+      pending+=("$repo")
+    else
+      status=0
+      clone_ado "$repo" "$dest" || status=$?
+      case $status in
+        0) say "repos: cloned $repo into ${dest/#$USER_HOME/\~}"; cloned=$((cloned + 1)) ;;
+        2) say "repos: pending $repo: Azure DevOps refused the key (not added there yet)"; pending+=("$repo") ;;
+        *) say "repos: could not clone $repo (above)"; failed=1 ;;
+      esac
+    fi
   done < <(jq -r '.repos[]' <<<"$config")
+  ((${#pending[@]} == 0)) || [[ ! -f $ADO_KEY ]] || ado_key_instructions "$config"
   for dir in "$WORK"/*; do
     [[ -d $dir/.git ]] || continue
     repo="$(origin_repo "$dir")"
     grep -qxF -- "$repo" <<<"$listed" ||
       say "repos: ${dir/#$USER_HOME/\~} ($repo) is no longer listed; left in place"
   done
-  ((cloned)) || say "repos: up to date"
+  ((cloned + ${#pending[@]} + failed)) || say "repos: up to date"
+  ((failed == 0))
 }
 
 # $2: --no-pacman-upgrade, passed on to update, or empty.
@@ -285,6 +355,8 @@ sync() {
   config="$(resolve_config "${1:-}")"
   sync_packages "$config"
   sync_tools "$config"
+  # Before the repos, so a failed clone doesn't hold back an identity change.
+  [[ ! -f $FINISHED ]] || git_identity "$config"
   sync_repos "$config"
   # Runs the checkout's devbox, which the pull above may have just changed.
   if [[ ! -f $FINISHED ]]; then
@@ -374,24 +446,72 @@ register_key() {
   fi
 }
 
-# Git identity (kept when already set) and SSH signing, in ~/.gitconfig.local.
-git_signing() {
-  local file=$USER_HOME/.gitconfig.local signers=$USER_HOME/.config/git/allowed_signers user email
-  if ! git config -f "$file" user.name >/dev/null; then
-    git config -f "$file" user.name "$(gh api user --jq 'if (.name // "") == "" then .login else .name end')"
+# Sets git config $2 to $3 in ~/.gitconfig.local, as the box user, unless it
+# already is; returns 1 when unchanged.
+set_git_config() {
+  local file=$USER_HOME/.gitconfig.local
+  [[ $(as_user git config -f "$file" "$1" 2>/dev/null) != "$2" ]] || return 1
+  as_user git config -f "$file" "$1" "$2" || die "git: could not set $1 in $file"
+}
+
+# Git identity and SSH signing, in ~/.gitconfig.local, with the allowed-signers
+# entry for the email. The client's git_name and git_email win over what is
+# there; left empty, what is there is kept, or your GitHub name and noreply
+# address are set. Runs as the box user or as root (devbox sync).
+git_identity() {
+  local config="$1" file=$USER_HOME/.gitconfig.local signers=$USER_HOME/.config/git/allowed_signers
+  local name email entry changed=false
+  name="$(jq -r '.git_name // ""' <<<"$config")"
+  email="$(jq -r '.git_email // ""' <<<"$config")"
+  [[ -n $name ]] || name="$(as_user git config -f "$file" user.name 2>/dev/null)" ||
+    name="$(as_user gh api user --jq 'if (.name // "") == "" then .login else .name end')"
+  [[ -n $email ]] || email="$(as_user git config -f "$file" user.email 2>/dev/null)" ||
+    email="$(as_user gh api user --jq '"\(.id)+\(.login)@users.noreply.github.com"')"
+  set_git_config user.name "$name" && changed=true
+  set_git_config user.email "$email" && changed=true
+  set_git_config gpg.format ssh || true
+  set_git_config user.signingkey "$SSH_KEY.pub" || true
+  set_git_config commit.gpgsign true || true
+  set_git_config tag.gpgsign true || true
+  set_git_config gpg.ssh.allowedSignersFile "$signers" || true
+  entry="$email $(cut -d' ' -f1,2 "$SSH_KEY.pub")"
+  if [[ ! -f $signers || $(<"$signers") != "$entry" ]]; then
+    # tee reads the here-string on its stdin; the user can't reopen root's /dev/stdin.
+    as_user mkdir -p "${signers%/*}"
+    as_user tee "$signers" >/dev/null <<<"$entry"
+    changed=true
   fi
-  if ! git config -f "$file" user.email >/dev/null; then
-    user="$(gh api user --jq '"\(.id)+\(.login)"')"
-    git config -f "$file" user.email "$user@users.noreply.github.com"
+  if $changed; then
+    say "git: signing commits as $name <$email> (${file/#$USER_HOME/\~})"
+  else
+    say "git: identity up to date ($name <$email>)"
   fi
-  email="$(git config -f "$file" user.email)"
-  git config -f "$file" gpg.format ssh
-  git config -f "$file" user.signingkey "$SSH_KEY.pub"
-  git config -f "$file" commit.gpgsign true
-  git config -f "$file" tag.gpgsign true
-  git config -f "$file" gpg.ssh.allowedSignersFile "$signers"
-  write_if_changed "$signers" "$email $(cut -d' ' -f1,2 "$SSH_KEY.pub")" 644 || true
-  say "git: signing commits as $(git config -f "$file" user.name) <$email> (${file/#$USER_HOME/\~})"
+}
+
+# For a config with Azure DevOps repos: the box's Azure DevOps key (RSA, which
+# is all Azure DevOps takes), ssh using only that key for $ADO_HOST, and its
+# host key pinned in known_hosts. Registering the key is left to a person.
+ado_setup() {
+  local config="$1" title="$2" ssh_config=$USER_HOME/.ssh/config known=$USER_HOME/.ssh/known_hosts
+  [[ -n $(ado_orgs "$config") ]] || return 0
+  if [[ -f $ADO_KEY ]]; then
+    say "azure devops: ${ADO_KEY/#$USER_HOME/\~} exists"
+  else
+    ssh-keygen -q -t rsa -b 4096 -N '' -C "$title" -f "$ADO_KEY"
+    say "azure devops: generated ${ADO_KEY/#$USER_HOME/\~}"
+  fi
+  if ! grep -qxF "$ADO_HOST_KEY" "$known" 2>/dev/null; then
+    printf '%s\n' "$ADO_HOST_KEY" >>"$known"
+    say "azure devops: pinned $ADO_HOST's host key in ${known/#$USER_HOME/\~}"
+  fi
+  # Azure DevOps fails on the first key it doesn't know rather than trying the
+  # next, so ssh offers it only this one.
+  if ! grep -qxF "Host $ADO_HOST" "$ssh_config" 2>/dev/null; then
+    printf '\nHost %s\n  IdentityFile %s\n  IdentitiesOnly yes\n  StrictHostKeyChecking yes\n' \
+      "$ADO_HOST" "${ADO_KEY/#$USER_HOME/\~}" >>"$ssh_config"
+    chmod 600 "$ssh_config"
+    say "azure devops: ssh uses ${ADO_KEY/#$USER_HOME/\~} for $ADO_HOST (${ssh_config/#$USER_HOME/\~})"
+  fi
 }
 
 # Reports a change made by an update step (see run_step); outside update it
@@ -491,7 +611,8 @@ finish() {
   fi
   register_key keys authentication "$title"
   register_key ssh_signing_keys signing "$title"
-  git_signing
+  git_identity "$config"
+  ado_setup "$config" "$title"
 
   while IFS= read -r skill; do
     install_skill "$skill"
@@ -658,6 +779,11 @@ box_logout() {
   local title key="" kind ids id state
   title="$(stored_config | jq -r .hostname)"
   [[ ! -f $SSH_KEY.pub ]] || key="$(cut -d' ' -f1,2 "$SSH_KEY.pub")"
+  # First, so the reminder shows even when removing the GitHub keys fails.
+  if [[ -f $ADO_KEY.pub ]]; then
+    say "azure devops: remove this box's key by hand: Azure DevOps -> User settings -> SSH public keys,"
+    say "azure devops: the key titled '$title', fingerprint $(ssh-keygen -lf "$ADO_KEY.pub" | cut -d' ' -f2)"
+  fi
   if ! gh_logged_in; then
     [[ -z $key ]] || die "gh is not logged in; can't remove this box's keys from GitHub"
     say "github: gh not logged in and no SSH key; nothing to remove"

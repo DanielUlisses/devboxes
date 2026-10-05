@@ -28,16 +28,19 @@ exit 1'
 
 usage() {
   cat <<EOF
-Usage: devbox-create [--light] [--dry-run] <client>
+Usage: devbox-create [--light] [--dry-run] [--allow-unpushed] <client>
 
 Create and start the devbox container for <client> (its file in the
 devbox-clients checkout, see devbox-config) on \$DEVBOX_HOST (required),
 using the first free VMID in $VMID_MIN-$VMID_MAX, then bootstrap it from
 bootstrap.sh at the pushed head of $REPO's \$DEVBOX_BRANCH (default
-main), handing it the client's resolved config from this machine.
+main), handing it the client's resolved config from this machine. Refuses
+when this checkout's HEAD is not that pushed commit.
 
-  --light    cap it at 1 GB memory, 512 MB swap, 1 core and an 8 GB disk
-  --dry-run  run every check, then print the pct commands instead
+  --light           cap it at 1 GB memory, 512 MB swap, 1 core and an 8 GB disk
+  --dry-run         run every check, then print the pct commands instead
+  --allow-unpushed  create even though this checkout's HEAD differs from
+                    the pushed commit the box bootstraps from
 EOF
 }
 
@@ -52,11 +55,12 @@ disk_gb() {
 }
 
 main() {
-  local light=false dry_run=false client=""
+  local light=false dry_run=false allow_unpushed=false client=""
   while (($#)); do
     case "$1" in
       --light) light=true ;;
       --dry-run) dry_run=true ;;
+      --allow-unpushed) allow_unpushed=true ;;
       -h | --help) usage; exit 0 ;;
       -*) usage >&2; die "unknown option: $1" ;;
       *) [[ -z $client ]] || die "expected one client, got '$client' and '$1'"; client="$1" ;;
@@ -80,6 +84,20 @@ main() {
     ((disk <= 8)) || disk=8
   fi
 
+  # The box clones the public repo, so it can only follow what's pushed.
+  local commit
+  commit="$(git ls-remote "https://github.com/$REPO.git" "refs/heads/$BRANCH" | cut -f1)"
+  [[ $commit =~ ^[0-9a-f]{40}$ ]] || die "could not find branch $BRANCH on github.com/$REPO: is it pushed?"
+  # The box runs the pushed scripts and this machine the local ones (devbox-config
+  # here, bootstrap.sh there), so the two must be the same commit.
+  local head
+  head="$(git -C "$ROOT" rev-parse HEAD)"
+  if [[ $head != "$commit" ]]; then
+    $allow_unpushed ||
+      die "refusing: this checkout is at ${head:0:12}, but the box would bootstrap from $BRANCH at ${commit:0:12} on github.com/$REPO; push it (or set DEVBOX_BRANCH), or pass --allow-unpushed"
+    say "warning: this checkout is at ${head:0:12}, the box bootstraps from $BRANCH at ${commit:0:12} (--allow-unpushed)"
+  fi
+
   local free_kb
   free_kb="$(pve cat /proc/meminfo | awk '/^MemAvailable:/ {print $2}')"
   [[ $free_kb =~ ^[0-9]+$ ]] || die "could not read free memory on $DEVBOX_HOST"
@@ -100,11 +118,6 @@ main() {
   [[ -n $template ]] || die "no Arch template in $TEMPLATE_STORAGE on $DEVBOX_HOST; on the host, run:
   pveam update && pveam available --section system | grep archlinux
   pveam download $TEMPLATE_STORAGE <archlinux-base_...tar.zst>"
-
-  # The box clones the public repo, so it can only follow what's pushed.
-  local commit
-  commit="$(git ls-remote "https://github.com/$REPO.git" "refs/heads/$BRANCH" | cut -f1)"
-  [[ $commit =~ ^[0-9a-f]{40}$ ]] || die "could not find branch $BRANCH on github.com/$REPO: is it pushed?"
 
   local create=(pct create "$vmid" "$template"
     --hostname "$hostname"
