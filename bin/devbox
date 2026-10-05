@@ -5,7 +5,8 @@
 # tools and cloned repos. Both run as root, re-running themselves under sudo
 # when needed. `devbox login`, `finish` and `logout` run as the box user (root
 # hands them over): the manual logins, then the per-box key, skills and repos,
-# and the cleanup bin/devbox-destroy runs before destroying the box.
+# and the cleanup bin/devbox-destroy runs before destroying the box. `devbox
+# rc` starts Claude Remote Control in a new herdr pane in ~/work.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
@@ -55,6 +56,7 @@ Usage: devbox bootstrap
        devbox login
        devbox finish
        devbox logout
+       devbox rc [<name>]
 
 Run inside a devbox.
 
@@ -71,6 +73,9 @@ Run inside a devbox.
              git identity and signing, skills, the mattpocock plugin, repos
   logout     remove this box's SSH keys from GitHub and log out of
              tailscale; bin/devbox-destroy runs it
+  rc         inside herdr, as $USER_NAME: open a pane beside this one in
+             ~/work running Claude with Remote Control (claude
+             --remote-control [<name>]), to pick up from the Claude app
 EOF
 }
 
@@ -451,6 +456,22 @@ box_logout() {
   fi
 }
 
+# Claude Remote Control on demand: splits the calling herdr pane and runs
+# claude --remote-control in the new pane, in ~/work, so the session is
+# reachable from the Claude app and still visible in herdr.
+rc() {
+  local name="${1:-}" pane run=(claude --remote-control)
+  [[ ${HERDR_ENV:-} == 1 ]] || die "rc runs inside herdr (herdr, or herdr --remote <box> from your machine)"
+  claude auth status --json 2>/dev/null | jq -e .loggedIn >/dev/null || die "claude is not logged in: run devbox login first"
+  [[ -z $name ]] || run+=("$name")
+  mkdir -p "$WORK"
+  pane="$(herdr pane split --current --direction right --cwd "$WORK" | jq -er .result.pane.pane_id)" ||
+    die "herdr pane split failed"
+  # The pane's shell runs the line, so quote the name for it.
+  herdr pane run "$pane" "${run[*]@Q}" >/dev/null || die "herdr pane run failed in pane $pane"
+  say "Remote Control starting in herdr pane $pane (${WORK/#$USER_HOME/\~}); open it in the Claude app"
+}
+
 # Stows this repo's dotfiles/ packages (bash, git, gh) into the user's home.
 # Real files in the way (the skeleton .bashrc) are moved aside.
 dotfiles() {
@@ -542,6 +563,7 @@ main() {
         shift
       done
       ;;
+    rc) (($# <= 1)) || die "rc takes at most one argument, the session name" ;;
     *) usage >&2; die "unknown command: $cmd" ;;
   esac
   [[ -f $STATE/client ]] || die "no client recorded in $STATE/client: is this a devbox? (bootstrap.sh records it)"
@@ -559,6 +581,11 @@ main() {
         finish) finish ;;
         logout) box_logout ;;
       esac
+      ;;
+    rc)
+      # Runs in the user's own herdr session, which root can't reach.
+      [[ $(id -un) == "$USER_NAME" ]] || die "rc runs as $USER_NAME, inside herdr"
+      rc "$@"
       ;;
     *)
       ((EUID == 0)) || exec sudo "$0" "${args[@]}"

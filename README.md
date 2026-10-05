@@ -12,7 +12,7 @@ bin/devbox-config      prints a client's resolved config, or fails naming the ba
 bin/devbox-create      creates, starts and bootstraps a client's container on the Proxmox host
 bin/devbox-sync        syncs a client's box to this checkout's config, from your machine
 bin/devbox-destroy     stops and destroys it
-bin/devbox             runs inside a box: `devbox bootstrap`, `sync`, `login`, `finish`, `logout`
+bin/devbox             runs inside a box: `devbox bootstrap`, `sync`, `login`, `finish`, `logout`, `rc`
 bootstrap.sh           first thing a new box runs: clones this repo, hands over to devbox
 dotfiles/              bash, git, gh and nvim config stowed into every box (no identity, no secrets)
 lib/pve.sh             the one way bin/ scripts talk to the host
@@ -180,6 +180,90 @@ what's missing:
 `devbox logout` undoes the outward-facing part: deletes the GitHub keys that
 match the box's public key or carry its title, and `tailscale logout`. `bin/devbox-destroy` runs
 it for you.
+
+## Working in a box
+
+Once a box is finished, everything happens in herdr on the box, reached from
+your machine over the tailnet.
+
+### Remote herdr
+
+```
+herdr --remote daniel@dev-<client>
+```
+
+attaches your local herdr client to the box's herdr server over SSH (Tailscale
+SSH, so no key to manage). The session persists on the box: detach, close the laptop, and the next `herdr
+--remote` picks up the same workspaces and panes. `--session <name>` picks a
+named session; `--remote-keybindings server` uses the box's keybindings
+instead of yours.
+
+### Claude in worktrees
+
+Each ticket gets its own git worktree under `~/work`, next to the clone, and
+its own herdr pane or tab with Claude running in it, so tickets don't share a
+checkout:
+
+```
+cd ~/work/<repo>
+git worktree add ../<repo>--<ticket> -b <ticket>
+cd ../<repo>--<ticket> && claude
+```
+
+The ticket framework comes with the skills `devbox finish` installs (the
+`skills:` list): Claude implements the ticket in the
+worktree, reviews it, and leaves the change unstaged for you to review,
+commit and push. `herdr worktree create` makes the worktree and opens it as
+a herdr workspace in one step.
+
+### Remote Control: `devbox rc`
+
+```
+devbox rc [<name>]
+```
+
+Run inside herdr on the box, as `daniel`. It opens a pane to the right of the
+current one, in `~/work`, running `claude --remote-control [<name>]`. The
+session then shows up in the Claude app (desktop, mobile, claude.ai/code)
+under that name, or the box's hostname when there is none, so you can follow
+and steer it away from the laptop; it also stays a normal Claude session in
+its herdr pane. Close it with `/exit` or by closing the pane. It needs `devbox
+login` done (Claude logged in) and refuses outside herdr.
+
+### Tailscale ACL
+
+Boxes join the tailnet as `tag:devbox`. They hold client credentials, so only
+your own devices reach them, and they reach nothing: no box-to-box traffic
+and no way back to your machines. In the tailnet policy file (admin console,
+Access controls), with `<you>` your own login:
+
+```jsonc
+{
+  "tagOwners": {
+    // devbox login advertises this tag; only you may apply it.
+    "tag:devbox": ["<you>"]
+  },
+  "grants": [
+    // Your own devices reach the boxes. Nothing grants tag:devbox as a
+    // source, so boxes reach neither each other nor anything else.
+    { "src": ["<you>"], "dst": ["tag:devbox"], "ip": ["*"] }
+  ],
+  "ssh": [
+    // Tailscale SSH into a box (herdr --remote), as daniel, from your devices.
+    {
+      "action": "accept",
+      "src":    ["<you>"],
+      "dst":    ["tag:devbox"],
+      "users":  ["daniel"]
+    }
+  ]
+}
+```
+
+Merge these into your existing policy, and remove the default allow-all
+rule (`"src": ["*"], "dst": ["*:*"]`) or any other rule whose `src` matches
+`tag:devbox`, or boxes can reach everything again. Check from a box that
+`nc -zv dev-<other-client> 22` fails.
 
 ## The Proxmox host
 
