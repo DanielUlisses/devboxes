@@ -22,6 +22,7 @@ bootstrap.sh           first thing a new box runs: clones this repo, hands over 
 dotfiles/              bash, git, gh and nvim config stowed into every box (no identity, no secrets)
 lib/pve.sh             the one way bin/ scripts talk to the host
 host/setup.sh          prepares the dedicated Proxmox host (run on the host)
+host/tailscale-only.sh no-subscription repo + tailnet for a shared Proxmox host, no firewall
 .githooks/pre-commit   refuses commits that fail the checks or leak secrets
 ```
 
@@ -628,6 +629,20 @@ What it sets up:
 
 If the firewall ever locks you out, log in on the physical console and run
 `pve-firewall stop`.
+
+### A shared host on the tailnet
+
+`setup.sh --apply` refuses a host that already runs other guests. To reach
+such a host over the tailnet anyway, `host/tailscale-only.sh` switches it
+from the enterprise repos (disabled, as they need a subscription) to
+`pve-no-subscription` (added unless already there), installs Tailscale from
+its own apt repo, starts it and joins the tailnet. It changes no firewall,
+SSH or boot settings, and is safe to re-run:
+
+```
+scp host/tailscale-only.sh root@<host>:
+ssh -t root@<host> ./tailscale-only.sh     # TS_AUTHKEY=... to skip the login URL
+```
 
 ## No secrets
 
