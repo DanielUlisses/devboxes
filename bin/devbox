@@ -502,12 +502,14 @@ login() {
 
   if tailscale_up; then
     say "tailscale: already up"
+    # Boxes joined before --accept-dns=false: hand DNS back to the box.
+    sudo tailscale set --accept-dns=false
   else
     say "tailscale: open the URL below to add this box to the tailnet"
-    sudo tailscale up --ssh --advertise-tags="$TAILSCALE_TAG"
-    # Tailscale takes over the box's DNS as it comes up; wait for it to resolve
-    # public names, or the 1Password check below fails on a lookup.
-    for _ in {1..30}; do getent hosts my.1password.com >/dev/null && break; sleep 1; done
+    # --accept-dns=false: a box never connects out to the tailnet, so it needs
+    # no MagicDNS, and taking over its resolv.conf left public names failing
+    # (SERVFAIL) wherever MagicDNS had no upstream to forward them to.
+    sudo tailscale up --ssh --advertise-tags="$TAILSCALE_TAG" --accept-dns=false
   fi
 
   if ! gh_logged_in; then
