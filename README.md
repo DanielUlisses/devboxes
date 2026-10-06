@@ -15,6 +15,8 @@ bin/devbox-create      creates, starts and bootstraps a client's container on th
 bin/devbox-sync        syncs a client's box to this checkout's config, from your machine
 bin/devbox-destroy     stops and destroys it
 bin/devbox             runs inside a box: `devbox bootstrap`, `sync`, `login`, `finish`, `update`, `logout`, `rc`
+bin/devbox-agent-instructions  prints a box's agent instructions (~/.claude/CLAUDE.md, ~/AGENTS.md) from a resolved config
+bin/devbox-browser     $BROWSER in a box: prints URLs instead of opening them
 bootstrap.sh           first thing a new box runs: clones this repo, hands over to devbox
 dotfiles/              bash, git, gh and nvim config stowed into every box (no identity, no secrets)
 lib/pve.sh             the one way bin/ scripts talk to the host

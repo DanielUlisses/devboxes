@@ -2,6 +2,10 @@
 # Devbox shell, from dotfiles/bash in the devboxes repo (stowed by devbox
 # bootstrap). Machine-specific additions go in ~/.bashrc.local.
 export EDITOR=nvim VISUAL=nvim
+# Headless: tools that would open a browser print the URL instead
+# (bin/devbox-browser, next to this file's checkout).
+BROWSER="$(readlink -f "${BASH_SOURCE[0]}")"
+export BROWSER="${BROWSER%/dotfiles/bash/.bashrc}/bin/devbox-browser"
 [[ $- != *i* ]] && return
 
 HISTSIZE=50000
