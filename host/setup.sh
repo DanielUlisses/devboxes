@@ -9,6 +9,8 @@ SUITE=trixie # Debian release under Proxmox VE 9
 ZFS_ARC_MAX=$((2 * 1024 * 1024 * 1024))
 TEMPLATE_STORAGE=local
 TAILNET_CIDR=100.64.0.0/10
+# Home Assistant polls the Proxmox API from the LAN.
+HOME_ASSISTANT_IP=172.16.0.7
 # The kernel's LSM order on stock Proxmox VE 9, used when neither the boot
 # config nor /sys/kernel/security/lsm says otherwise.
 STOCK_LSM=lockdown,capability,yama,apparmor,ima,evm
@@ -35,7 +37,8 @@ policy_out: ACCEPT
 local_network $TAILNET_CIDR
 
 [RULES]
-IN ACCEPT -i tailscale0 -log nolog"
+IN ACCEPT -i tailscale0 -log nolog
+IN ACCEPT -source $HOME_ASSISTANT_IP -p tcp -dport 8006 -log nolog"
 
 SSHD_CONF="# Managed by devboxes host/setup.sh: root logs in with a key only.
 PermitRootLogin prohibit-password
