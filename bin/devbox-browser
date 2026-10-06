@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# $BROWSER in a devbox (set by dotfiles/bash/.bashrc): the box is headless,
+# so rather than open its arguments (URLs) it prints them, one per line, for
+# the person to open on their own machine.
+set -euo pipefail
+
+for url in "$@"; do
+  printf 'Open in your browser: %s\n' "$url"
+done
