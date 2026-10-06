@@ -469,6 +469,9 @@ login() {
   else
     say "tailscale: open the URL below to add this box to the tailnet"
     sudo tailscale up --ssh --advertise-tags="$TAILSCALE_TAG"
+    # Tailscale takes over the box's DNS as it comes up; wait for it to resolve
+    # public names, or the 1Password check below fails on a lookup.
+    for _ in {1..30}; do getent hosts my.1password.com >/dev/null && break; sleep 1; done
   fi
 
   if ! gh_logged_in; then
@@ -486,6 +489,8 @@ login() {
   else
     say "1password: paste the $(<"$STATE/client") service-account token (hidden; empty skips)"
     IFS= read -rs token
+    # A paste through Windows terminals and ssh can carry a CR or spaces.
+    token="${token//[$'\r\n\t ']/}"
     printf '\n' >&2
     if [[ -z $token ]]; then
       say "1password: skipped"

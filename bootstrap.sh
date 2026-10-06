@@ -21,20 +21,24 @@ die() {
 client="$1" url="$2" branch="$3" commit="$4" config="$5"
 ((EUID == 0)) || die "must run as root"
 
-# pacman 7 downloads as user alpm inside a Landlock sandbox. The stock Proxmox
-# kernel doesn't enable Landlock, so in a container every download fails; turn
-# the download sandbox off then. It only confines pacman's own downloader:
-# signatures are still checked, and the container stays unprivileged.
-if ! grep -qw landlock /sys/kernel/security/lsm 2>/dev/null; then
-  sed -i -e 's/^DownloadUser/#DownloadUser/' \
-    -e 's/^#DisableSandboxFilesystem/DisableSandboxFilesystem/' \
-    -e 's/^#DisableSandboxSyscalls/DisableSandboxSyscalls/' /etc/pacman.conf
-fi
-
 # Fresh containers can ship with an empty keyring and no mirror enabled.
 pacman-key --init
 pacman-key --populate archlinux >/dev/null
 grep -q '^Server' /etc/pacman.d/mirrorlist || printf 'Server = %s\n' "$MIRROR" >>/etc/pacman.d/mirrorlist
+
+# pacman 7 downloads as user alpm inside a Landlock sandbox. A kernel without
+# Landlock (stock Proxmox) makes every download fail; only then is the
+# download sandbox turned off. Tried rather than read from
+# /sys/kernel/security/lsm, which an unprivileged container can't see. It only
+# confines pacman's own downloader: signatures are still checked, and the
+# container stays unprivileged.
+if ! out="$(pacman -Sy 2>&1)"; then
+  grep -qiE 'landlock|sandbox' <<<"$out" || die "pacman -Sy failed: $out"
+  echo "bootstrap.sh: pacman's download sandbox doesn't work on this kernel (no Landlock); turning it off" >&2
+  sed -i -e 's/^DownloadUser/#DownloadUser/' \
+    -e 's/^#DisableSandboxFilesystem/DisableSandboxFilesystem/' \
+    -e 's/^#DisableSandboxSyscalls/DisableSandboxSyscalls/' /etc/pacman.conf
+fi
 pacman -Syu --needed --noconfirm archlinux-keyring git
 
 if [[ ! -d $DIR/.git ]]; then
