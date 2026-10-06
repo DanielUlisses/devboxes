@@ -372,10 +372,29 @@ sync_repos() {
   ((failed == 0))
 }
 
+# Points /etc/localtime at the config's zone. timedatectl too when systemd
+# runs; a container may refuse to set the clock, but the zone is a file.
+sync_timezone() {
+  local zone
+  zone="$(jq -r '.timezone // "UTC"' <<<"$1")"
+  [[ -f /usr/share/zoneinfo/$zone ]] || die "timezone: no zone $zone in /usr/share/zoneinfo"
+  if [[ $(readlink /etc/localtime 2>/dev/null) == "/usr/share/zoneinfo/$zone" ]] &&
+    [[ $(cat /etc/timezone 2>/dev/null) == "$zone" ]]; then
+    return
+  fi
+  say "timezone: $zone"
+  ln -sfn "/usr/share/zoneinfo/$zone" /etc/localtime
+  printf '%s\n' "$zone" >/etc/timezone
+  if [[ -d /run/systemd/system ]]; then
+    timedatectl set-timezone "$zone" 2>/dev/null || say "timezone: timedatectl refused; /etc/localtime is set"
+  fi
+}
+
 # $2: --no-pacman-upgrade, passed on to update, or empty.
 sync() {
   local config no_upgrade="${2:-}"
   config="$(resolve_config "${1:-}")"
+  sync_timezone "$config"
   sync_packages "$config"
   sync_tools "$config"
   # Before the repos, so a failed clone doesn't hold back an identity change.
@@ -458,6 +477,21 @@ add_az_extension() {
   changed "az: added the $AZ_EXTENSION extension"
 }
 
+# Validates a service-account token with op whoami. Right after tailscale up,
+# op's own resolver fails on MagicDNS for a while even when getent resolves,
+# so retry for up to a minute while the error is a lookup or dial one; any
+# other error (a bad token) fails at once.
+op_check_token() {
+  local err net='lookup |dial tcp|server misbehaving|no such host|i/o timeout|network is unreachable|connection refused'
+  for _ in {1..30}; do
+    err="$(OP_SERVICE_ACCOUNT_TOKEN="$1" op whoami 2>&1 >/dev/null)" && return
+    grep -qiE "$net" <<<"$err" || { printf '%s\n' "$err" >&2; die "1password: op rejected the token; not stored"; }
+    sleep 2
+  done
+  printf '%s\n' "$err" >&2
+  die "1password: op still can't reach 1Password after a minute; token not stored, re-run devbox login"
+}
+
 # The manual logins. Each step skips when already done, so re-running only
 # asks for what's missing.
 login() {
@@ -497,7 +531,7 @@ login() {
     if [[ -z $token ]]; then
       say "1password: skipped"
     else
-      OP_SERVICE_ACCOUNT_TOKEN="$token" op whoami >/dev/null || die "1password: op rejected the token; not stored"
+      op_check_token "$token"
       (umask 077 && mkdir -p "${OP_TOKEN_FILE%/*}" && printf '%s\n' "$token" >"$OP_TOKEN_FILE")
       chmod 600 "$OP_TOKEN_FILE"
       say "1password: token stored in ${OP_TOKEN_FILE/#$USER_HOME/\~}"
