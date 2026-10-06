@@ -61,6 +61,10 @@ ADO_KEY=$USER_HOME/.ssh/id_rsa_ado
 # fingerprint, SHA256:ohD8VZEXGWo6Ez8GSEJQ9WpafgLFsOfLOtGGQCQo6Og, is the one
 # Microsoft documents in "Use SSH key authentication" (Azure Repos).
 ADO_HOST_KEY="$ADO_HOST ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQC7Hr1oTWqNqOlzGJOfGJ4NakVyIzf1rXYd4d7wo6jBlkLvCA4odBlL0mDUyZ0/QUfTTqeu+tm22gOsv+VrVTMk6vwRU75gY/y9ut5Mb3bR5BV58dKXyq9A9UeB5Cakehn5Zgm6x1mKoVyf+FFn26iYqXJRgzIZZcZ5V6hrE0Qg39kZm4az48o0AUbf6Sp4SLdvnuMa2sVNwHBboS7EJkm57XQPVU3/QpyNLHbWDdzwtrlS+ez30S3AdYhLKEOxAG8weOnyrtLJAUen9mTkol8oII1edf7mWWbWVf0nBmly21+nZcmCTISQBtdcyPaEno7fFQMDD26/s0lfKob4Kw8H"
+# Boxes with Azure DevOps repos also get az and its azure-devops extension, for
+# `az repos pr create` in their clones.
+AZ_PACKAGE=azure-cli
+AZ_EXTENSION=azure-devops
 WORK=$USER_HOME/work
 # Clones of the skill repos, installed from there into ~/.claude.
 SKILL_REPOS=$USER_HOME/.claude/skill-repos
@@ -94,15 +98,17 @@ Run inside a devbox.
              a resolved config (bin/devbox-config --json) instead, without
              pulling; bin/devbox-sync uses it.
   login      the manual logins, interactive: tailscale, gh, the client's
-             1Password service-account token, Claude
+             1Password service-account token, Claude; with Azure DevOps
+             repos, az (device code) and its azure-devops extension
   finish     after login: this box's SSH key on GitHub (auth and signing),
              git identity and signing, skills, the mattpocock plugin, repos;
              with Azure DevOps repos, a key for it to add there by hand
   update     after finish: bring current what finish and bootstrap installed
              (skills, plugins, pacman -Syu unless --no-pacman-upgrade, mise
-             "latest" tools, Claude Code, new gh/nvim config files, nvim
-             plugins to lazy-lock.json); sync runs it
-  logout     remove this box's SSH keys from GitHub and log out of
+             "latest" tools, Claude Code, the azure-devops az extension,
+             new gh/nvim config files, nvim plugins to lazy-lock.json); sync
+             runs it
+  logout     remove this box's SSH keys from GitHub and log out of az and
              tailscale (the Azure DevOps key is removed by hand; it says
              which); bin/devbox-destroy runs it
   rc         inside herdr, as $USER_NAME: open a pane beside this one in
@@ -191,9 +197,13 @@ resolve_config() {
 # Pacman packages: install the listed ones that are missing; for the ones
 # dropped since the last sync (recorded in $STATE/packages), mark them as
 # dependencies and `pacman -Rns` those nothing else needs. Base packages stay.
+# A config with Azure DevOps repos also wants $AZ_PACKAGE.
 sync_packages() {
   local config="$1" want had missing=() dropped=() orphans=()
-  want="$(jq -r '.packages[]' <<<"$config" | sort -u)"
+  want="$({
+    jq -r '.packages[]' <<<"$config"
+    [[ -z $(ado_orgs "$config") ]] || echo "$AZ_PACKAGE"
+  } | sort -u)"
   had="$(sort -u "$STATE/packages" 2>/dev/null || true)"
   local -a wanted=()
   [[ -z $want ]] || mapfile -t wanted <<<"$want"
@@ -387,6 +397,54 @@ gh_has_scopes() {
   done
 }
 
+# With several tenants on the az login, asks which one holds the Azure DevOps
+# orgs and makes it the default, which the azure-devops extension tries first.
+az_pick_tenant() {
+  local accounts tenants=() i choice
+  accounts="$(az account list -o json)"
+  mapfile -t tenants < <(jq -r 'map(.tenantId) | unique[]' <<<"$accounts")
+  ((${#tenants[@]} > 1)) || return 0
+  say "az: this login reaches ${#tenants[@]} tenants; pick the one holding the Azure DevOps orgs:"
+  for i in "${!tenants[@]}"; do
+    printf '  %d) %s\n' $((i + 1)) "$(jq -r --arg t "${tenants[i]}" \
+      'first(.[] | select(.tenantId == $t)) | "\(.tenantDisplayName // .tenantDefaultDomain // "?") (\(.tenantId))"' \
+      <<<"$accounts")" >&2
+  done
+  while :; do
+    read -rp "tenant [1-${#tenants[@]}]: " choice
+    [[ $choice =~ ^[0-9]+$ ]] && ((choice >= 1 && choice <= ${#tenants[@]})) && break
+  done
+  az account set --subscription "$(jq -r --arg t "${tenants[choice - 1]}" \
+    'first(.[] | select(.tenantId == $t)) | .id' <<<"$accounts")"
+  say "az: default tenant ${tenants[choice - 1]}"
+}
+
+# For a config with Azure DevOps repos: az logged in, with a device code as the
+# box has no browser, and the azure-devops extension added. `az repos` then
+# reads a clone's org, project and repo from its origin remote.
+az_login() {
+  local config="$1" orgs
+  orgs="$(ado_orgs "$config" | paste -sd, | sed 's/,/, /g')"
+  [[ -n $orgs ]] || return 0
+  command -v az >/dev/null || die "az: not installed; run devbox sync (it installs $AZ_PACKAGE), then devbox login"
+  if az account show &>/dev/null; then
+    say "az: already logged in as $(az account show --query user.name -o tsv)"
+  else
+    say "az: log in with the account that reaches $orgs"
+    # Off: az's own subscription picker; az_pick_tenant asks for the tenant.
+    AZURE_CORE_LOGIN_EXPERIENCE_V2=off az login --use-device-code --allow-no-subscriptions --only-show-errors >/dev/null
+    az_pick_tenant
+  fi
+  add_az_extension || say "az: $AZ_EXTENSION extension already added"
+}
+
+# Adds the $AZ_EXTENSION az extension; returns 1 when it is already there.
+add_az_extension() {
+  az extension show --name "$AZ_EXTENSION" &>/dev/null && return 1
+  az extension add --name "$AZ_EXTENSION" --only-show-errors
+  changed "az: added the $AZ_EXTENSION extension"
+}
+
 # The manual logins. Each step skips when already done, so re-running only
 # asks for what's missing.
 login() {
@@ -434,6 +492,8 @@ login() {
     say "claude: log in with the '$account' account"
     claude auth login
   fi
+
+  az_login "$config"
   say "logged in; next: devbox finish"
 }
 
@@ -714,6 +774,19 @@ update_mise() {
   done <<<"$outdated"
 }
 
+# The azure-devops extension updated, or added when missing (login adds it,
+# but a box may have gained Azure DevOps repos since).
+update_az() {
+  local before after
+  command -v az >/dev/null || { say "az: not installed (devbox sync installs it)"; return 1; }
+  add_az_extension && return
+  before="$(az extension show --name "$AZ_EXTENSION" --query version -o tsv)"
+  # Exits 0 when it is already the latest.
+  az extension update --name "$AZ_EXTENSION" --only-show-errors
+  after="$(az extension show --name "$AZ_EXTENSION" --query version -o tsv)"
+  [[ $before == "$after" ]] || changed "az: updated $AZ_EXTENSION ($before -> $after)"
+}
+
 update_claude() {
   local before after
   before="$(claude --version)"
@@ -768,6 +841,7 @@ update() {
   fi
   run_step mise update_mise
   run_step claude update_claude
+  [[ -z $(ado_orgs "$config") ]] || run_step az update_az
   run_step configs copy_configs
   run_step nvim update_nvim
 
@@ -777,7 +851,8 @@ update() {
 
 # Before the box is destroyed: deletes its SSH keys (auth and signing) from
 # GitHub, matched by key or by the box's title (in case the key file is
-# gone), and logs out of tailscale. Named so it doesn't shadow bash's logout.
+# gone), and logs out of az and tailscale. Named so it doesn't shadow bash's
+# logout.
 box_logout() {
   local title key="" kind ids id state
   title="$(stored_config | jq -r .hostname)"
@@ -813,6 +888,14 @@ box_logout() {
     say "tailscale: logged out"
   else
     say "tailscale: not logged in"
+  fi
+  # Last: local only, so a failure can't hold back the GitHub and tailscale
+  # cleanup above.
+  if command -v az >/dev/null && az account show &>/dev/null; then
+    az logout
+    say "az: logged out"
+  else
+    say "az: not logged in"
   fi
 }
 
