@@ -315,8 +315,10 @@ clone_ado() {
 
 # owner/repo of a clone's origin, lowercased (GitHub names ignore case). An
 # Azure DevOps origin stays its SSH URL, lowercased.
+# Read as the box user, who owns the clones: as root (devbox sync) git refuses
+# them as "dubious ownership".
 origin_repo() {
-  git -C "$1" remote get-url origin 2>/dev/null |
+  as_user git -C "$1" remote get-url origin 2>/dev/null |
     sed -E 's#^(https://github\.com/|git@github\.com:)##; s#\.git$##' | tr '[:upper:]' '[:lower:]'
 }
 
