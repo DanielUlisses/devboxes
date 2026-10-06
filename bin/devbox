@@ -527,8 +527,12 @@ login() {
   else
     say "1password: paste the $(<"$STATE/client") service-account token (hidden; empty skips)"
     IFS= read -rs token
-    # A paste through Windows terminals and ssh can carry a CR or spaces.
-    token="${token//[$'\r\n\t ']/}"
+    # A paste through Windows terminals and ssh can carry a CR or spaces, and
+    # bracketed-paste markers (ESC[200~ ... ESC[201~): keep only the
+    # characters a token is made of.
+    token="${token//$'\e[200~'/}"
+    token="${token//$'\e[201~'/}"
+    token="$(LC_ALL=C tr -cd 'A-Za-z0-9_=+/.-' <<<"$token")"
     printf '\n' >&2
     if [[ -z $token ]]; then
       say "1password: skipped"
