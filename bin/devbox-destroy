@@ -17,11 +17,20 @@ Stop and destroy the devbox container for <client> (see devbox-config) on
 \$DEVBOX_HOST (required). Exits 0 when there is none. First runs
 \`devbox logout\` in the box (starting it if stopped): deletes its SSH keys
 from GitHub and logs it out of tailscale. Removes the box's backup job
-first, if it has one (its backups stay on the storage).
+first, if it has one (its backups stay on the storage). Last, removes it
+from this machine: ssh config entries, herdr machine, host keys
+(bin/devbox-host remove).
 
   --skip-logout  destroy without it, for a box too broken to run it; then
                  delete its keys (titled with its hostname) on GitHub by hand
 EOF
+}
+
+# This machine's side of the box: its ssh config entries, herdr machine and
+# host keys, so a box recreated under the same name starts clean.
+remove_from_this_machine() {
+  "$ROOT/bin/devbox-host" remove "$1" ||
+    say "could not remove everything for $1 from this machine; retry with bin/devbox-host remove $1"
 }
 
 main() {
@@ -43,6 +52,7 @@ main() {
   vmid="$(find_devbox "$hostname")"
   if [[ -z $vmid ]]; then
     say "no $hostname on $DEVBOX_HOST; nothing to destroy"
+    remove_from_this_machine "$client"
     exit 0
   fi
 
@@ -69,6 +79,7 @@ main() {
   say "destroying $hostname (VMID $vmid) on $DEVBOX_HOST"
   pve pct destroy "$vmid"
   say "destroyed $hostname"
+  remove_from_this_machine "$client"
 }
 
 main "$@"

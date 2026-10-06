@@ -14,6 +14,7 @@ bin/devbox-config      prints a client's resolved config, or fails naming the ba
 bin/devbox-create      creates, starts and bootstraps a client's container on the Proxmox host
 bin/devbox-sync        syncs a client's box to this checkout's config, from your machine
 bin/devbox-destroy     stops and destroys it
+bin/devbox-host        this machine's side of the boxes: ssh config entries, herdr machines, host keys
 bin/devbox             runs inside a box: `devbox bootstrap`, `sync`, `login`, `finish`, `update`, `logout`, `rc`
 bootstrap.sh           first thing a new box runs: clones this repo, hands over to devbox
 dotfiles/              bash, git, gh and nvim config stowed into every box (no identity, no secrets)
@@ -153,6 +154,11 @@ hostname on GitHub by hand).
 
 The Arch template must already be on the host (downloading it is a host
 change, left to a person): `pveam download local archlinux-base_<date>_amd64.tar.zst`.
+Once a box is created, `devbox-create` runs `bin/devbox-host add` for it;
+`devbox-destroy` runs `bin/devbox-host remove` once the box is gone (or when
+there was none), so a box recreated under the same name starts clean. See
+[devbox-host](#devbox-host).
+
 Overrides: `DEVBOX_HOST`, `DEVBOX_BRANCH` (default `main`), `DEVBOX_STORAGE` (rootfs, default `local-lvm`),
 `DEVBOX_TEMPLATE_STORAGE` (default `local`), `DEVBOX_BRIDGE` (default `vmbr0`),
 `DEVBOX_BACKUP_STORAGE` (backups, default `local`).
@@ -199,6 +205,52 @@ SSH key, gh and tailscale logins inside it; those may no longer be valid
 (`devbox-destroy` deletes the box's keys from GitHub and logs it out of
 tailscale), so get a shell in it and run `devbox login`, then `devbox
 finish`, which re-adds its key to GitHub.
+
+## devbox-host
+
+```
+bin/devbox-host [--dry-run] add [--new-box] <client>
+bin/devbox-host [--dry-run] remove <client>
+bin/devbox-host [--dry-run] sync
+bin/devbox-host doctor
+```
+
+The developer-machine side of each box, run on your machine (WSL):
+
+- **ssh config, twice:** a `Host <hostname>` entry (`HostName` the box's
+  MagicDNS name, `User daniel`; Tailscale SSH, so no key) in `~/.ssh/config`
+  and, on WSL, in the Windows `%USERPROFILE%\.ssh\config` that VS Code
+  Remote-SSH reads (found with `cmd.exe` and `wslpath`, or set
+  `DEVBOX_WINDOWS_SSH_CONFIG`; not on WSL, only the first). Only the block
+  between `# BEGIN devboxes managed` and `# END devboxes managed` is ever
+  written, rewritten whole, appended the first time; your own entries stay as
+  they are, and the file is copied to `<file>.devboxes.bak` before devboxes
+  first writes to it. A stowed (symlinked) config is written through the link.
+- **known_hosts:** `remove`, and `add` for a box not yet listed, delete the
+  box's old host keys (hostname and MagicDNS name) from the `known_hosts` next
+  to each config, so a recreated box's new key doesn't stop ssh or VS Code.
+  `add --new-box` (what `devbox-create` runs) deletes them even when the box
+  is listed, and re-learns the key for an already saved herdr machine.
+- **herdr:** `herdr machine add daniel@<hostname> --label <client>`, skipped
+  when already saved; `remove` drops it. Adding needs the box on the tailnet,
+  which happens at `devbox login`: until then `add` reports it pending (and
+  exits 1); run `bin/devbox-host add <client>` again after logging in. It
+  accepts the box's new host key first (over Tailscale, so trusting it on
+  first use is safe), since herdr has no terminal to ask.
+
+`sync` rebuilds all of it from the devbox containers on `$DEVBOX_HOST`, for
+a new laptop or after boxes changed elsewhere: the blocks list exactly those
+boxes, herdr machines and host keys of boxes no longer there are removed, and
+missing herdr machines are added, labelled with the client whose file
+resolves to that hostname (in `$DEVBOX_CLIENTS`), or the hostname. `doctor`
+checks each box on the host: listed in both configs, its MagicDNS name
+resolves, `ssh daniel@<hostname> true` works from WSL and from Windows
+(`ssh.exe`), and its herdr machine is reachable; it also flags entries for
+boxes that are gone, and exits 1 on any failure.
+
+With nothing changed, `add`, `remove` and `sync` write nothing. The MagicDNS
+suffix comes from `tailscale status` (`tailscale` or `tailscale.exe`), or
+`DEVBOX_TAILNET`.
 
 ## Inside a box
 
