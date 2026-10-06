@@ -118,7 +118,7 @@ bin/devbox-destroy [--skip-logout] <client>
 
 Both run `ssh root@$DEVBOX_HOST pct ...`. `DEVBOX_HOST` has no default and
 must be exported (host names stay out of this public repo). `devbox-create` makes an unprivileged Arch container
-with `nesting=1` and `/dev/net/tun`, hostname from the config, tag `devbox`,
+with `nesting=1,keyctl=1` (what Docker needs, see [Docker](#docker)) and `/dev/net/tun`, hostname from the config, tag `devbox`,
 the first free VMID in 2000-2099, sized from `resources`, then starts it.
 `--light` caps it at 1 GB memory, 512 MB swap, 1 core and an 8 GB disk; `--dry-run` runs
 every check and prints the `pct create` and `pct exec` commands, and the
@@ -210,8 +210,11 @@ resolved config it was handed in `/var/lib/devbox/`, then runs `devbox
 bootstrap`, which:
 
 - installs the base packages (`base-devel git openssh sudo stow jq go-yq
-  unzip mise github-cli tailscale bash-completion neovim ripgrep fd`), generates the `en_US.UTF-8` locale and enables
+  unzip mise github-cli tailscale bash-completion neovim ripgrep fd docker
+  docker-buildx docker-compose`), generates the `en_US.UTF-8` locale and enables
   `tailscaled`;
+- sets Docker's storage driver, enables `docker.service` and adds `daniel`
+  to the `docker` group (below);
 - adds user `daniel` with passwordless sudo, and `devbox` on the PATH;
 - installs Claude Code (native installer) and puts herdr and the 1Password
   CLI (`op`) in mise's system config, `/etc/mise/config.toml`;
@@ -262,6 +265,38 @@ also read. A sync:
   (below).
 
 With nothing changed, a sync installs and removes nothing.
+
+### Docker
+
+Every box runs Docker, for agents and dev work: `docker`, `docker buildx`
+and `docker compose`, as `daniel` without sudo (the `docker` group applies
+from the next login). In an unprivileged container it needs the container
+features `nesting=1,keyctl=1`, which `devbox-create` sets.
+
+Bootstrap picks the storage driver, written to `/etc/docker/daemon.json`;
+`docker info` shows it as `Storage Driver:`:
+
+- **`overlay2`** when the box's rootfs takes an overlay mount, which
+  bootstrap tries first. The default `local-lvm` (LVM-thin, ext4) does, and
+  so does ZFS 2.2 or later.
+- **`fuse-overlayfs`** otherwise (older ZFS), installed then. It needs
+  `/dev/fuse`, which `devbox-create` doesn't give the box: on the host, `pct
+  set <vmid> --features nesting=1,keyctl=1,fuse=1`, restart the box and
+  re-run `devbox bootstrap`. Proxmox warns that fuse in a container can
+  deadlock with the freezer, which snapshot backups use.
+- **`vfs`** with neither: Docker's own fallback, a full copy of every layer.
+  Bootstrap says so.
+
+A box made before Docker was added gets it from `devbox bootstrap` (as
+root, in the box) once its features include `keyctl=1`: `pct set <vmid>
+--features nesting=1,keyctl=1` on the host, then restart it.
+
+Containers count against the box's own memory limit (`resources.memory_mb`,
+plus swap), not the host's, and images fill its own disk. A `--light` box
+runs small containers only, one or two light services or a test run, and
+holds few images; anything heavier (databases, a compose stack, image
+builds) wants a full-size box. `docker stats` and `docker system df` show
+what they use.
 
 ### Keeping a box current: `devbox update`
 

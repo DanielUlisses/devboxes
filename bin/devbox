@@ -26,7 +26,7 @@ USER_HOME=/home/$USER_NAME
 export LC_ALL=C # one collation for sort and comm
 
 # Installed by bootstrap; sync never removes them.
-BASE_PACKAGES=(base-devel git openssh sudo stow jq go-yq unzip mise github-cli tailscale bash-completion neovim ripgrep fd)
+BASE_PACKAGES=(base-devel git openssh sudo stow jq go-yq unzip mise github-cli tailscale bash-completion neovim ripgrep fd docker docker-buildx docker-compose)
 
 # mise tools every box gets, kept in the system config so the client's tools:
 # list (the user config) can't drop them.
@@ -34,6 +34,9 @@ BASE_TOOLS='# Written by devbox bootstrap: tools every devbox gets.
 [tools]
 herdr = "latest"
 1password = "latest"'
+
+# Docker's daemon config; bootstrap sets its storage driver.
+DOCKER_DAEMON=/etc/docker/daemon.json
 
 # Stow packages under dotfiles/ in this repo.
 DOTFILES_PACKAGES=(bash git)
@@ -81,8 +84,8 @@ Usage: devbox bootstrap
 
 Run inside a devbox.
 
-  bootstrap  set up a fresh box (user $USER_NAME, base packages, claude, herdr,
-             1Password CLI, gh, tailscale, mise, dotfiles), then sync
+  bootstrap  set up a fresh box (user $USER_NAME, base packages, docker, claude,
+             herdr, 1Password CLI, gh, tailscale, mise, dotfiles), then sync
   sync       converge the box to its client's config: pull the devboxes
              repo and, once gh is logged in, $CLIENTS_REPO (before
              that, the last config the box was given), then install and
@@ -869,6 +872,53 @@ copy_configs() {
   done
 }
 
+# Succeeds when an overlay mount works on /var/lib's filesystem, where Docker
+# keeps its layers: ext4 (LVM-thin) does, ZFS before 2.2 doesn't.
+overlay_works() {
+  local dir rc=0
+  dir="$(mktemp -d -p /var/lib devbox-overlay.XXXXXX)"
+  mkdir "$dir"/{lower,upper,work,merged}
+  mount -t overlay overlay -o "lowerdir=$dir/lower,upperdir=$dir/upper,workdir=$dir/work" "$dir/merged" 2>/dev/null || rc=1
+  ((rc)) || umount "$dir/merged"
+  rm -rf "$dir"
+  return "$rc"
+}
+
+# Docker for daniel: overlay2 where the rootfs takes an overlay mount, else
+# fuse-overlayfs, which needs /dev/fuse (the container's fuse=1 feature,
+# which devbox-create doesn't set). Without either, Docker falls back to vfs.
+docker_setup() {
+  local driver=""
+  if overlay_works; then
+    driver=overlay2
+  elif [[ -c /dev/fuse ]]; then
+    driver=fuse-overlayfs
+    pacman -S --needed --noconfirm -- fuse-overlayfs
+  else
+    say "docker: no overlay mount and no /dev/fuse, docker uses vfs (see the README)"
+  fi
+  local restart=false
+  if [[ -n $driver ]]; then
+    say "docker: storage driver $driver"
+    write_if_changed "$DOCKER_DAEMON" "$(jq -n --arg d "$driver" '{"storage-driver": $d}')" 644 && restart=true
+  elif [[ -f $DOCKER_DAEMON ]]; then
+    # A driver an earlier run picked that no longer works keeps dockerd down.
+    rm "$DOCKER_DAEMON"
+    restart=true
+  fi
+  # A change only reaches a daemon already running once it restarts.
+  if $restart && [[ -d /run/systemd/system ]]; then
+    systemctl try-restart docker.service
+  fi
+  # Takes effect at daniel's next login.
+  id -nG "$USER_NAME" | grep -qw docker || usermod -aG docker "$USER_NAME"
+  if [[ -d /run/systemd/system ]]; then
+    systemctl enable --now docker.service
+  else
+    say "docker: no systemd, docker not started"
+  fi
+}
+
 bootstrap() {
   say "base packages"
   pacman -Syu --needed --noconfirm -- "${BASE_PACKAGES[@]}"
@@ -901,6 +951,9 @@ bootstrap() {
   else
     say "tailscale: no systemd, tailscaled not started"
   fi
+
+  say "docker"
+  docker_setup
 
   say "claude, herdr, 1Password CLI"
   [[ -x $USER_HOME/.local/bin/claude ]] || as_user bash -c 'curl -fsSL https://claude.ai/install.sh | bash'

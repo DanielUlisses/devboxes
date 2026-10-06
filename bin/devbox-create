@@ -126,7 +126,7 @@ main() {
     --hostname "$hostname"
     --tags "$DEVBOX_TAG"
     --unprivileged 1
-    --features nesting=1
+    --features "nesting=1,keyctl=1"
     --dev0 /dev/net/tun
     --memory "$memory" --swap "$swap" --cores "$cores"
     --rootfs "$ROOTFS_STORAGE:$disk"
