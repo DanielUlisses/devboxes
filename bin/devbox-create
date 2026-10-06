@@ -37,8 +37,9 @@ bootstrap.sh at the pushed head of $REPO's \$DEVBOX_BRANCH (default
 main), handing it the client's resolved config from this machine. With
 \`backup: true\`, adds the box's Proxmox backup job (to
 \$DEVBOX_BACKUP_STORAGE, default local); refused, the box still created, on
-a host running guests that aren't devboxes. Refuses when this checkout's
-HEAD is not that pushed commit.
+a host running guests that aren't devboxes. Then adds the box to this
+machine: ssh config entries and herdr machine (bin/devbox-host add).
+Refuses when this checkout's HEAD is not that pushed commit.
 
   --light           cap it at 1 GB memory, 512 MB swap, 1 core and an 8 GB disk
   --dry-run         run every check, then print the pct and pvesh commands instead
@@ -142,6 +143,7 @@ main() {
     printf '%q ' "${bootstrap[@]}"
     printf '\n'
     sync_backup_job "$hostname" "$vmid" "$config" true
+    "$ROOT/bin/devbox-host" --dry-run add --new-box "$client" || true
     exit 0
   fi
 
@@ -155,6 +157,9 @@ main() {
   say "bootstrapped $hostname"
   sync_backup_job "$hostname" "$vmid" "$config" ||
     say "created $hostname without a backup job; bin/devbox-sync $client adds it once the host allows it"
+  # This machine's side: ssh config entries, no stale host keys, the herdr machine.
+  "$ROOT/bin/devbox-host" add --new-box "$client" ||
+    say "$hostname is up, but this machine's side is unfinished; once it is on the tailnet: bin/devbox-host add $client"
 }
 
 main "$@"

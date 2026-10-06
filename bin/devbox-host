@@ -1,0 +1,404 @@
+#!/usr/bin/env bash
+# The developer-machine side of each devbox: a herdr machine, a Host entry in
+# the WSL ~/.ssh/config and in the Windows one VS Code Remote-SSH reads, and
+# no stale host keys in either known_hosts. devbox-create and devbox-destroy
+# call it; sync rebuilds it all from the boxes on $DEVBOX_HOST, doctor checks
+# each box. In each ssh config it only ever rewrites one marked block.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+# shellcheck source-path=SCRIPTDIR/.. source=lib/pve.sh
+source "$ROOT/lib/pve.sh"
+
+BEGIN_MARK='# BEGIN devboxes managed'
+END_MARK='# END devboxes managed'
+SSH_USER=daniel
+CLIENTS_DIR="${DEVBOX_CLIENTS:-$ROOT/../devbox-clients}/clients"
+
+usage() {
+  cat <<EOF
+Usage: devbox-host [--dry-run] add [--new-box] <client>
+       devbox-host [--dry-run] remove <client>
+       devbox-host [--dry-run] sync
+       devbox-host doctor
+
+Manage this machine's side of the devboxes: for each box, a
+\`Host <hostname>\` entry (HostName its MagicDNS name, User $SSH_USER) in
+~/.ssh/config and, on WSL, in the Windows ssh config VS Code reads
+(\$DEVBOX_WINDOWS_SSH_CONFIG, default %USERPROFILE%\\.ssh\\config), and a
+herdr machine $SSH_USER@<hostname> labelled with the client. Only the
+block between '$BEGIN_MARK' and '$END_MARK' is ever
+edited; the file is backed up to <file>.devboxes.bak before the first write.
+
+  add <client>     add the box's entries, forgetting the host keys of a box not
+                   yet listed (--new-box: even when listed, as after a create);
+                   the herdr machine needs the box on the tailnet (devbox login)
+  remove <client>  remove its entries, herdr machine and host keys
+  sync             make the entries match the devbox containers on \$DEVBOX_HOST
+  doctor           check each box on \$DEVBOX_HOST: entries, name, ssh from WSL
+                   and Windows, herdr status
+  --dry-run        print the changes instead of making them
+
+The tailnet's MagicDNS suffix comes from \`tailscale status\` (tailscale or
+tailscale.exe), or \$DEVBOX_TAILNET.
+EOF
+}
+
+DRY_RUN=false
+NEW_BOX=false
+TAILNET=""
+CONFIGS=() # the ssh configs to manage, from ssh_configs
+
+# The tailnet's MagicDNS suffix, e.g. tail1234.ts.net.
+tailnet() {
+  if [[ -n ${DEVBOX_TAILNET:-} ]]; then
+    printf '%s' "$DEVBOX_TAILNET"
+    return
+  fi
+  local ts suffix
+  for ts in tailscale tailscale.exe; do
+    command -v "$ts" >/dev/null || continue
+    suffix="$("$ts" status --json 2>/dev/null | jq -r '.MagicDNSSuffix // empty')" || continue
+    [[ -z $suffix ]] || { printf '%s' "$suffix"; return; }
+  done
+  die "could not read the tailnet's MagicDNS suffix from tailscale status; is tailscale up? (or set DEVBOX_TAILNET)"
+}
+
+# The ssh configs to manage: WSL's, then Windows' when there is one.
+ssh_configs() {
+  printf '%s\n' "$HOME/.ssh/config"
+  if [[ -n ${DEVBOX_WINDOWS_SSH_CONFIG:-} ]]; then
+    printf '%s\n' "$DEVBOX_WINDOWS_SSH_CONFIG"
+  elif command -v cmd.exe >/dev/null && command -v wslpath >/dev/null; then
+    local profile
+    # From a Windows directory, or cmd.exe warns about the UNC working directory.
+    profile="$(cd /mnt/c 2>/dev/null; cmd.exe /c 'echo %USERPROFILE%' 2>/dev/null | tr -d '\r')"
+    [[ $profile == [A-Za-z]:\\* ]] || die "could not find the Windows profile (cmd.exe said '$profile'); set DEVBOX_WINDOWS_SSH_CONFIG"
+    printf '%s\n' "$(wslpath -u "$profile")/.ssh/config"
+  fi
+}
+
+# "<host> <hostname>" for each Host entry in file $1's managed block.
+read_block() {
+  [[ -f $1 ]] || return 0
+  awk -v begin="$BEGIN_MARK" -v end="$END_MARK" '
+    { sub(/\r$/, "") }
+    $0 == begin { inblock = 1; next }
+    $0 == end { inblock = 0; next }
+    inblock && $1 == "Host" { host = $2 }
+    inblock && $1 == "HostName" && host != "" { print host, $2; host = "" }' "$1"
+}
+
+# The managed block for "<host> <hostname>" lines on stdin; nothing for none.
+render_block() {
+  local entries
+  entries="$(sort -u)"
+  [[ -n $entries ]] || return 0
+  printf '%s\n' "$BEGIN_MARK" "# Written by devboxes bin/devbox-host; edits inside this block are lost."
+  local host hostname
+  while read -r host hostname; do
+    printf 'Host %s\n  HostName %s\n  User %s\n\n' "$host" "$hostname" "$SSH_USER"
+  done <<<"$entries"
+  # Whatever follows the block applies to every host again, not to the last entry.
+  printf '%s\n' "Match all" "$END_MARK"
+}
+
+# Prints file $1 with its managed block replaced by block $2: in place,
+# appended after a blank line of its own when it has none, or dropped (with
+# the line before it, when blank) when $2 is empty. Every other line is left
+# exactly as it was, so adding then removing the block restores the file.
+splice_block() {
+  [[ -f $1 ]] || { printf '%s' "$2"; return; }
+  BLOCK="$2" awk -v begin="$BEGIN_MARK" -v end="$END_MARK" '
+    function flush(i) { for (i = 1; i <= blanks; i++) print held[i]; blanks = 0 }
+    { line = $0; sub(/\r$/, "", line) }
+    line == begin {
+      if (ENVIRON["BLOCK"] == "" && blanks > 0) blanks--
+      flush(); printf "%s", ENVIRON["BLOCK"]; done = 1; inblock = 1; next
+    }
+    inblock { if (line == end) inblock = 0; next }
+    line == "" { held[++blanks] = $0; next }
+    { flush(); print }
+    END {
+      flush()
+      if (!done && ENVIRON["BLOCK"] != "" && NR > 0) print ""
+      if (!done) printf "%s", ENVIRON["BLOCK"]
+    }' "$1"
+}
+
+# Rewrites ssh config $1's managed block to the "<host> <hostname>" lines on
+# stdin. Does nothing when that changes nothing.
+write_block() {
+  local file="$1" block target new old=/dev/null
+  block="$(render_block)"
+  [[ -z $block ]] || block+=$'\n'
+  [[ -f $file || -n $block ]] || return 0
+  new="$(mktemp)"
+  splice_block "$file" "$block" >"$new"
+  if [[ -f $file ]] && cmp -s "$file" "$new"; then
+    rm -f "$new"
+    say "$file: up to date"
+    return 0
+  fi
+  if $DRY_RUN; then
+    [[ ! -f $file ]] || old="$file"
+    diff -u --label "$file" --label "$file (new)" "$old" "$new" || true
+    rm -f "$new"
+    return 0
+  fi
+  # A stowed config is a symlink: write through it, keep it a link.
+  target="$(readlink -m "$file")"
+  [[ -d $(dirname "$target") ]] || mkdir -m 700 "$(dirname "$target")"
+  # The developer's own file, before devboxes first wrote to it.
+  if [[ -f $target && ! -e $target.devboxes.bak ]] && ! grep -qxF "$BEGIN_MARK" "$target"; then
+    cp -p "$target" "$target.devboxes.bak"
+    say "$file: backed up to $target.devboxes.bak"
+  fi
+  # Same directory, so the mv is a rename and the file is never half written.
+  local tmp
+  tmp="$(mktemp "$target.XXXXXX")"
+  cat "$new" >"$tmp"
+  rm -f "$new"
+  if [[ -f $target ]]; then
+    chmod --reference="$target" "$tmp"
+  else
+    chmod 600 "$tmp"
+  fi
+  mv "$tmp" "$target"
+  say "$file: updated the managed block"
+}
+
+# Removes the host keys for names $2... from the known_hosts next to ssh config $1.
+forget_host_keys() {
+  local known_hosts name
+  known_hosts="$(dirname "$1")/known_hosts"
+  shift
+  [[ -f $known_hosts ]] || return 0
+  for name in "$@"; do
+    ssh-keygen -F "$name" -f "$known_hosts" >/dev/null || continue
+    if $DRY_RUN; then
+      printf 'ssh-keygen -R %q -f %q\n' "$name" "$known_hosts"
+    else
+      ssh-keygen -R "$name" -f "$known_hosts" >/dev/null 2>&1
+      say "$known_hosts: removed the host key of $name"
+    fi
+  done
+}
+
+have_herdr() {
+  command -v herdr >/dev/null && return 0
+  say "herdr is not installed; skipping its machines"
+  return 1
+}
+
+# The id of the saved herdr machine for $SSH_USER@<host $1>, or nothing.
+herdr_id() {
+  herdr machine list --json | jq -r --arg t "$SSH_USER@$1" 'first(.[] | select(.target == $t) | .id) // empty'
+}
+
+# Saves herdr machine $SSH_USER@<host $1> labelled $2, unless it's saved
+# already. Returns 1, saying why, when the box isn't reachable yet.
+herdr_add() {
+  local host="$1" label="$2" target="$SSH_USER@$1" id
+  have_herdr || return 0
+  id="$(herdr_id "$host")" || return 1
+  if [[ -n $id ]] && ! $NEW_BOX; then
+    say "herdr: $target is already saved"
+    return 0
+  fi
+  if $DRY_RUN; then
+    [[ -n $id ]] || printf 'herdr machine add %q --label %q\n' "$target" "$label"
+    return 0
+  fi
+  # herdr connects without a terminal to answer the prompt for the box's new
+  # host key; over Tailscale (WireGuard keys) trusting it on first use is safe.
+  ssh_ok "$host" ssh || {
+    say "herdr: can't reach $target yet; once the box is on the tailnet (devbox login), run bin/devbox-host add $label"
+    return 1
+  }
+  if [[ -n $id ]]; then
+    say "herdr: $target is already saved; learned its new host key"
+    return 0
+  fi
+  herdr machine add "$target" --label "$label" </dev/null || { say "herdr: adding $target failed"; return 1; }
+  say "herdr: saved $target as $label"
+}
+
+herdr_remove() {
+  local host="$1" id
+  have_herdr || return 0
+  id="$(herdr_id "$host")" || return 1
+  [[ -n $id ]] || return 0
+  if $DRY_RUN; then
+    printf 'herdr machine remove %q\n' "$id"
+    return 0
+  fi
+  herdr machine remove "$id" || { say "herdr: removing $SSH_USER@$host failed"; return 1; }
+  say "herdr: removed $SSH_USER@$host"
+}
+
+# Client $1's hostname, from its resolved config.
+client_hostname() {
+  "$ROOT/bin/devbox-config" --json "$1" | jq -r .hostname
+}
+
+# Hostnames of the devbox containers on $DEVBOX_HOST, one per line.
+devbox_hostnames() {
+  local all
+  all="$(guests)" || exit 1
+  jq -r --arg tag "$DEVBOX_TAG" --argjson lo "$VMID_MIN" --argjson hi "$VMID_MAX" '
+    .[] | select(.type == "lxc" and .vmid >= $lo and .vmid <= $hi
+                 and ((.tags // "") | [splits("[;, ]")] | index([$tag])))
+    | .name' <<<"$all" | sort -u
+}
+
+# "<hostname> <client>" for each client file that resolves.
+client_labels() {
+  local f client
+  for f in "$CLIENTS_DIR"/[!_]*.yaml; do
+    [[ -e $f ]] || continue
+    client="$(basename "$f" .yaml)"
+    printf '%s %s\n' "$(client_hostname "$client" 2>/dev/null)" "$client"
+  done
+}
+
+cmd_add() {
+  local client="$1" host config failed=0
+  host="$(client_hostname "$client")" || exit 1
+  TAILNET="$(tailnet)" || exit 1
+  for config in "${CONFIGS[@]}"; do
+    # A new box has a new host key; an old one under its name would make ssh
+    # refuse it. A box already listed keeps the key ssh learned for it.
+    if $NEW_BOX || ! in_block "$host" "$config"; then
+      forget_host_keys "$config" "$host" "$host.$TAILNET"
+    fi
+    { read_block "$config" | awk -v h="$host" '$1 != h'; printf '%s %s\n' "$host" "$host.$TAILNET"; } |
+      write_block "$config"
+  done
+  herdr_add "$host" "$client" || failed=1
+  return "$failed"
+}
+
+cmd_remove() {
+  local client="$1" host config fqdn failed=0
+  host="$(client_hostname "$client")" || exit 1
+  herdr_remove "$host" || failed=1
+  for config in "${CONFIGS[@]}"; do
+    fqdn="$(read_block "$config" | awk -v h="$host" '$1 == h {print $2}')"
+    read_block "$config" | awk -v h="$host" '$1 != h' | write_block "$config"
+    forget_host_keys "$config" "$host" ${fqdn:+"$fqdn"}
+  done
+  return "$failed"
+}
+
+cmd_sync() {
+  local hosts labels config host fqdn label failed=0
+  hosts="$(devbox_hostnames)" || exit 1
+  TAILNET="$(tailnet)" || exit 1
+  labels="$(client_labels)"
+  say "devboxes on $DEVBOX_HOST: $(paste -sd ' ' <<<"$hosts")"
+
+  # Boxes gone from the host: drop their herdr machines first, while the WSL
+  # block still says which hosts were ours.
+  while read -r host fqdn; do
+    grep -qxF "$host" <<<"$hosts" || herdr_remove "$host" || failed=1
+  done < <(read_block "$HOME/.ssh/config")
+
+  for config in "${CONFIGS[@]}"; do
+    while read -r host fqdn; do
+      grep -qxF "$host" <<<"$hosts" || forget_host_keys "$config" "$host" "$fqdn"
+    done < <(read_block "$config")
+    for host in $hosts; do printf '%s %s\n' "$host" "$host.$TAILNET"; done | write_block "$config"
+  done
+
+  for host in $hosts; do
+    label="$(awk -v h="$host" '$1 == h {print $2; exit}' <<<"$labels")"
+    herdr_add "$host" "${label:-$host}" || failed=1
+  done
+  return "$failed"
+}
+
+# Prints one check's result; records a failure.
+check() {
+  local what="$1"
+  shift
+  if "$@" >/dev/null 2>&1; then
+    printf '  ok    %s\n' "$what"
+  else
+    printf '  FAIL  %s\n' "$what"
+    DOCTOR_FAILED=1
+  fi
+}
+
+in_block() {
+  read_block "$2" | awk -v h="$1" '$1 == h {found = 1} END {exit !found}'
+}
+
+# ssh_ok <host> <ssh command...>: runs `true` on the box as $SSH_USER.
+ssh_ok() {
+  "${@:2}" -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new "$SSH_USER@$1" true </dev/null
+}
+
+cmd_doctor() {
+  local hosts host config fqdn id status windows_config="${CONFIGS[1]:-}"
+  DOCTOR_FAILED=0
+  hosts="$(devbox_hostnames)" || exit 1
+  [[ -n $hosts ]] || say "no devboxes on $DEVBOX_HOST"
+  for host in $hosts; do
+    printf '%s\n' "$host"
+    for config in "${CONFIGS[@]}"; do
+      check "in $config" in_block "$host" "$config"
+    done
+    fqdn="$(read_block "${CONFIGS[0]}" | awk -v h="$host" '$1 == h {print $2}')"
+    check "${fqdn:-$host} resolves" getent hosts "${fqdn:-$host}"
+    check "ssh $SSH_USER@$host true (WSL)" ssh_ok "$host" ssh
+    if [[ -n $windows_config ]] && command -v ssh.exe >/dev/null; then
+      check "ssh $SSH_USER@$host true (Windows)" ssh_ok "$host" ssh.exe -F "$(wslpath -w "$windows_config")"
+    fi
+    if command -v herdr >/dev/null; then
+      id="$(herdr_id "$host")" || id=""
+      status="$([[ -z $id ]] || herdr machine status --json "$id" | jq -r '.[0].status // empty')" || status=""
+      check "herdr machine $SSH_USER@$host: ${status:-not saved}" test "$status" == reachable
+    fi
+  done
+  # Entries for boxes that are gone.
+  for config in "${CONFIGS[@]}"; do
+    while read -r host fqdn; do
+      grep -qxF "$host" <<<"$hosts" && continue
+      printf '  FAIL  %s in %s is not on %s (sync drops it)\n' "$host" "$config" "$DEVBOX_HOST"
+      DOCTOR_FAILED=1
+    done < <(read_block "$config")
+  done
+  return "$DOCTOR_FAILED"
+}
+
+main() {
+  local action="" client=""
+  while (($#)); do
+    case "$1" in
+      --dry-run) DRY_RUN=true ;;
+      --new-box) NEW_BOX=true ;;
+      -h | --help) usage; exit 0 ;;
+      -*) usage >&2; die "unknown option: $1" ;;
+      *)
+        if [[ -z $action ]]; then action="$1"
+        elif [[ -z $client ]]; then client="$1"
+        else die "unexpected argument: $1"
+        fi ;;
+    esac
+    shift
+  done
+  case "$action" in
+    add | remove) [[ -n $client ]] || { usage >&2; exit 1; } ;;
+    sync | doctor) [[ -z $client ]] || die "$action takes no client" ;;
+    *) usage >&2; exit 1 ;;
+  esac
+  [[ $action == add ]] || ! $NEW_BOX || die "--new-box is for add"
+  [[ $action != doctor ]] || ! $DRY_RUN || die "doctor changes nothing; drop --dry-run"
+  local configs
+  configs="$(ssh_configs)" || exit 1
+  mapfile -t CONFIGS <<<"$configs"
+  "cmd_$action" "$client"
+}
+
+main "$@"
