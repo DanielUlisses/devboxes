@@ -247,7 +247,9 @@ also read. A sync:
 - **packages:** installs listed packages that are missing. Packages dropped
   from the list since the last sync (recorded in `/var/lib/devbox/packages`)
   are marked as dependencies and removed with `pacman -Rns` unless another
-  package still needs them. Base packages are never removed.
+  package still needs them. Base packages are never removed. A client with
+  Azure DevOps repos also gets `azure-cli`, as if listed, so it goes when
+  the last of them is dropped.
 - **tools:** writes `~/.config/mise/config.toml` from `tools:` (a tool listed
   twice gets both versions, the first the default), then `mise install` and
   `mise prune`, which drops versions no config uses.
@@ -286,6 +288,8 @@ reported and the rest still run, then `update` (and the sync) exits 1:
 - **mise:** `mise upgrade` of the tools asked for as `latest` (herdr and
   1password, plus any client `<tool>@latest`), then `mise prune`.
 - **claude:** `claude update`.
+- **az:** with Azure DevOps repos, `az extension update --name
+  azure-devops` (added when missing); `az` itself comes with pacman.
 - **configs:** gh's `config.yml` and the nvim config gain files new in this
   repo; files already on the box, edited or not, are left alone. A
   `bin/devbox-sync` doesn't pull the box's checkout, so new files reach it
@@ -317,6 +321,12 @@ what's missing:
 - **Claude:** `claude auth login`, telling you which account the client
   file's `claude_account` names; when already logged in it prints the
   logged-in account to compare.
+- **az**, with Azure DevOps repos only: `az login --use-device-code
+  --allow-no-subscriptions` (open the URL, enter the code). When the login
+  reaches several tenants it lists them and asks which one holds the Azure
+  DevOps orgs, making it the default. Then `az extension add --name
+  azure-devops`. `az` comes from `devbox sync`; on a box synced before it
+  had Azure DevOps repos, sync first.
 
 `devbox finish` then, again skipping what's done:
 
@@ -351,9 +361,9 @@ what's missing:
   is added, `devbox sync` (or `finish` again) clones the pending ones.
 
 `devbox logout` undoes the outward-facing part: deletes the GitHub keys that
-match the box's public key or carry its title, and `tailscale logout`. The
-Azure DevOps key has to be removed by hand: it prints the key's title and
-fingerprint to delete under User settings -> SSH public keys. `bin/devbox-destroy` runs
+match the box's public key or carry its title, `az logout` when az is
+logged in, and `tailscale logout`. The Azure DevOps key has to be removed by
+hand: it prints the key's title and fingerprint to delete under User settings -> SSH public keys. `bin/devbox-destroy` runs
 it for you.
 
 ## Working in a box
@@ -390,6 +400,22 @@ The ticket framework comes with the skills `devbox finish` installs (the
 worktree, reviews it, and leaves the change unstaged for you to review,
 commit and push. `herdr worktree create` makes the worktree and opens it as
 a herdr workspace in one step.
+
+### Azure DevOps pull requests
+
+In a clone (or worktree) of an Azure DevOps repo, after `devbox login`:
+
+```
+az repos pr create --draft --title "<title>" --description "<text>"
+```
+
+needs no other flags and asks nothing: the azure-devops extension reads the
+org, project and repo from the clone's `origin`
+(`git@ssh.dev.azure.com:v3/<org>/<project>/<repo>`), takes the current
+branch as the source and the repo's default branch as the target. Push the
+branch first. Outside a clone, name them:
+`az repos pr create --org https://dev.azure.com/<org> --project <project>
+--repository <repo> --source-branch <branch>`.
 
 ### Remote Control: `devbox rc`
 
