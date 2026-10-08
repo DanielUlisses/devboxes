@@ -56,6 +56,10 @@ repos:
   - example-org/example-repo
   - git@ssh.dev.azure.com:v3/example-org/example-project/example-ado-repo
 
+# IANA time zone (a name under /usr/share/zoneinfo). devbox bootstrap sets
+# it and devbox sync re-applies it when it changes. Shown value is the default.
+# timezone: America/Sao_Paulo
+
 # Proxmox backup job for this box: vzdump in snapshot mode, zstd, to the
 # storage in $DEVBOX_BACKUP_STORAGE (default local). devbox-create adds it,
 # bin/devbox-sync adds, updates or removes it when these change, and

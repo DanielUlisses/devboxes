@@ -67,12 +67,19 @@ fi
 
 systemctl enable --now tailscaled
 
+# --accept-dns=false: the host keeps its own DNS. Proxmox copies the host's
+# resolv.conf into every container it starts, so MagicDNS here would reach
+# every guest.
 if ip="$(tailscale ip -4 2>/dev/null | head -n1)" && [[ -n $ip ]]; then
   echo "tailscale: already up as $ip"
+  if tailscale debug prefs 2>/dev/null | grep -q '"CorpDNS": true'; then
+    tailscale set --accept-dns=false
+    echo "tailscale: the host keeps its own DNS now"
+  fi
 elif [[ -n ${TS_AUTHKEY:-} ]]; then
-  tailscale up --auth-key="$TS_AUTHKEY"
+  tailscale up --accept-dns=false --auth-key="$TS_AUTHKEY"
 else
   echo "tailscale: open the URL below to add this host to the tailnet"
-  tailscale up
+  tailscale up --accept-dns=false
 fi
 echo "tailscale: up as $(tailscale ip -4 | head -n1)"

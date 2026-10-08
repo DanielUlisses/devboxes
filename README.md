@@ -641,7 +641,9 @@ What it sets up:
   turns off password login over SSH.
 - **Tailscale:** installs it, starts `tailscaled`, joins the tailnet.
 - **Firewall:** the datacenter firewall drops all inbound traffic except over
-  Tailscale, so neither the WAN nor the LAN can reach SSH or the web UI.
+  Tailscale, so neither the WAN nor the LAN can reach SSH or the web UI. The
+  one exception is Home Assistant (`HOME_ASSISTANT_IP`), which may reach the
+  API on port 8006.
   It is only switched on once Tailscale is up. After that, use
   `https://<tailscale-ip>:8006` and `ssh root@<tailscale-ip>`.
 - **Template:** downloads the latest `archlinux-base` LXC template to `local`.

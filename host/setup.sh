@@ -9,6 +9,8 @@ SUITE=trixie # Debian release under Proxmox VE 9
 ZFS_ARC_MAX=$((2 * 1024 * 1024 * 1024))
 TEMPLATE_STORAGE=local
 TAILNET_CIDR=100.64.0.0/10
+# Home Assistant polls the Proxmox API from the LAN.
+HOME_ASSISTANT_IP=172.16.0.7
 # The kernel's LSM order on stock Proxmox VE 9, used when neither the boot
 # config nor /sys/kernel/security/lsm says otherwise.
 STOCK_LSM=lockdown,capability,yama,apparmor,ima,evm
@@ -35,7 +37,8 @@ policy_out: ACCEPT
 local_network $TAILNET_CIDR
 
 [RULES]
-IN ACCEPT -i tailscale0 -log nolog"
+IN ACCEPT -i tailscale0 -log nolog
+IN ACCEPT -source $HOME_ASSISTANT_IP -p tcp -dport 8006 -log nolog"
 
 SSHD_CONF="# Managed by devboxes host/setup.sh: root logs in with a key only.
 PermitRootLogin prohibit-password
@@ -340,11 +343,14 @@ tailscale_ip() {
   command -v tailscale >/dev/null && tailscale ip -4 2>/dev/null | head -n1 | grep .
 }
 
+# --accept-dns=false: the host keeps its own DNS. Proxmox copies the host's
+# resolv.conf into every container it starts, and MagicDNS there left the
+# boxes failing to resolve public names.
 tailscale_up() {
   if [[ -n ${TS_AUTHKEY:-} ]]; then
-    tailscale up --auth-key="$TS_AUTHKEY"
+    tailscale up --accept-dns=false --auth-key="$TS_AUTHKEY"
   else
-    tailscale up
+    tailscale up --accept-dns=false
   fi
 }
 
@@ -364,6 +370,11 @@ setup_tailscale() {
   local ip
   if ip="$(tailscale_ip)"; then
     ok "on the tailnet as $ip"
+    if tailscale debug prefs 2>/dev/null | grep -q '"CorpDNS": true'; then
+      change "keep the host's own DNS (tailscale set --accept-dns=false)" tailscale set --accept-dns=false
+    else
+      ok "host keeps its own DNS"
+    fi
   else
     change "join the tailnet with 'tailscale up' (prints a login URL unless TS_AUTHKEY is set)" tailscale_up
   fi

@@ -46,6 +46,18 @@ main() {
   [[ $(pve pct status "$vmid") == "status: running" ]] || die "$hostname (VMID $vmid) is not running"
 
   say "syncing $hostname (VMID $vmid)"
+  # With --config-json the box doesn't pull, so bring its devboxes checkout to
+  # the pushed head of its branch first: fixes pushed since bootstrap reach it.
+  # shellcheck disable=SC2016 # expanded in the box
+  pve pct exec "$vmid" -- bash -c 'set -e
+    branch="$(cat /var/lib/devbox/branch)"
+    git -C /opt/devboxes fetch -q origin "$branch"
+    # A deployed copy, not a place for edits: name any, then replace them.
+    edits="$(git -C /opt/devboxes status --short --untracked-files=no)"
+    [[ -z $edits ]] || echo "devbox-sync: replacing local edits in /opt/devboxes: $edits" >&2
+    git -C /opt/devboxes -c advice.detachedHead=false checkout -q --force --detach FETCH_HEAD
+    echo "devbox-sync: box code at $branch $(git -C /opt/devboxes rev-parse --short HEAD)"' ||
+    die "could not update the devboxes checkout in $hostname"
   pve pct exec "$vmid" -- /usr/local/bin/devbox sync --config-json "$(jq -c . <<<"$config")" "${sync_args[@]}"
 }
 
