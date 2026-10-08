@@ -265,19 +265,23 @@ resolved config it was handed in `/var/lib/devbox/`, then runs `devbox
 bootstrap`, which:
 
 - installs the base packages (`base-devel git openssh sudo stow jq go-yq
-  unzip mise github-cli tailscale bash-completion neovim ripgrep fd docker
-  docker-buildx docker-compose`), generates the `en_US.UTF-8` locale and enables
+  unzip less mise github-cli tailscale bash-completion starship zoxide neovim
+  tree-sitter-cli ripgrep fd docker docker-buildx docker-compose`; `tree-sitter-cli` builds
+  nvim's treesitter parsers), generates the `en_US.UTF-8` locale and enables
   `tailscaled`;
 - sets Docker's storage driver, enables `docker.service` and adds `daniel`
   to the `docker` group (below);
 - adds user `daniel` with passwordless sudo, and `devbox` on the PATH;
-- installs Claude Code (native installer) and puts herdr and the 1Password
-  CLI (`op`) in mise's system config, `/etc/mise/config.toml`;
+- installs Claude Code (native installer) and puts herdr, the 1Password
+  CLI (`op`) and node 26 (global, for `npx`) in mise's system config,
+  `/etc/mise/config.toml`;
 - stows this repo's `dotfiles/` `bash` and `git` packages into the user's
   home (files in the way are moved to `<file>.bak`), and copies gh's
   `config.yml` and the nvim config, since both tools write there (a re-run
-  only adds files missing from the box). The nvim config is LazyVim with the
-  plugin versions pinned in `lazy-lock.json`; its clipboard goes over OSC 52,
+  only adds files missing from the box). The shell prompt is starship's
+  (its defaults; a `~/.config/starship.toml` on the box overrides them),
+  and `z <fragment>` (zoxide) jumps to directories visited before. The nvim
+  config is LazyVim with the plugin versions pinned in `lazy-lock.json`; its clipboard goes over OSC 52,
   so yanks reach your local clipboard through ssh and herdr. They hold no
   identity: git's `user.name`/`user.email` go in `~/.gitconfig.local`, shell
   extras in `~/.bashrc.local`, and git authenticates through `gh`;
@@ -302,13 +306,15 @@ runs the sync with it over `ssh` and `pct exec`, without pulling. Each sync
 stores the config it applied, which `devbox login`, `finish` and `logout`
 also read. A sync:
 
-- **packages:** installs listed packages that are missing. Packages dropped
+- **packages:** installs listed packages that are missing, and base packages
+  added to this repo since the box was bootstrapped. Packages dropped
   from the list since the last sync (recorded in `/var/lib/devbox/packages`)
   are marked as dependencies and removed with `pacman -Rns` unless another
   package still needs them. Base packages are never removed. A client with
   Azure DevOps repos also gets `azure-cli`, as if listed, so it goes when
   the last of them is dropped.
-- **tools:** writes `~/.config/mise/config.toml` from `tools:` (a tool listed
+- **tools:** rewrites `/etc/mise/config.toml` when this repo's base tools
+  changed, writes `~/.config/mise/config.toml` from `tools:` (a tool listed
   twice gets both versions, the first the default), then `mise install` and
   `mise prune`, which drops versions no config uses.
 - **repos:** clones listed repos that are missing into `~/work/<repo>`:
@@ -369,10 +375,17 @@ reported and the rest still run, then `update` (and the sync) exits 1:
 
 - **skills:** pulls each skill repo and re-runs its install (as `finish`
   does) when its head moved since the last install, recorded in the clone's
-  `.git/devbox-installed`; a failed install is retried next time. Skills
-  newly listed in the client file are installed.
+  `.git/devbox-installed`; a failed install is retried next time.
+  `mattpocock-skills` is re-added with `npx skills@latest add` when the
+  head of `mattpocock/skills` moved (recorded in
+  `~/.local/state/devbox/skills/`). Skills newly listed in the client file
+  are installed.
 - **plugins:** `claude plugin marketplace update`, then `claude plugin
   update` for every user-scope plugin.
+- **herdr:** reinstalls each herdr plugin whose GitHub default branch moved
+  past the installed commit (herdr has no plugin update; its config is
+  kept), and installs missing ones. A plugin linked from a local checkout
+  is left alone.
 - **pacman:** `pacman -Syu` (Arch upgrades the whole system together, base
   packages included); `--no-pacman-upgrade` skips it.
 - **mise:** `mise upgrade` of the tools asked for as `latest` (herdr and
@@ -440,13 +453,19 @@ what's missing:
   it in Azure DevOps (User settings -> SSH public keys -> + New Key, titled
   with the box's hostname), `finish` and `sync` print the key and the
   settings page of each org, and report those repos pending;
-- installs the `skills:` list: `mattpocock-skills` is the
-  `mattpocock-skills@claude-plugins-official` plugin; every other entry is a
+- installs the `skills:` list: `mattpocock-skills` is every skill in
+  `mattpocock/skills`, installed with `npx skills@latest add mattpocock/skills
+  --global --agent claude-code --skill '*' --yes` into `~/.claude/skills/`
+  (a box that had it as the `mattpocock-skills@claude-plugins-official`
+  plugin has that uninstalled); every other entry is a
   GitHub repo (`<owner>/<repo>`, or a bare name under `DanielUlisses`) cloned
   with gh into `~/.claude/skill-repos/` and installed by its layout: its
   `install.sh`, a plugin marketplace (`.claude-plugin/marketplace.json`), or
   a `SKILL.md` at its root linked into `~/.claude/skills/` (`-skill` dropped
   from the name);
+- installs the herdr plugins: [reviewr](https://github.com/persiyanov/herdr-reviewr)
+  (`herdr plugin install persiyanov/herdr-reviewr`), a pane to review the
+  agent's diff and send line comments back to it;
 - clones `repos:` into `~/work`, as a sync does. Once the Azure DevOps key
   is added, `devbox sync` (or `finish` again) clones the pending ones.
 
