@@ -12,6 +12,8 @@ DEFAULTS="$ROOT/defaults.yaml"
 CLIENTS_CHECKOUT="${DEVBOX_CLIENTS:-$ROOT/../devbox-clients}"
 CLIENTS="$CLIENTS_CHECKOUT/clients"
 PUBLIC_CLIENTS="$ROOT/clients"
+# shellcheck source-path=SCRIPTDIR/.. source=lib/host-name.sh
+source "$ROOT/lib/host-name.sh"
 
 usage() {
   cat <<EOF
@@ -82,7 +84,7 @@ def int_min($p; $min):
 
 def str_match($p; $re; $what):
   if . == null then empty
-  elif type != "string" or (test($re) | not) then err($p; "must be \($what) \(got)")
+  elif type != "string" or test("\n") or (test($re) | not) then err($p; "must be \($what) \(got)")
   else empty end;
 
 def str_list($p; $re; $what):
@@ -96,11 +98,15 @@ def unknown_keys($prefix; $allowed):
 if . == null then {} else . end
 | if type != "object" then err("(top level)"; "must be a mapping of fields \(got)")
   else
-    unknown_keys(""; ["hostname", "claude_account", "git_name", "git_email", "resources", "packages", "tools", "skills", "repos",
+    unknown_keys(""; ["hostname", "host", "claude_account", "git_name", "git_email", "resources", "packages", "tools", "skills", "repos",
                      "timezone", "backup", "backup_schedule", "backup_keep"]),
 
     (.hostname | str_match("hostname"; "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$";
       "a lowercase hostname (letters, digits, inner dashes, max 63)")),
+
+    (.host | if . == "" then empty
+      else str_match("host"; $host_re;
+        "the ssh name of a Proxmox host (letters, digits, . _ -), or empty for $DEVBOX_HOST") end),
 
     (if $required and .claude_account == null then err("claude_account"; "required")
      else .claude_account | str_match("claude_account"; "^[A-Za-z0-9._-]+$";
@@ -154,14 +160,14 @@ def strip_nulls: if type == "object" then with_entries(select(.value != null) | 
 | ($d * $c)
 | .hostname //= "dev-\($name)"
 | .skills = (reduce (($d.skills // []) + ($c.skills // []))[] as $s ([]; if IN(.[]; $s) then . else . + [$s] end))
-| {hostname, claude_account, git_name, git_email, resources, packages, tools, skills, repos, timezone, backup, backup_schedule, backup_keep}
+| {hostname, host, claude_account, git_name, git_email, resources, packages, tools, skills, repos, timezone, backup, backup_schedule, backup_keep}
 '
 
 # Prints the errors of one file, prefixed with its displayed path.
 validate() {
   local file="$1" json="$2" required="$3" prefix
   prefix="$(display "$file")"
-  jq -r --argjson required "$required" "$VALIDATE" <<<"$json" |
+  jq -r --argjson required "$required" --arg host_re "$DEVBOX_HOST_RE" "$VALIDATE" <<<"$json" |
     sed "s|^|$prefix: |"
 }
 

@@ -4,6 +4,11 @@
 # the commands listed there: the host may be shared, so the one host-level
 # change, a box's backup job, only runs on a host where every guest is a devbox.
 
+# shellcheck source=lib/host-name.sh
+source "$(dirname "${BASH_SOURCE[0]}")/host-name.sh"
+
+# The host every pve() call goes to; scripts acting on one client's box point
+# it at that client's `host` with use_config_host.
 DEVBOX_HOST="${DEVBOX_HOST:-}"
 VMID_MIN=2000
 VMID_MAX=2099
@@ -41,6 +46,26 @@ pve() {
   # ssh joins its arguments into one string for the remote shell; quote them.
   # shellcheck disable=SC2029 # expanding client-side is the point
   ssh -o BatchMode=yes -o ConnectTimeout=10 "root@$DEVBOX_HOST" "$(printf '%q ' "$@")"
+}
+
+# Dies unless $DEVBOX_HOST, when set, is a valid host ssh name ($DEVBOX_HOST_RE).
+assert_devbox_host_name() {
+  [[ -z $DEVBOX_HOST ]] || is_devbox_host_name "$DEVBOX_HOST" ||
+    die "DEVBOX_HOST must be the ssh name of a Proxmox host (letters, digits, . _ -), got '$DEVBOX_HOST'"
+}
+
+# Points this run at the Proxmox host of resolved config $1 (devbox-config
+# --json): its `host`, or $DEVBOX_HOST when that is empty. Dies when neither
+# names one; says which host it is.
+use_config_host() {
+  local config="$1" host hostname
+  host="$(jq -r '.host // ""' <<<"$config")" || die "could not read host from the resolved config"
+  hostname="$(jq -r .hostname <<<"$config")" || die "could not read hostname from the resolved config"
+  [[ -z $host ]] || DEVBOX_HOST="$host"
+  [[ -n $DEVBOX_HOST ]] ||
+    die "no Proxmox host for $hostname: its client file sets no \`host\` and DEVBOX_HOST is not set (export it to the host's ssh name)"
+  [[ -n $host ]] || assert_devbox_host_name
+  say "$hostname: targeting Proxmox host $DEVBOX_HOST ($([[ -n $host ]] && echo "the client's host" || echo "DEVBOX_HOST"))"
 }
 
 # Dies unless "$@" (pvesh create|set|delete ...) touches only one devbox
