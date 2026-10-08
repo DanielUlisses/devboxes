@@ -416,8 +416,14 @@ sync_timezone() {
 
 # $2: --no-pacman-upgrade, passed on to update, or empty.
 sync() {
-  local config no_upgrade="${2:-}"
+  local config no_upgrade="${2:-}" before
+  before="$(git -C "$ROOT" rev-parse HEAD)"
   config="$(resolve_config "${1:-}")"
+  # The pull may have changed this script, and this run is still the old one:
+  # re-run the new one on the config just resolved (--config-json doesn't pull).
+  if [[ -z ${1:-} && $(git -C "$ROOT" rev-parse HEAD) != "$before" ]]; then
+    exec "$ROOT/bin/devbox" sync --config-json "$(jq -c . <<<"$config")" ${no_upgrade:+"$no_upgrade"}
+  fi
   base_packages
   sync_timezone "$config"
   sync_packages "$config"
