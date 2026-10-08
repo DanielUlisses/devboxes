@@ -43,7 +43,8 @@ tools:
 # Extra skills, appended to the base list in defaults.yaml (ticket-skill,
 # tdd-skill, humanizer-skill, mattpocock-skills). Each is a GitHub repo,
 # <owner>/<repo> or a bare name under DanielUlisses, that `devbox finish`
-# clones and installs into ~/.claude; mattpocock-skills is a Claude plugin.
+# clones and installs into ~/.claude; mattpocock-skills is installed with
+# npx skills from mattpocock/skills.
 skills: []
 
 # Repos to clone into ~/work/<repo>: GitHub ones as <owner>/<repo>, Azure

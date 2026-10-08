@@ -22,12 +22,17 @@ if [[ -r ~/.config/op/service-account-token ]]; then
 fi
 
 [[ -r /usr/share/bash-completion/bash_completion ]] && source /usr/share/bash-completion/bash_completion
-if [[ -r /usr/share/git/completion/git-prompt.sh ]]; then
+if command -v starship >/dev/null; then
+  eval "$(starship init bash)"
+elif [[ -r /usr/share/git/completion/git-prompt.sh ]]; then
   source /usr/share/git/completion/git-prompt.sh
   PS1='[\u@\h \W$(__git_ps1 " (%s)")]\$ '
 else
   PS1='[\u@\h \W]\$ '
 fi
+# z <dir fragment> jumps to a directory visited before; after the prompt, as
+# zoxide's own hook goes last.
+command -v zoxide >/dev/null && eval "$(zoxide init bash)"
 
 # shellcheck source=/dev/null
 source ~/.aliases
