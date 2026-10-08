@@ -31,7 +31,8 @@ usage() {
 Usage: devbox-create [--light] [--dry-run] [--allow-unpushed] <client>
 
 Create and start the devbox container for <client> (its file in the
-devbox-clients checkout, see devbox-config) on \$DEVBOX_HOST (required),
+devbox-clients checkout, see devbox-config) on the client's \`host\`, or
+\$DEVBOX_HOST when it names none (one of the two is required),
 using the first free VMID in $VMID_MIN-$VMID_MAX, then bootstrap it from
 bootstrap.sh at the pushed head of $REPO's \$DEVBOX_BRANCH (default
 main), handing it the client's resolved config from this machine. With
@@ -81,6 +82,7 @@ main() {
   cores="$(jq -r .resources.cores <<<"$config")"
   disk="$(disk_gb "$(jq -r .resources.disk <<<"$config")")"
   onboot="$(jq -r 'if .resources.onboot then 1 else 0 end' <<<"$config")"
+  use_config_host "$config"
   if $light; then
     ((memory <= 1024)) || memory=1024
     ((swap <= 512)) || swap=512

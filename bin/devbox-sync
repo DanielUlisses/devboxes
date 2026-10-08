@@ -12,7 +12,8 @@ usage() {
   cat <<EOF
 Usage: devbox-sync [--no-pacman-upgrade] <client>
 
-Converge the devbox for <client> on \$DEVBOX_HOST (required) to its
+Converge the devbox for <client>, on the client's \`host\` or else
+\$DEVBOX_HOST (one of the two is required), to its
 resolved config on this machine (see devbox-config): install and remove
 pacman packages and mise tools to match it, clone newly listed repos, then
 (once devbox finish has run) bring skills, plugins, packages, tools, Claude
@@ -39,6 +40,7 @@ main() {
   local config hostname vmid
   config="$("$ROOT/bin/devbox-config" --json "$client")" || exit 1
   hostname="$(jq -r .hostname <<<"$config")"
+  use_config_host "$config"
   vmid="$(find_devbox "$hostname")"
   [[ -n $vmid ]] || die "no $hostname on $DEVBOX_HOST; create it with bin/devbox-create $client"
   assert_devbox "$vmid" "$hostname"

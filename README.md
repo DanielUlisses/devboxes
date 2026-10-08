@@ -21,6 +21,7 @@ bin/devbox-browser     $BROWSER in a box: prints URLs instead of opening them
 bootstrap.sh           first thing a new box runs: clones this repo, hands over to devbox
 dotfiles/              bash, git, gh and nvim config stowed into every box (no identity, no secrets)
 lib/pve.sh             the one way bin/ scripts talk to the host
+lib/host-name.sh       what a Proxmox host's ssh name may be, for devbox-config and the bash scripts
 host/setup.sh          prepares the dedicated Proxmox host (run on the host)
 host/tailscale-only.sh no-subscription repo + tailnet for a shared Proxmox host, no firewall
 .githooks/pre-commit   refuses commits that fail the checks or leak secrets
@@ -100,7 +101,10 @@ Prints `defaults.yaml` merged with the client's file
 (`$DEVBOX_CLIENTS/clients/<client>.yaml`), as YAML (or JSON with
 `--json`). Mappings merge key by key, lists replace, except `skills`, which
 appends the client's extras to the base list (duplicates dropped). `hostname` defaults to
-`dev-<client>`.
+`dev-<client>`. `host`, the ssh name of the Proxmox host the box runs on
+(as in `ssh root@<host>`), defaults to empty, meaning `$DEVBOX_HOST`; it is
+a label like `claude_account`, and like every client value it lives only in
+the private `devbox-clients` files.
 
 On an invalid file it prints one line per problem, each naming the field, and
 exits 1:
@@ -120,8 +124,12 @@ bin/devbox-create [--light] [--dry-run] [--allow-unpushed] <client>
 bin/devbox-destroy [--skip-logout] <client>
 ```
 
-Both run `ssh root@$DEVBOX_HOST pct ...`. `DEVBOX_HOST` has no default and
-must be exported (host names stay out of this public repo). `devbox-create` makes an unprivileged Arch container
+Both run `ssh root@<host> pct ...`, where `<host>` is the client's `host`
+or, when its file sets none, `$DEVBOX_HOST`; so does `devbox-sync`, and the
+first line each prints names the host it targets. `DEVBOX_HOST` has no
+default: a client without `host` needs it exported (host names stay out of
+this public repo), and the scripts stop before any host call when neither is
+set. `devbox-create` makes an unprivileged Arch container
 with `nesting=1,keyctl=1` (what Docker needs, see [Docker](#docker)) and `/dev/net/tun`, hostname from the config, tag `devbox`,
 the first free VMID in 2000-2099, sized from `resources`, then starts it.
 `--light` caps it at 1 GB memory, 512 MB swap, 1 core and an 8 GB disk; `--dry-run` runs
@@ -241,12 +249,20 @@ The developer-machine side of each box, run on your machine (WSL):
   accepts the box's new host key first (over Tailscale, so trusting it on
   first use is safe), since herdr has no terminal to ask.
 
-`sync` rebuilds all of it from the devbox containers on `$DEVBOX_HOST`, for
-a new laptop or after boxes changed elsewhere: the blocks list exactly those
-boxes, herdr machines and host keys of boxes no longer there are removed, and
-missing herdr machines are added, labelled with the client whose file
-resolves to that hostname (in `$DEVBOX_CLIENTS`), or the hostname. `doctor`
-checks each box on the host: listed in both configs, its MagicDNS name
+`sync` rebuilds all of it from the devbox containers on every Proxmox host:
+each host a client file in `$DEVBOX_CLIENTS` names in `host`, plus
+`$DEVBOX_HOST`. It is for a new laptop or after boxes changed elsewhere: the
+blocks list exactly the boxes found across those hosts, herdr machines and
+host keys of boxes on none of them are removed, and missing herdr machines
+are added, labelled with the client whose file resolves to that hostname, or
+the hostname. Boxes are matched by hostname, not VMID, since VMIDs on two
+hosts can coincide. `sync` refuses to change anything when a host can't be
+listed, when a client file doesn't resolve, or when a client sets no `host`
+and `DEVBOX_HOST` is unset. That way a box on one host is never dropped
+because another lacks it. It warns of a hostname found on several hosts.
+`doctor` checks each box on those hosts (a client file that doesn't resolve
+counts as a failure there, though the `host` it names is still checked):
+listed in both configs, its MagicDNS name
 resolves, `ssh daniel@<hostname> true` works from WSL and from Windows
 (`ssh.exe`), and its herdr machine is reachable; it also flags entries for
 boxes that are gone, and exits 1 on any failure.

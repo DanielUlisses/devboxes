@@ -11,6 +11,12 @@
 # VM hostname. Default: dev-<client>.
 # hostname: dev-example
 
+# Proxmox host the box runs on: a label, the host's ssh name (as in
+# `ssh root@<host>`; letters, digits, . _ -). bin/devbox-create,
+# devbox-sync and devbox-destroy run against it. Default: empty, meaning
+# $DEVBOX_HOST.
+# host: example-host
+
 # Which Claude account the devbox signs in with: a label, never an email.
 # Required.
 claude_account: example

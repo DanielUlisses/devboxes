@@ -3,6 +3,9 @@
 # where the client's list is appended to the base list below.
 # `hostname` has no entry here: it defaults to dev-<client>.
 
+# Proxmox host the box runs on, as its ssh name; empty means $DEVBOX_HOST.
+host: ""
+
 # Git identity for commits in the box; empty means your GitHub name and
 # noreply address.
 git_name: ""

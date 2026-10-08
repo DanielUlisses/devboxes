@@ -2,8 +2,9 @@
 # The developer-machine side of each devbox: a herdr machine, a Host entry in
 # the WSL ~/.ssh/config and in the Windows one VS Code Remote-SSH reads, and
 # no stale host keys in either known_hosts. devbox-create and devbox-destroy
-# call it; sync rebuilds it all from the boxes on $DEVBOX_HOST, doctor checks
-# each box. In each ssh config it only ever rewrites one marked block.
+# call it; sync rebuilds it all from the boxes on every Proxmox host (each
+# client file's `host`, plus $DEVBOX_HOST), doctor checks each box. In each
+# ssh config it only ever rewrites one marked block.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
@@ -34,8 +35,10 @@ edited; the file is backed up to <file>.devboxes.bak before the first write.
                    yet listed (--new-box: even when listed, as after a create);
                    the herdr machine needs the box on the tailnet (devbox login)
   remove <client>  remove its entries, herdr machine and host keys
-  sync             make the entries match the devbox containers on \$DEVBOX_HOST
-  doctor           check each box on \$DEVBOX_HOST: entries, name, ssh from WSL
+  sync             make the entries match the devbox containers on every host
+                   (each client file's \`host\`, plus \$DEVBOX_HOST); refuses
+                   when a host can't be listed or a client file doesn't resolve
+  doctor           check each box on those hosts: entries, name, ssh from WSL
                    and Windows, herdr status
   --dry-run        print the changes instead of making them
 
@@ -242,23 +245,75 @@ client_hostname() {
   "$ROOT/bin/devbox-config" --json "$1" | jq -r .hostname
 }
 
-# Hostnames of the devbox containers on $DEVBOX_HOST, one per line.
-devbox_hostnames() {
-  local all
-  all="$(guests)" || exit 1
-  jq -r --arg tag "$DEVBOX_TAG" --argjson lo "$VMID_MIN" --argjson hi "$VMID_MAX" '
-    .[] | select(.type == "lxc" and .vmid >= $lo and .vmid <= $hi
-                 and ((.tags // "") | [splits("[;, ]")] | index([$tag])))
-    | .name' <<<"$all" | sort -u
-}
-
-# "<hostname> <client>" for each client file that resolves.
-client_labels() {
-  local f client
+# "<hostname> <client> <host>" for each client file, <host> being the Proxmox
+# host its box lives on: its `host`, or $DEVBOX_HOST ("-" when neither).
+# Returns 1 when files don't resolve (devbox-config's errors on stderr say
+# why; callers name them from the "-" lines); each of those still gets a
+# line, hostname "-", with the `host` read raw from its file when that is a
+# valid host name ("-" when not), so doctor can still list that host's boxes.
+client_entries() {
+  local f client config raw failed=0
   for f in "$CLIENTS_DIR"/[!_]*.yaml; do
     [[ -e $f ]] || continue
     client="$(basename "$f" .yaml)"
-    printf '%s %s\n' "$(client_hostname "$client" 2>/dev/null)" "$client"
+    if config="$("$ROOT/bin/devbox-config" --json "$client")"; then
+      jq -r --arg c "$client" --arg d "${DEVBOX_HOST:--}" \
+        '(.host // "") as $h | "\(.hostname) \($c) \(if $h == "" then $d else $h end)"' <<<"$config"
+    else
+      failed=1
+      raw="$(yq -o=json '.' "$f" 2>/dev/null |
+        jq -r 'if type == "object" and (.host | type) == "string" then .host else "" end' 2>/dev/null)" || raw=""
+      [[ -n $raw ]] || raw="${DEVBOX_HOST:--}"
+      is_devbox_host_name "$raw" || raw=-
+      printf -- '- %s %s\n' "$client" "$raw"
+    fi
+  done
+  return "$failed"
+}
+
+# The Proxmox hosts to gather boxes from, one per line: those client entries
+# $1 name, plus $DEVBOX_HOST. Dies when there are none, when $DEVBOX_HOST is
+# not a host name, or when a resolved client's host is unknown (no `host`, no
+# $DEVBOX_HOST): its box could look gone.
+pve_hosts() {
+  local hosts unknown
+  assert_devbox_host_name
+  unknown="$(awk '$1 != "-" && $3 == "-" {print $2}' <<<"$1" | paste -sd ' ')"
+  [[ -z $unknown ]] ||
+    die "no Proxmox host for client(s) $unknown: their files set no \`host\` and DEVBOX_HOST is not set"
+  hosts="$({ awk 'NF == 3 && $3 != "-" {print $3}' <<<"$1"; [[ -z $DEVBOX_HOST ]] || printf '%s\n' "$DEVBOX_HOST"; } |
+    sort -u)"
+  [[ -n $hosts ]] || die "no Proxmox host: no client file sets \`host\` and DEVBOX_HOST is not set"
+  printf '%s\n' "$hosts"
+}
+
+# "<hostname> <host>" for each devbox container on each host in $@. Keyed on
+# hostname: VMIDs on two hosts can coincide. Fails, naming the host, when one
+# can't be listed (or lists something other than a JSON array), rather than
+# let its boxes look gone.
+devbox_hostnames() {
+  local host all
+  for host in "$@"; do
+    all="$(DEVBOX_HOST="$host" guests)" || die "could not list the guests on $host; not treating its boxes as gone"
+    jq -e 'type == "array"' <<<"$all" >/dev/null 2>&1 ||
+      die "could not list the guests on $host: it returned no JSON list; not treating its boxes as gone"
+    jq -r --arg host "$host" --arg tag "$DEVBOX_TAG" --argjson lo "$VMID_MIN" --argjson hi "$VMID_MAX" '
+      .[] | select(.type == "lxc" and .vmid >= $lo and .vmid <= $hi
+                   and ((.tags // "") | [splits("[;, ]")] | index([$tag])))
+      | "\(.name) \($host)"' <<<"$all" || die "could not read the guest list of $host"
+  done | sort -u
+}
+
+# Says which devboxes each host in $2... has, from "<hostname> <host>" lines
+# $1, and warns of a hostname on several hosts: its entries can only point at one.
+report_boxes() {
+  local boxes="$1" host name
+  shift
+  for host in "$@"; do
+    say "devboxes on $host: $(awk -v p="$host" '$2 == p {print $1}' <<<"$boxes" | paste -sd ' ')"
+  done
+  for name in $(awk '{print $1}' <<<"$boxes" | sort | uniq -d); do
+    say "warning: $name is on several hosts: $(awk -v h="$name" '$1 == h {print $2}' <<<"$boxes" | paste -sd ' ')"
   done
 }
 
@@ -292,11 +347,17 @@ cmd_remove() {
 }
 
 cmd_sync() {
-  local hosts labels config host fqdn label failed=0
-  hosts="$(devbox_hostnames)" || exit 1
+  local entries pves boxes hosts config host fqdn label failed=0
+  entries="$(client_entries)" ||
+    die "client(s) $(awk '$1 == "-" {print $2}' <<<"$entries" | paste -sd ' ') do not resolve; fix their files first: the box of one may live on a host not listed here"
+  pves="$(pve_hosts "$entries")" || exit 1
+  # Word splitting is the point: host names hold no spaces (devbox-config checks).
+  # shellcheck disable=SC2086
+  boxes="$(devbox_hostnames $pves)" || exit 1
+  hosts="$(awk '{print $1}' <<<"$boxes" | sort -u)"
   TAILNET="$(tailnet)" || exit 1
-  labels="$(client_labels)"
-  say "devboxes on $DEVBOX_HOST: $(paste -sd ' ' <<<"$hosts")"
+  # shellcheck disable=SC2086
+  report_boxes "$boxes" $pves
 
   # Boxes gone from the host: drop their herdr machines first, while the WSL
   # block still says which hosts were ours.
@@ -312,7 +373,7 @@ cmd_sync() {
   done
 
   for host in $hosts; do
-    label="$(awk -v h="$host" '$1 == h {print $2; exit}' <<<"$labels")"
+    label="$(awk -v h="$host" '$1 == h {print $2; exit}' <<<"$entries")"
     herdr_add "$host" "${label:-$host}" || failed=1
   done
   return "$failed"
@@ -340,12 +401,23 @@ ssh_ok() {
 }
 
 cmd_doctor() {
-  local hosts host config fqdn id status windows_config="${CONFIGS[1]:-}"
+  local entries unresolved=false client pves boxes hosts host config fqdn id status gone
+  local windows_config="${CONFIGS[1]:-}"
   DOCTOR_FAILED=0
-  hosts="$(devbox_hostnames)" || exit 1
-  [[ -n $hosts ]] || say "no devboxes on $DEVBOX_HOST"
+  # A client file that doesn't resolve is a failure, not a reason to stop: its
+  # raw `host` is still queried.
+  entries="$(client_entries)" || { DOCTOR_FAILED=1; unresolved=true; }
+  while read -r client; do
+    printf '  FAIL  client %s does not resolve (bin/devbox-config %s says why)\n' "$client" "$client"
+  done < <(awk '$1 == "-" {print $2}' <<<"$entries")
+  pves="$(pve_hosts "$entries")" || exit 1
+  # shellcheck disable=SC2086 # host names hold no spaces (devbox-config checks)
+  boxes="$(devbox_hostnames $pves)" || exit 1
+  hosts="$(awk '{print $1}' <<<"$boxes" | sort -u)"
+  # shellcheck disable=SC2086
+  report_boxes "$boxes" $pves
   for host in $hosts; do
-    printf '%s\n' "$host"
+    printf '%s (on %s)\n' "$host" "$(awk -v h="$host" '$1 == h {print $2}' <<<"$boxes" | paste -sd ' ')"
     for config in "${CONFIGS[@]}"; do
       check "in $config" in_block "$host" "$config"
     done
@@ -361,11 +433,14 @@ cmd_doctor() {
       check "herdr machine $SSH_USER@$host: ${status:-not saved}" test "$status" == reachable
     fi
   done
-  # Entries for boxes that are gone.
+  # Entries for boxes that are gone. While a client file doesn't resolve, sync
+  # refuses, so it drops nothing.
+  gone="(sync drops it)"
+  ! $unresolved || gone="(sync refuses to run until the client files resolve)"
   for config in "${CONFIGS[@]}"; do
     while read -r host fqdn; do
       grep -qxF "$host" <<<"$hosts" && continue
-      printf '  FAIL  %s in %s is not on %s (sync drops it)\n' "$host" "$config" "$DEVBOX_HOST"
+      printf '  FAIL  %s in %s is not on any of %s %s\n' "$host" "$config" "$(paste -sd ' ' <<<"$pves")" "$gone"
       DOCTOR_FAILED=1
     done < <(read_block "$config")
   done

@@ -14,7 +14,8 @@ usage() {
 Usage: devbox-destroy [--skip-logout] <client>
 
 Stop and destroy the devbox container for <client> (see devbox-config) on
-\$DEVBOX_HOST (required). Exits 0 when there is none. First runs
+the client's \`host\`, or \$DEVBOX_HOST when it names none (one of the two
+is required). Exits 0 when there is none. First runs
 \`devbox logout\` in the box (starting it if stopped): deletes its SSH keys
 from GitHub and logs it out of tailscale. Removes the box's backup job
 first, if it has one (its backups stay on the storage). Last, removes it
@@ -49,6 +50,7 @@ main() {
   local config hostname vmid status
   config="$("$ROOT/bin/devbox-config" --json "$client")" || exit 1
   hostname="$(jq -r .hostname <<<"$config")"
+  use_config_host "$config"
   vmid="$(find_devbox "$hostname")"
   if [[ -z $vmid ]]; then
     say "no $hostname on $DEVBOX_HOST; nothing to destroy"
