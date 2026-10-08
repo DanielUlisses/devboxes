@@ -33,17 +33,21 @@ Usage: devbox-create [--light] [--dry-run] [--allow-unpushed] <client>
 Create and start the devbox container for <client> (its file in the
 devbox-clients checkout, see devbox-config) on the client's \`host\`, or
 \$DEVBOX_HOST when it names none (one of the two is required),
-using the first free VMID in $VMID_MIN-$VMID_MAX, then bootstrap it from
+using the first free VMID in $VMID_MIN-$VMID_MAX, sized from its resolved
+\`resources\` (a role: runner box gets defaults.yaml's runner_resources: a low
+CPU weight and hard memory, core and disk caps), then bootstrap it from
 bootstrap.sh at the pushed head of $REPO's \$DEVBOX_BRANCH (default
 main), handing it the client's resolved config from this machine. With
 \`backup: true\`, adds the box's Proxmox backup job (to
 \$DEVBOX_BACKUP_STORAGE, default local); refused, the box still created, on
 a host running guests that aren't devboxes. Then adds the box to this
-machine: ssh config entries and herdr machine (bin/devbox-host add).
+machine: ssh config entries and, for a devbox (not a runner), herdr
+machine (bin/devbox-host add).
 Refuses when this checkout's HEAD is not that pushed commit.
 
   --light           cap it at 1 GB memory, 512 MB swap, 1 core and an 8 GB disk
-  --dry-run         run every check, then print the pct and pvesh commands instead
+  --dry-run         run every check, then print the pct and pvesh commands
+                    (memory, swap, cores, cpuunits, disk) instead
   --allow-unpushed  create even though this checkout's HEAD differs from
                     the pushed commit the box bootstraps from
 EOF
@@ -74,13 +78,15 @@ main() {
   done
   [[ -n $client ]] || { usage >&2; exit 1; }
 
-  local config hostname memory swap cores disk onboot
+  local config hostname role memory swap cores disk cpuunits onboot
   config="$("$ROOT/bin/devbox-config" --json "$client")" || exit 1
   hostname="$(jq -r .hostname <<<"$config")"
+  role="$(jq -r .role <<<"$config")"
   memory="$(jq -r .resources.memory_mb <<<"$config")"
   swap="$(jq -r .resources.swap_mb <<<"$config")"
   cores="$(jq -r .resources.cores <<<"$config")"
   disk="$(disk_gb "$(jq -r .resources.disk <<<"$config")")"
+  cpuunits="$(jq -r .resources.cpuunits <<<"$config")"
   onboot="$(jq -r 'if .resources.onboot then 1 else 0 end' <<<"$config")"
   use_config_host "$config"
   if $light; then
@@ -131,7 +137,7 @@ main() {
     --unprivileged 1
     --features "nesting=1,keyctl=1"
     --dev0 /dev/net/tun
-    --memory "$memory" --swap "$swap" --cores "$cores"
+    --memory "$memory" --swap "$swap" --cores "$cores" --cpuunits "$cpuunits"
     --rootfs "$ROOTFS_STORAGE:$disk"
     --net0 "name=eth0,bridge=$BRIDGE,ip=dhcp"
     --onboot "$onboot")
@@ -149,7 +155,7 @@ main() {
     exit 0
   fi
 
-  say "creating $hostname as VMID $vmid on $DEVBOX_HOST ($memory MB, $cores cores, ${disk}G)"
+  say "creating $role $hostname as VMID $vmid on $DEVBOX_HOST ($memory MB + $swap MB swap, $cores cores, CPU weight $cpuunits, ${disk}G)"
   pve "${create[@]}"
   assert_devbox "$vmid" "$hostname"
   pve pct start "$vmid"
@@ -159,7 +165,8 @@ main() {
   say "bootstrapped $hostname"
   sync_backup_job "$hostname" "$vmid" "$config" ||
     say "created $hostname without a backup job; bin/devbox-sync $client adds it once the host allows it"
-  # This machine's side: ssh config entries, no stale host keys, the herdr machine.
+  # This machine's side: ssh config entries, no stale host keys, the herdr
+  # machine (none for a runner).
   "$ROOT/bin/devbox-host" add --new-box "$client" ||
     say "$hostname is up, but this machine's side is unfinished; once it is on the tailnet: bin/devbox-host add $client"
 }

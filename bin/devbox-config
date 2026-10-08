@@ -67,7 +67,8 @@ to_json() {
 }
 
 # Reads one config document as JSON, prints one "<field>: <problem>" line per
-# error. $required: whether fields with no default must be present.
+# error. $required: whether fields with no default must be present (a client
+# file, not defaults.yaml); $default_role: the role a file without one gets.
 # shellcheck disable=SC2016 # jq program, not shell expansions
 VALIDATE='
 "[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}" as $email_re
@@ -81,6 +82,9 @@ def is_int: type == "number" and . == floor;
 def int_min($p; $min):
   if . == null or (is_int and . >= $min) then empty
   else err($p; "must be an integer >= \($min) \(got)") end;
+def int_range($p; $min; $max):
+  if . == null or (is_int and . >= $min and . <= $max) then empty
+  else err($p; "must be an integer from \($min) to \($max) \(got)") end;
 
 def str_match($p; $re; $what):
   if . == null then empty
@@ -95,11 +99,26 @@ def str_list($p; $re; $what):
 def unknown_keys($prefix; $allowed):
   keys[] | select(IN($allowed[]) | not) | err($prefix + .; "unknown field");
 
+def resources($p):
+  if . == null then empty
+  elif type != "object" then err($p; "must be a mapping \(got)")
+  else
+    unknown_keys("\($p)."; ["memory_mb", "swap_mb", "cores", "disk", "cpuunits", "onboot"]),
+    (.memory_mb | int_min("\($p).memory_mb"; 1)),
+    (.swap_mb | int_min("\($p).swap_mb"; 0)),
+    (.cores | int_min("\($p).cores"; 1)),
+    (.disk | str_match("\($p).disk"; "^[1-9][0-9]*[MGT]$"; "a size like 40G")),
+    (.cpuunits | int_range("\($p).cpuunits"; 1; 10000)),
+    (.onboot | if . == null or type == "boolean" then empty
+               else err("\($p).onboot"; "must be true or false \(got)") end)
+  end;
+
 if . == null then {} else . end
 | if type != "object" then err("(top level)"; "must be a mapping of fields \(got)")
   else
-    unknown_keys(""; ["hostname", "host", "claude_account", "git_name", "git_email", "resources", "packages", "tools", "skills", "repos",
-                     "timezone", "backup", "backup_schedule", "backup_keep"]),
+    unknown_keys(""; ["hostname", "host", "role", "claude_account", "git_name", "git_email", "resources", "packages", "tools", "skills",
+                     "repos", "timezone", "backup", "backup_schedule", "backup_keep"]
+                     + if $required then [] else ["runner_resources"] end),
 
     (.hostname | str_match("hostname"; "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$";
       "a lowercase hostname (letters, digits, inner dashes, max 63)")),
@@ -108,7 +127,11 @@ if . == null then {} else . end
       else str_match("host"; $host_re;
         "the ssh name of a Proxmox host (letters, digits, . _ -), or empty for $DEVBOX_HOST") end),
 
-    (if $required and .claude_account == null then err("claude_account"; "required")
+    (.role | if . == null or IN("devbox", "runner") then empty
+      else err("role"; "must be devbox or runner \(got)") end),
+
+    (if $required and .claude_account == null and (.role // $default_role) == "devbox"
+     then err("claude_account"; "required when role is devbox")
      else .claude_account | str_match("claude_account"; "^[A-Za-z0-9._-]+$";
        "an account label (letters, digits, . _ -), not an email") end),
 
@@ -116,18 +139,8 @@ if . == null then {} else . end
     (.git_email | if . == "" then empty
       else str_match("git_email"; "^\($email_re)$"; "an email address, or empty for the GitHub noreply one") end),
 
-    (.resources |
-      if . == null then empty
-      elif type != "object" then err("resources"; "must be a mapping \(got)")
-      else
-        unknown_keys("resources."; ["memory_mb", "swap_mb", "cores", "disk", "onboot"]),
-        (.memory_mb | int_min("resources.memory_mb"; 1)),
-        (.swap_mb | int_min("resources.swap_mb"; 0)),
-        (.cores | int_min("resources.cores"; 1)),
-        (.disk | str_match("resources.disk"; "^[1-9][0-9]*[MGT]$"; "a size like 40G")),
-        (.onboot | if . == null or type == "boolean" then empty
-                   else err("resources.onboot"; "must be true or false \(got)") end)
-      end),
+    (.resources | resources("resources")),
+    (.runner_resources | resources("runner_resources")),
 
     (.timezone | str_match("timezone"; "^(UTC|[A-Za-z][A-Za-z0-9_+-]*(/[A-Za-z0-9][A-Za-z0-9_+-]*)+)$";
       "an IANA zone like America/Sao_Paulo or UTC")),
@@ -153,21 +166,25 @@ if . == null then {} else . end
 '
 
 # Defaults first, client second: mappings merge, lists replace, skills append.
+# A runner box starts from the defaults' runner_resources instead of resources.
 # shellcheck disable=SC2016 # jq program, not shell expansions
 MERGE='
 def strip_nulls: if type == "object" then with_entries(select(.value != null) | .value |= strip_nulls) else . end;
-($defaults | strip_nulls) as $d | ($client // {} | strip_nulls) as $c
+($defaults | strip_nulls) as $d0 | ($client // {} | strip_nulls) as $c
+| ($d0 | if ($d0 * $c).role == "runner" then .resources = .runner_resources else . end
+       | del(.runner_resources)) as $d
 | ($d * $c)
 | .hostname //= "dev-\($name)"
 | .skills = (reduce (($d.skills // []) + ($c.skills // []))[] as $s ([]; if IN(.[]; $s) then . else . + [$s] end))
-| {hostname, host, claude_account, git_name, git_email, resources, packages, tools, skills, repos, timezone, backup, backup_schedule, backup_keep}
+| {hostname, host, role, claude_account, git_name, git_email, resources, packages, tools, skills, repos, timezone, backup, backup_schedule, backup_keep}
 '
 
 # Prints the errors of one file, prefixed with its displayed path.
 validate() {
-  local file="$1" json="$2" required="$3" prefix
+  local file="$1" json="$2" required="$3" default_role="$4" prefix
   prefix="$(display "$file")"
-  jq -r --argjson required "$required" --arg host_re "$DEVBOX_HOST_RE" "$VALIDATE" <<<"$json" |
+  jq -r --argjson required "$required" --arg default_role "$default_role" --arg host_re "$DEVBOX_HOST_RE" \
+    "$VALIDATE" <<<"$json" |
     sed "s|^|$prefix: |"
 }
 
@@ -206,10 +223,12 @@ main() {
 
   require_tools
 
-  local defaults_json client_json errors
+  local defaults_json client_json default_role errors
   defaults_json="$(to_json "$DEFAULTS")"
   client_json="$(to_json "$file")"
-  errors="$(validate "$DEFAULTS" "$defaults_json" false; validate "$file" "$client_json" true)"
+  default_role="$(jq -r 'if type == "object" and (.role | type) == "string" then .role else "devbox" end' <<<"$defaults_json")"
+  errors="$(validate "$DEFAULTS" "$defaults_json" false "$default_role"
+    validate "$file" "$client_json" true "$default_role")"
   if [[ -n $errors ]]; then
     printf '%s\n' "$errors" >&2
     die "invalid config for client '$client'"

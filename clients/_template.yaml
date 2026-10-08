@@ -11,6 +11,13 @@
 # VM hostname. Default: dev-<client>.
 # hostname: dev-example
 
+# What the box is for: devbox, a developer's box, or runner, a locked-down
+# box for CI runners: base packages, Docker, Tailscale (as tag:runner) and
+# op only, no Claude, skills, nvim, mise tools, repos or git identity, and
+# the smaller resources in defaults.yaml's runner_resources. A runner usually
+# sets hostname too, to drop the dev- prefix. Default: devbox.
+# role: devbox
+
 # Proxmox host the box runs on: a label, the host's ssh name (as in
 # `ssh root@<host>`; letters, digits, . _ -). bin/devbox-create,
 # devbox-sync and devbox-destroy run against it. Default: empty, meaning
@@ -18,7 +25,7 @@
 # host: example-host
 
 # Which Claude account the devbox signs in with: a label, never an email.
-# Required.
+# Required when role is devbox; a runner box has no Claude.
 claude_account: example
 
 # Git identity for commits in the box, written to ~/.gitconfig.local by
@@ -29,12 +36,14 @@ claude_account: example
 # git_name: Your Name
 # git_email: <name>@<client-domain>
 
-# VM resources. Each key is optional; shown values are the defaults.
+# VM resources. Each key is optional; shown values are the defaults for a
+# devbox (a runner's are runner_resources in defaults.yaml).
 # resources:
 #   memory_mb: 10240   # memory ceiling, in MB
 #   swap_mb: 2048      # swap, in MB (0 disables it)
 #   cores: 8           # CPU cores
 #   disk: 40G          # root disk size, with an M, G or T suffix
+#   cpuunits: 100      # CPU weight against the host's other guests (1-10000)
 #   onboot: true       # start the VM when the host boots
 
 # Extra pacman packages, on top of the base image.

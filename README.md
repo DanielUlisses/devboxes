@@ -101,7 +101,9 @@ Prints `defaults.yaml` merged with the client's file
 (`$DEVBOX_CLIENTS/clients/<client>.yaml`), as YAML (or JSON with
 `--json`). Mappings merge key by key, lists replace, except `skills`, which
 appends the client's extras to the base list (duplicates dropped). `hostname` defaults to
-`dev-<client>`. `host`, the ssh name of the Proxmox host the box runs on
+`dev-<client>`. `role` is `devbox` (the default) or `runner` (see [Runner
+boxes](#runner-boxes)); `claude_account` is required only for a devbox, and a
+runner starts from `runner_resources` instead of `resources`. `host`, the ssh name of the Proxmox host the box runs on
 (as in `ssh root@<host>`), defaults to empty, meaning `$DEVBOX_HOST`; it is
 a label like `claude_account`, and like every client value it lives only in
 the private `devbox-clients` files.
@@ -131,7 +133,9 @@ default: a client without `host` needs it exported (host names stay out of
 this public repo), and the scripts stop before any host call when neither is
 set. `devbox-create` makes an unprivileged Arch container
 with `nesting=1,keyctl=1` (what Docker needs, see [Docker](#docker)) and `/dev/net/tun`, hostname from the config, tag `devbox`,
-the first free VMID in 2000-2099, sized from `resources`, then starts it.
+the first free VMID in 2000-2099, sized from `resources` (memory, swap,
+cores, disk and `cpuunits`, its CPU weight against the host's other guests;
+100 is Proxmox's default), then starts it.
 `--light` caps it at 1 GB memory, 512 MB swap, 1 core and an 8 GB disk; `--dry-run` runs
 every check and prints the `pct create` and `pct exec` commands, and the
 backup job's `pvesh` command (see [Backups](#backups)), instead of running them.
@@ -247,7 +251,10 @@ The developer-machine side of each box, run on your machine (WSL):
   which happens at `devbox login`: until then `add` reports it pending (and
   exits 1); run `bin/devbox-host add <client>` again after logging in. It
   accepts the box's new host key first (over Tailscale, so trusting it on
-  first use is safe), since herdr has no terminal to ask.
+  first use is safe), since herdr has no terminal to ask. A client whose
+  resolved config has `role: runner` gets no herdr machine: `add` (and
+  `--dry-run`) says so and removes one saved earlier for that hostname; it
+  still gets both ssh config entries.
 
 `sync` rebuilds all of it from the devbox containers on every Proxmox host:
 each host a client file in `$DEVBOX_CLIENTS` names in `host`, plus
@@ -255,7 +262,8 @@ each host a client file in `$DEVBOX_CLIENTS` names in `host`, plus
 blocks list exactly the boxes found across those hosts, herdr machines and
 host keys of boxes on none of them are removed, and missing herdr machines
 are added, labelled with the client whose file resolves to that hostname, or
-the hostname. Boxes are matched by hostname, not VMID, since VMIDs on two
+the hostname. A runner box's herdr machine is removed instead of added (a box
+no client file resolves to counts as a devbox). Boxes are matched by hostname, not VMID, since VMIDs on two
 hosts can coincide. `sync` refuses to change anything when a host can't be
 listed, when a client file doesn't resolve, or when a client sets no `host`
 and `DEVBOX_HOST` is unset. That way a box on one host is never dropped
@@ -264,7 +272,8 @@ because another lacks it. It warns of a hostname found on several hosts.
 counts as a failure there, though the `host` it names is still checked):
 listed in both configs, its MagicDNS name
 resolves, `ssh daniel@<hostname> true` works from WSL and from Windows
-(`ssh.exe`), and its herdr machine is reachable; it also flags entries for
+(`ssh.exe`), and its herdr machine is reachable (for a runner box: that it
+has none); it also flags entries for
 boxes that are gone, and exits 1 on any failure.
 
 With nothing changed, `add`, `remove` and `sync` write nothing. The MagicDNS
@@ -590,6 +599,64 @@ Merge these into your existing policy, and remove the default allow-all
 rule (`"src": ["*"], "dst": ["*:*"]`) or any other rule whose `src` matches
 `tag:devbox`, or boxes can reach everything again. Check from a box that
 `nc -zv dev-<other-client> 22` fails.
+
+## Runner boxes
+
+A client file with `role: runner` describes a runner box: an LXC like any
+devbox, made, synced and destroyed by the same scripts, that will host CI
+runners (added by a later change) on a shared host. It carries none of a
+devbox's developer tooling or credentials. Its client file usually sets
+`hostname` itself, to drop the `dev-` prefix, and `host` to the shared host;
+`claude_account` isn't needed.
+
+- **What it skips.** `devbox bootstrap` installs only the base packages a
+  runner needs (`git sudo jq go-yq unzip less mise tailscale docker
+  docker-buildx docker-compose`), Docker, Tailscale and the 1Password CLI:
+  no Claude, skills, nvim, dotfiles, mise dev tools, repos or git identity.
+  `op` is installed by root with mise into `/opt/mise` and linked as
+  `/usr/local/bin/op`, outside any home, so the runner user can run it.
+  `devbox finish` and `devbox update` refuse on a runner box; `devbox sync`
+  converges it. A runner has no gh, so a sync inside the box reuses the
+  config it was last given; client-file changes reach it through
+  `bin/devbox-sync <client>` from your machine.
+- **The runner user.** `devbox sync` adds `ghrunner`, a system user that
+  is not in `wheel` and has no login shell, and closes every home under
+  `/home` to other users (mode 700). `daniel` stays the admin login, with
+  sudo.
+- **Logins.** `devbox login` asks only for Tailscale, joining as
+  **`tag:runner`** (not `tag:devbox`), and the runner's 1Password
+  service-account token, checked with `op whoami`. No gh, Claude or az. The
+  token goes in `/etc/ghrunner/op-service-account-token`: the directory is
+  `root:ghrunner`, mode 750, so only root and `ghrunner` enter it and
+  `ghrunner` can't add or swap files there; the file is `root:ghrunner`,
+  mode 640, so root owns it and `ghrunner` (alone in its own group) can
+  only read it. 640 rather than 600: a root-owned 600 file would shut
+  `ghrunner` out. It is never in a home directory.
+- **Resources.** `defaults.yaml`'s `runner_resources` replaces `resources`
+  for a runner: CPU weight (`cpuunits`) 50 against the default 100, so the
+  HA VM and other guests win under contention; 3 GB memory plus 1 GB swap,
+  a 4 GB hard cap; 2 cores; a 16 GB disk. A runner's own `resources:` still
+  overrides it key by key. `devbox-create --dry-run` shows all of them in
+  the `pct create` line.
+- **No LAN listeners.** `devbox sync` masks `sshd` (Tailscale SSH serves the
+  tailnet; `pct enter` on the host still works) and turns off
+  systemd-resolved's LLMNR and mDNS listeners. It then reports anything
+  still listening beyond loopback and the tailnet. The one expected
+  exception is tailscaled's WireGuard UDP port, which accepts only packets
+  from tailnet peers.
+- **No herdr machine.** You reach a runner as `daniel` over Tailscale SSH
+  (`ssh <hostname>`; `bin/devbox-host` still writes its ssh config entries),
+  not through herdr: `bin/devbox-host` saves no herdr machine for it and
+  `sync` removes one saved before. See [devbox-host](#devbox-host).
+- **No backup job.** On a shared host `lib/pve.sh` refuses host-level
+  changes, so a runner box there gets no backup job, whatever `backup`
+  says. That is fine: the box holds no state worth restoring. Its config
+  is in `devbox-clients`, its token in 1Password, and a broken box is
+  destroyed and created again.
+
+In the tailnet policy, `tag:runner` needs its own `tagOwners` entry and the
+same kind of grant and ssh rule as `tag:devbox` (see [Tailscale
+ACL](#tailscale-acl)), with nothing granting `tag:runner` as a source.
 
 ## The Proxmox host
 

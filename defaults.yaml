@@ -3,6 +3,10 @@
 # where the client's list is appended to the base list below.
 # `hostname` has no entry here: it defaults to dev-<client>.
 
+# What the box is for: devbox (a developer's box) or runner (a locked-down
+# box for CI runners, without the developer tooling or credentials).
+role: devbox
+
 # Proxmox host the box runs on, as its ssh name; empty means $DEVBOX_HOST.
 host: ""
 
@@ -16,6 +20,18 @@ resources:
   swap_mb: 2048
   cores: 8
   disk: 40G
+  cpuunits: 100      # CPU weight against the host's other guests
+  onboot: true
+
+# The resources of a role: runner box, in place of `resources` above (its
+# client's own resources: still win key by key): a low CPU weight and hard
+# caps, so it can't starve the other guests on a shared host. Set here only.
+runner_resources:
+  memory_mb: 3072    # memory ceiling; with swap, a 4 GB hard cap
+  swap_mb: 1024
+  cores: 2
+  disk: 16G
+  cpuunits: 50       # half a default guest's CPU weight
   onboot: true
 
 # IANA time zone the box runs in.
