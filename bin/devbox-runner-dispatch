@@ -90,6 +90,18 @@ b64url() {
   openssl base64 -A | tr '+/' '-_' | tr -d '='
 }
 
+# Prints $1, a PEM key, with its line breaks restored: a key pasted into a
+# single-line 1Password field comes back with spaces (or literal \n) where
+# the newlines were, which openssl can't read. Anything else passes through.
+pem_key() {
+  local key="$1" kind body re='-----BEGIN ([A-Z ]+)-----(.*)-----END [A-Z ]+-----'
+  [[ $key =~ $re ]] || { printf '%s\n' "$key"; return; }
+  kind="${BASH_REMATCH[1]}"
+  body="${BASH_REMATCH[2]//\\n/}"
+  body="$(tr -d ' \t\r\n' <<<"$body")"
+  printf -- '-----BEGIN %s-----\n%s\n-----END %s-----\n' "$kind" "$(fold -w 64 <<<"$body")" "$kind"
+}
+
 # A JWT for the App, valid 9 minutes (GitHub allows 10), backdated a minute
 # against clock drift. The key goes to openssl through a pipe, never a file.
 app_jwt() {
@@ -101,7 +113,7 @@ app_jwt() {
   # Straight into b64url: the binary signature never sits in a variable,
   # which would drop its NULs and a trailing newline.
   sig="$(printf '%s.%s' "$header" "$payload" |
-    openssl dgst -sha256 -binary -sign <(printf '%s\n' "$APP_KEY") | b64url)" || return 1
+    openssl dgst -sha256 -binary -sign <(pem_key "$APP_KEY") | b64url)" || return 1
   printf '%s.%s.%s' "$header" "$payload" "$sig"
 }
 
