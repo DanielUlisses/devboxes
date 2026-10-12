@@ -18,6 +18,7 @@ bin/devbox-host        this machine's side of the boxes: ssh config entries, her
 bin/devbox             runs inside a box: `devbox bootstrap`, `sync`, `login`, `finish`, `update`, `logout`, `rc`
 bin/devbox-agent-instructions  prints a box's agent instructions (~/.claude/CLAUDE.md, ~/AGENTS.md) from a resolved config
 bin/devbox-browser     $BROWSER in a box: prints URLs instead of opening them
+bin/devbox-runner-dispatch  a runner box's dispatcher: one just-in-time Actions runner per queued job
 bootstrap.sh           first thing a new box runs: clones this repo, hands over to devbox
 dotfiles/              bash, git, gh and nvim config stowed into every box (no identity, no secrets)
 lib/pve.sh             the one way bin/ scripts talk to the host
@@ -103,7 +104,9 @@ Prints `defaults.yaml` merged with the client's file
 appends the client's extras to the base list (duplicates dropped). `hostname` defaults to
 `dev-<client>`. `role` is `devbox` (the default) or `runner` (see [Runner
 boxes](#runner-boxes)); `claude_account` is required only for a devbox, and a
-runner starts from `runner_resources` instead of `resources`. `host`, the ssh name of the Proxmox host the box runs on
+runner starts from `runner_resources` instead of `resources`. `runners`
+(`org`, `labels`, `max_jobs`) is allowed only on a runner, where `org` and a
+non-empty `labels` are required; only a runner's resolved config has it. `host`, the ssh name of the Proxmox host the box runs on
 (as in `ssh root@<host>`), defaults to empty, meaning `$DEVBOX_HOST`; it is
 a label like `claude_account`, and like every client value it lives only in
 the private `devbox-clients` files.
@@ -603,26 +606,43 @@ rule (`"src": ["*"], "dst": ["*:*"]`) or any other rule whose `src` matches
 ## Runner boxes
 
 A client file with `role: runner` describes a runner box: an LXC like any
-devbox, made, synced and destroyed by the same scripts, that will host CI
-runners (added by a later change) on a shared host. It carries none of a
+devbox, made, synced and destroyed by the same scripts, that runs GitHub
+Actions jobs for an org on a shared host, one ephemeral runner per job (see
+[The dispatcher](#the-dispatcher)). It carries none of a
 devbox's developer tooling or credentials. Its client file usually sets
 `hostname` itself, to drop the `dev-` prefix, and `host` to the shared host;
-`claude_account` isn't needed.
+`claude_account` isn't needed; `runners` is:
+
+```yaml
+role: runner
+hostname: homelab-runner
+runners:
+  org: UlissesTech      # the org whose jobs it runs
+  labels: [homelab]     # jobs with runs-on: [self-hosted, homelab]
+  max_jobs: 2           # jobs at once (default 2)
+```
+
 
 - **What it skips.** `devbox bootstrap` installs only the base packages a
-  runner needs (`git sudo jq go-yq unzip less mise tailscale docker
-  docker-buildx docker-compose`), Docker, Tailscale and the 1Password CLI:
-  no Claude, skills, nvim, dotfiles, mise dev tools, repos or git identity.
-  `op` is installed by root with mise into `/opt/mise` and linked as
-  `/usr/local/bin/op`, outside any home, so the runner user can run it.
-  `devbox finish` and `devbox update` refuse on a runner box; `devbox sync`
-  converges it. A runner has no gh, so a sync inside the box reuses the
-  config it was last given; client-file changes reach it through
-  `bin/devbox-sync <client>` from your machine.
+  runner needs (`git openssh curl sudo jq go-yq unzip less mise github-cli
+  icu tailscale docker docker-buildx docker-compose`: what a job finds on
+  `PATH`, and `icu` for the Actions runner), Docker, Tailscale and the
+  1Password CLI: no Claude, skills, nvim, dotfiles, mise dev tools, repos
+  or git identity. `op` is installed by root with mise into `/opt/mise` and
+  linked as `/usr/local/bin/op`, outside any home, so the runner user can
+  run it. `devbox finish` refuses on a runner box; `devbox sync` converges
+  it, and `devbox update` bumps its pinned runner (see [The
+  dispatcher](#the-dispatcher)). gh is there for jobs, but the box itself
+  never logs it in, so a sync inside the box reuses the config it was last
+  given; client-file changes reach it through `bin/devbox-sync <client>`
+  from your machine.
 - **The runner user.** `devbox sync` adds `ghrunner`, a system user that
   is not in `wheel` and has no login shell, and closes every home under
   `/home` to other users (mode 700). `daniel` stays the admin login, with
-  sudo.
+  sudo. `ghrunner` is in `docker`, so jobs run containers. That group is
+  root on the box in all but name, which is acceptable only here: a
+  dedicated, unprivileged box that holds nothing but the runner's own
+  token.
 - **Logins.** `devbox login` asks only for Tailscale, joining as
   **`tag:runner`** (not `tag:devbox`), and the runner's 1Password
   service-account token, checked with `op whoami`. No gh, Claude or az. The
@@ -657,6 +677,128 @@ devbox's developer tooling or credentials. Its client file usually sets
 In the tailnet policy, `tag:runner` needs its own `tagOwners` entry and the
 same kind of grant and ssh rule as `tag:devbox` (see [Tailscale
 ACL](#tailscale-acl)), with nothing granting `tag:runner` as a source.
+
+### The dispatcher
+
+Between jobs a runner box runs one small service,
+`devbox-runner-dispatch.service`, as `ghrunner`. It only calls out to
+GitHub's API; nothing connects in. `devbox sync` writes and enables it
+(restart on failure after 30 s, started at boot), installs
+`bin/devbox-runner-dispatch` as `/usr/local/libexec/devbox-runner-dispatch`,
+and writes its settings, the config's `runners` block plus the hostname, to
+`/etc/ghrunner/dispatcher.json`. The dispatcher re-reads those settings
+every cycle, so a new `max_jobs` or `labels` applies from the next sync
+without a restart. A new script or unit restarts it, which stops any job
+running then, so sync a runner box when it is idle.
+
+Every 20 seconds or so it:
+
+1. signs a JWT as the GitHub App (its id and private key read with `op read`
+   from the `homelab-ci` vault) and swaps it for an installation token for
+   `runners.org`, kept until five minutes before it expires;
+2. lists the private, unarchived repos the App is installed on (public ones
+   are skipped) and, in each, its latest 100 workflow runs in one call
+   (only those: a queued run older than a repo's 100 latest is missed);
+   for the runs queued or in progress, it lists their jobs and keeps the
+   queued ones whose `runs-on` labels are all among the box's `labels` plus
+   `self-hosted` (case-insensitively);
+3. starts min(matching jobs − runners still waiting for one, `max_jobs` −
+   runners running) runners. Each one gets a just-in-time config from
+   `POST /orgs/{org}/actions/runners/generate-jitconfig` (the box's labels,
+   a unique name `<hostname>-<time>-<random>`, the default runner group) and
+   runs in its own directory, `/home/ghrunner/jobs/<name>/`: a copy of the
+   runner with its `_work` folder, and an empty `HOME`. The runner takes one
+   job and exits, and the dispatcher deletes that directory and
+   deregisters the runner (GitHub usually has already).
+
+A runner GitHub reports as not busy (or no longer knows) 15 minutes after it
+started (its job was cancelled) is stopped and deregistered; one whose
+status check fails is logged and left running. On an API or 1Password error, or a runner failing
+within a minute of starting, the dispatcher logs it and waits, doubling the
+wait up to 5 minutes, instead of exiting; at start it deletes job
+directories and deregisters offline runners of its own
+(`<hostname>-<time>-<6 hex digits>`) left by an earlier run.
+
+**API budget.** An installation token gets 5,000 calls an hour, shared by
+every runner box on the same org, since they all act as the same App
+installation. A cycle
+makes ⌈installed repos / 100⌉ + private repos + runs queued or in progress
++ running runners (a busy check each) + runners started + runners reaped
+calls; with nothing queued that is about 1 + the private repos. After each
+cycle the dispatcher reads `X-RateLimit-Remaining` and `X-RateLimit-Reset`:
+when the calls left, at the last cycle's pace, would run out before the
+reset, it stretches the wait so they last until then, and logs it. Its log is `journalctl -u devbox-runner-dispatch`.
+Files a job's containers leave owned by root can't be deleted by `ghrunner`;
+the log names any such directory.
+
+To see what it would do, without registering anything:
+
+```
+sudo -u ghrunner /usr/local/libexec/devbox-runner-dispatch --dry-run
+```
+
+It prints the matching queued jobs (repo, run, job, name, labels) and how
+many runners it would start.
+
+**Before it can run anything** (by hand, once):
+
+- a GitHub App owned by the org and installed on it, with the repository
+  permission **Actions: read** and the organization permission
+  **Self-hosted runners: read and write**;
+- its app id and private key (PEM) in the 1Password vault `homelab-ci`, as
+  `op://homelab-ci/github-app/app-id` and
+  `op://homelab-ci/github-app/private-key`, readable by the box's service
+  account (`devbox login` stores its token). The item and field names are
+  this repo's choice (an assumption, not a GitHub or 1Password name);
+  `DISPATCH_APP_ID_REF` and `DISPATCH_APP_KEY_REF`, set in a `systemctl
+  edit devbox-runner-dispatch` drop-in, override them;
+- the org's **Default** runner group (id 1), which runners join, left
+  closed to public repositories (GitHub's default).
+
+**The pinned runner.** `bin/devbox` pins an `actions/runner` release
+(`RUNNER_VERSION` and the sha256 of its linux-x64 tarball). Sync installs
+the box's own pin in `/var/lib/devbox/runner-version` when that is newer,
+else the script's: it downloads the tarball, checks its sha256, unpacks it
+into `/opt/actions-runner/<version>` and links
+`/opt/actions-runner/current`, from which each job copies. GitHub stops
+serving runners that fall too far behind, so `devbox update` on a runner
+box (as `daniel` or root) reads the latest release from
+`GET /repos/actions/runner/releases/latest`, pins its version and the
+`digest` GitHub publishes for the tarball in
+`/var/lib/devbox/runner-version`, and installs it; jobs started after that
+use it. Bumping `RUNNER_VERSION` in the repo brings every box at least that
+far on its next sync.
+
+**The job contract.** A workflow gets a runner box with:
+
+```yaml
+runs-on: [self-hosted, homelab]
+```
+
+and can count on:
+
+- `git`, `ssh`, `curl`, `jq`, `gh`, `op` and `docker` on `PATH`
+  (`/usr/local/bin:/usr/bin`); nothing else is promised;
+- `OP_SERVICE_ACCOUNT_TOKEN` set to the box's service-account token, so
+  `op read op://...` works; the job's environment holds nothing else of
+  the box's;
+- an empty `HOME` of its own, and a work directory that is deleted, with
+  the `HOME`, when the job ends: nothing carries over between jobs;
+- no serialization: up to `max_jobs` jobs run at once, as the same user, on
+  the same Docker daemon. A workflow that must not overlap itself sets its
+  own `concurrency:`.
+
+**Safety rules.** A self-hosted runner runs whatever the workflow says, as
+a user that can drive Docker and read the box's 1Password token. That token
+is the dispatcher's too, so **every job can read the GitHub App's private
+key** (`op read op://homelab-ci/github-app/private-key`) and act as the App
+on every repo it is installed on, including registering runners. The
+service account can't be scoped per job; only trusted workflows may run
+here. So use
+`runs-on: [self-hosted, homelab]` only in workflows triggered by
+`schedule`, `workflow_dispatch` or `push` to `main`; never in public repos,
+and never on `pull_request` (or `pull_request_target`), where code from a
+branch or a fork would run with those rights.
 
 ## The Proxmox host
 

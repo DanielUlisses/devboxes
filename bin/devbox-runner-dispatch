@@ -1,0 +1,434 @@
+#!/usr/bin/env bash
+# The dispatcher of a role: runner box, run by `devbox sync`'s systemd unit as
+# ghrunner. Every cycle it looks, as the org's GitHub App, for queued jobs
+# whose runs-on labels are all among the box's labels plus self-hosted, and
+# for each one (up to max_jobs at once) starts a fresh just-in-time runner:
+# its own copy of the runner, work dir and empty HOME, deleted when the runner
+# exits after its one job. It only calls out to GitHub; nothing connects in.
+set -euo pipefail
+
+API=https://api.github.com
+# The box's settings, written by devbox sync: {org, labels, max_jobs, hostname}.
+CONF=${DISPATCH_CONF:-/etc/ghrunner/dispatcher.json}
+# The 1Password service-account token devbox login stores; an
+# OP_SERVICE_ACCOUNT_TOKEN already set wins (a dry run from your own shell).
+OP_TOKEN_FILE=/etc/ghrunner/op-service-account-token
+# The GitHub App's id and private key, in the homelab-ci vault.
+APP_ID_REF=${DISPATCH_APP_ID_REF:-op://homelab-ci/github-app/app-id}
+APP_KEY_REF=${DISPATCH_APP_KEY_REF:-op://homelab-ci/github-app/private-key}
+# The runner devbox sync installs; each job runs a copy of it.
+RUNNER_DIST=/opt/actions-runner/current
+# One directory per running job: runner/ (the copy, with its _work) and home/.
+JOBS=${DISPATCH_JOBS:-/home/ghrunner/jobs}
+# The org's default runner group, which takes no public repos by default.
+RUNNER_GROUP=1
+CYCLE=20          # seconds between cycles
+BACKOFF_MAX=300   # longest wait after repeated errors
+IDLE_TIMEOUT=900  # a runner still without a job after this long is removed
+# What a job finds on PATH: git, ssh, curl, jq, gh, docker, op.
+JOB_PATH=/usr/local/bin:/usr/bin
+
+usage() {
+  cat <<EOF
+Usage: devbox-runner-dispatch [--dry-run]
+
+Starts one just-in-time GitHub Actions runner per matching queued job, at
+most max_jobs at once, every ${CYCLE}s, with the settings in $CONF.
+--dry-run looks once, prints the matching queued jobs and the runners it
+would start, and registers nothing. On a runner box:
+
+  sudo -u ghrunner /usr/local/libexec/devbox-runner-dispatch --dry-run
+EOF
+}
+
+log() {
+  printf 'dispatch: %s\n' "$*" >&2
+}
+
+die() {
+  log "$*"
+  exit 1
+}
+
+# Settings, re-read every cycle so a sync's new labels or max_jobs apply
+# without a restart.
+ORG="" LABELS_JSON="" MAX_JOBS="" PREFIX=""
+load_settings() {
+  local s
+  s="$(jq -ce '
+    select((.org | type) == "string" and (.labels | type) == "array" and (.labels | length) > 0
+           and (.max_jobs | type) == "number" and .max_jobs >= 1)' "$CONF" 2>/dev/null)" ||
+    { log "no valid settings in $CONF (want org, labels and max_jobs; devbox sync writes them)"; return 1; }
+  ORG="$(jq -r .org <<<"$s")"
+  # The runner's labels: the box's plus self-hosted, lowercased, as GitHub
+  # matches labels case-insensitively.
+  LABELS_JSON="$(jq -c '["self-hosted"] + .labels | map(ascii_downcase) | unique' <<<"$s")"
+  MAX_JOBS="$(jq -r '.max_jobs | floor' <<<"$s")"
+  PREFIX="$(jq -r --arg h "$(uname -n)" '.hostname // $h' <<<"$s")"
+}
+
+# --- GitHub -----------------------------------------------------------------
+
+OP_TOKEN="" APP_ID="" APP_KEY=""
+# The service-account token, and with it the App's id and key, read once.
+load_secrets() {
+  [[ -z $APP_KEY ]] || return 0
+  if [[ -n ${OP_SERVICE_ACCOUNT_TOKEN:-} ]]; then
+    OP_TOKEN="$OP_SERVICE_ACCOUNT_TOKEN"
+  elif [[ -r $OP_TOKEN_FILE && -s $OP_TOKEN_FILE ]]; then
+    OP_TOKEN="$(<"$OP_TOKEN_FILE")"
+  else
+    log "no 1Password token in $OP_TOKEN_FILE (devbox login stores it)"
+    return 1
+  fi
+  APP_ID="$(OP_SERVICE_ACCOUNT_TOKEN="$OP_TOKEN" op read "$APP_ID_REF")" || { log "op read $APP_ID_REF failed"; return 1; }
+  APP_KEY="$(OP_SERVICE_ACCOUNT_TOKEN="$OP_TOKEN" op read "$APP_KEY_REF")" || { log "op read $APP_KEY_REF failed"; APP_ID=""; return 1; }
+}
+
+b64url() {
+  openssl base64 -A | tr '+/' '-_' | tr -d '='
+}
+
+# A JWT for the App, valid 9 minutes (GitHub allows 10), backdated a minute
+# against clock drift. The key goes to openssl through a pipe, never a file.
+app_jwt() {
+  local now header payload sig
+  now="$(date +%s)"
+  header="$(printf '{"alg":"RS256","typ":"JWT"}' | b64url)"
+  payload="$(jq -cn --arg iss "$APP_ID" --argjson now "$now" \
+    '{iat: ($now - 60), exp: ($now + 540), iss: (if ($iss | test("^[0-9]+$")) then ($iss | tonumber) else $iss end)}' | b64url)"
+  # Straight into b64url: the binary signature never sits in a variable,
+  # which would drop its NULs and a trailing newline.
+  sig="$(printf '%s.%s' "$header" "$payload" |
+    openssl dgst -sha256 -binary -sign <(printf '%s\n' "$APP_KEY") | b64url)" || return 1
+  printf '%s.%s.%s' "$header" "$payload" "$sig"
+}
+
+# Calls the API with bearer token $1: method $2, path $3, JSON body $4.
+# Prints the body. Fails on any HTTP error, logging the status and message:
+# returns 2 on a 404 (not logged with QUIET_404=1, for a caller to whom a
+# missing thing is news it handles), 1 on anything else. Times out rather than hang a cycle. The token reaches curl
+# through a pipe, not its command line. Each call appends a line to
+# RATE_FILE: "<rate limit remaining> <reset epoch>".
+call() {
+  local token="$1" method="$2" path="$3" body="${4:-}" out code rate
+  out="$(curl -sS --connect-timeout 10 --max-time 60 -X "$method" \
+    -w '\n%header{x-ratelimit-remaining} %header{x-ratelimit-reset}\n%{http_code}' \
+    -H @<(printf 'Authorization: Bearer %s\n' "$token") \
+    -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2022-11-28' \
+    ${body:+--data "$body"} "$API$path")" || { log "$method $path: curl failed"; return 1; }
+  code="${out##*$'\n'}"
+  out="${out%$'\n'*}"
+  rate="${out##*$'\n'}"
+  out="${out%$'\n'*}"
+  [[ -z $RATE_FILE ]] || printf '%s\n' "$rate" >>"$RATE_FILE"
+  if [[ $code != 2?? ]]; then
+    [[ $code == 404 && -n ${QUIET_404:-} ]] ||
+      log "$method $path: HTTP $code: $(jq -r '.message // empty' <<<"$out" 2>/dev/null || true)"
+    [[ $code != 404 ]] || return 2
+    return 1
+  fi
+  printf '%s\n' "$out"
+}
+
+# An installation token for the org, cached until five minutes before it
+# expires (an hour after it is minted).
+TOKEN="" TOKEN_ORG="" TOKEN_UNTIL=0
+installation_token() {
+  local jwt id resp expires
+  [[ -n $TOKEN && $TOKEN_ORG == "$ORG" ]] && (($(date +%s) < TOKEN_UNTIL)) && return 0
+  jwt="$(app_jwt)" || { log "could not sign the App's JWT (is $APP_KEY_REF a PEM private key?)"; return 1; }
+  id="$(call "$jwt" GET "/orgs/$ORG/installation" | jq -er .id)" || { log "the App is not installed on $ORG?"; return 1; }
+  resp="$(call "$jwt" POST "/app/installations/$id/access_tokens")" || return 1
+  TOKEN="$(jq -er .token <<<"$resp")" || return 1
+  expires="$(date -d "$(jq -r .expires_at <<<"$resp")" +%s)" || return 1
+  TOKEN_ORG="$ORG"
+  TOKEN_UNTIL=$((expires - 300))
+}
+
+api() {
+  call "$TOKEN" "$@"
+}
+
+# The queued jobs this box can take, one JSON object per line: every private,
+# unarchived repo the App can see (public repos never get a self-hosted
+# runner), one call for its latest 100 runs, then, for those queued or in
+# progress (an in-progress matrix run still has queued jobs), their jobs that
+# are queued and whose labels are all among the runner's.
+matching_jobs() {
+  local page=1 repos="" chunk repo runs run jobs
+  while :; do
+    chunk="$(api GET "/installation/repositories?per_page=100&page=$page")" || return 1
+    repos+="$(jq -r '.repositories[] | select(.private and (.archived | not)) | .full_name' <<<"$chunk")"$'\n'
+    (($(jq '.repositories | length' <<<"$chunk") == 100)) || break
+    page=$((page + 1))
+  done
+  while IFS= read -r repo; do
+    [[ -n $repo ]] || continue
+    runs="$(api GET "/repos/$repo/actions/runs?per_page=100")" || return 1
+    while IFS= read -r run; do
+      [[ -n $run ]] || continue
+      jobs="$(api GET "/repos/$repo/actions/runs/$run/jobs?filter=latest&per_page=100")" || return 1
+      jq -c --arg repo "$repo" --argjson labels "$LABELS_JSON" '
+        .jobs[] | select(.status == "queued" and (.labels | length) > 0
+                         and all(.labels[]; ascii_downcase | IN($labels[])))
+        | {repo: $repo, run: .run_id, id, name, labels}' <<<"$jobs"
+    done < <(jq -r '.workflow_runs[] | select(.status == "queued" or .status == "in_progress") | .id' <<<"$runs")
+  done <<<"$repos"
+}
+
+# --- runners ------------------------------------------------------------------
+
+# Running runners, by pid: their name, GitHub runner id and start time.
+declare -A R_NAME=() R_ID=() R_START=()
+# A runner that failed within EARLY_EXIT seconds of starting (a bad config,
+# a broken install) fails the cycle, so the backoff applies.
+EARLY_EXIT=60
+EARLY_FAILED=false
+
+# Whether runner $1 still runs, by bash's own job table.
+alive() {
+  # Not -q: grep quitting early would fail jobs with SIGPIPE under pipefail.
+  jobs -rp | grep -xF -- "$1" >/dev/null
+}
+
+# Deletes job dir $1. Files a job's containers left owned by root can't be,
+# so those are logged.
+remove_dir() {
+  rm -rf -- "$1" 2>/dev/null || log "could not delete all of $1 (files a container left owned by root?)"
+}
+
+# Collects runners that exited: their exit status logged, their dir deleted,
+# the runner deregistered (GitHub usually has already: then the 404 is fine).
+reap() {
+  local pid status
+  for pid in "${!R_NAME[@]}"; do
+    alive "$pid" && continue
+    status=0
+    wait "$pid" || status=$?
+    log "${R_NAME[$pid]}: exited ($status), deleting its job dir"
+    remove_dir "$JOBS/${R_NAME[$pid]}"
+    deregister "${R_ID[$pid]}" || true
+    if ((status != 0 && $(date +%s) - R_START[$pid] < EARLY_EXIT)); then
+      log "${R_NAME[$pid]}: failed within ${EARLY_EXIT}s of starting"
+      EARLY_FAILED=true
+    fi
+    unset "R_NAME[$pid]" "R_ID[$pid]" "R_START[$pid]"
+  done
+}
+
+# Deregisters runner id $1, saying whether GitHub had already removed it.
+deregister() {
+  local rc=0
+  QUIET_404=1 api DELETE "/orgs/$ORG/actions/runners/$1" >/dev/null || rc=$?
+  case $rc in
+    0) log "deregistered runner $1" ;;
+    2) log "runner $1 already gone from GitHub" ;;
+    *) log "could not deregister runner $1"; return 1 ;;
+  esac
+}
+
+# Stops runner $1 (its whole session) and deregisters it.
+stop_runner() {
+  kill -TERM -- "-$1" 2>/dev/null || true
+  deregister "${R_ID[$1]}" || true
+}
+
+# IDLE: how many running runners have no job yet. A runner whose status
+# GitHub can't give now (an API error) counts as idle, so it never leads to
+# starting too many, but is never stopped for it: only one GitHub reports as
+# not busy (or no longer knows) past IDLE_TIMEOUT (its job was cancelled or
+# taken elsewhere) is. Run in the main shell, not $(...), as it reads the job
+# table.
+IDLE=0
+idle_runners() {
+  local pid info idle=0 now rc
+  now="$(date +%s)"
+  for pid in "${!R_NAME[@]}"; do
+    alive "$pid" || continue
+    rc=0
+    info="$(QUIET_404=1 api GET "/orgs/$ORG/actions/runners/${R_ID[$pid]}")" || rc=$?
+    if ((rc == 0)) && [[ $(jq -r .busy <<<"$info") == true ]]; then
+      continue
+    fi
+    if ((rc == 1)); then
+      log "${R_NAME[$pid]}: status check failed; counted as idle, not stopped"
+    elif ((now - R_START[$pid] > IDLE_TIMEOUT)); then
+      log "${R_NAME[$pid]}: no job after ${IDLE_TIMEOUT}s, stopping it"
+      stop_runner "$pid"
+      continue
+    fi
+    idle=$((idle + 1))
+  done
+  IDLE=$idle
+}
+
+# Starts one runner: copies the runner into a fresh job dir, asks GitHub for
+# a just-in-time config, and runs it in its own session with an empty HOME
+# and a clean environment. The runner takes one job, then exits.
+start_runner() {
+  local name dir resp cfg id pid
+  name="$PREFIX-$(date +%s)-$(od -An -N3 -tx1 /dev/urandom | tr -d ' \n')"
+  dir="$JOBS/$name"
+  # Called as an if condition, where set -e is off: each step checks itself.
+  install -d -m 700 "$dir" "$dir/home" || { log "$name: could not make $dir"; return 1; }
+  if ! cp -a "$RUNNER_DIST/." "$dir/runner/"; then
+    log "$name: could not copy $RUNNER_DIST (devbox sync installs it)"
+    remove_dir "$dir"
+    return 1
+  fi
+  resp="$(api POST "/orgs/$ORG/actions/runners/generate-jitconfig" "$(jq -cn \
+    --arg name "$name" --argjson labels "$LABELS_JSON" --argjson group "$RUNNER_GROUP" \
+    '{name: $name, runner_group_id: $group, labels: $labels, work_folder: "_work"}')")" ||
+    { remove_dir "$dir"; return 1; }
+  cfg="$(jq -r '.encoded_jit_config // empty' <<<"$resp")"
+  id="$(jq -r '.runner.id // empty' <<<"$resp")"
+  if [[ -z $cfg || ! $id =~ ^[0-9]+$ ]]; then
+    log "$name: generate-jitconfig returned no config"
+    remove_dir "$dir"
+    return 1
+  fi
+  (
+    # Only what the job's contract names, plus what a process needs.
+    while IFS= read -r v; do unset "$v" 2>/dev/null || true; done < <(compgen -e)
+    export HOME="$dir/home" USER=ghrunner LOGNAME=ghrunner PATH="$JOB_PATH" LANG=C.UTF-8 \
+      OP_SERVICE_ACCOUNT_TOKEN="$OP_TOKEN"
+    cd "$dir/runner"
+    exec setsid ./run.sh --jitconfig "$cfg" </dev/null
+  ) &
+  pid=$!
+  R_NAME[$pid]="$name"
+  R_ID[$pid]="$id"
+  R_START[$pid]="$(date +%s)"
+  log "$name: started (runner id $id, labels $(jq -r 'join(",")' <<<"$LABELS_JSON"))"
+}
+
+# Deregisters offline runners this box registered before it last stopped.
+CLEANED=false
+clean_stale() {
+  local page=1 chunk id
+  while :; do
+    chunk="$(api GET "/orgs/$ORG/actions/runners?per_page=100&page=$page")" || return 1
+    # Only names start_runner makes: <prefix>-<epoch>-<6 hex digits>.
+    for id in $(jq -r --arg p "$PREFIX" '.runners[] | select(.status == "offline"
+        and (.name | test("^\($p)-[0-9]+-[0-9a-f]{6}$"))) | .id' <<<"$chunk"); do
+      log "runner $id: a stale runner of this box's"
+      deregister "$id" || true
+    done
+    (($(jq '.runners | length' <<<"$chunk") == 100)) || break
+    page=$((page + 1))
+  done
+  CLEANED=true
+}
+
+# One cycle: start min(matching queued jobs - idle runners, max_jobs - running).
+# Fails when a runner failed right after starting.
+cycle() {
+  local jobs queued running start
+  EARLY_FAILED=false
+  load_settings || return 1
+  load_secrets || return 1
+  installation_token || return 1
+  $CLEANED || clean_stale || return 1
+  reap
+  jobs="$(matching_jobs)" || return 1
+  queued="$(grep -c . <<<"$jobs" || true)"
+  idle_runners
+  reap
+  ! $EARLY_FAILED || return 1
+  running="${#R_NAME[@]}"
+  start=$((queued - IDLE))
+  ((start <= MAX_JOBS - running)) || start=$((MAX_JOBS - running))
+  ((queued == 0 && running == 0)) || log "queued $queued, running $running ($IDLE idle), max $MAX_JOBS: starting $((start > 0 ? start : 0))"
+  while ((start-- > 0)); do
+    start_runner || return 1
+  done
+}
+
+# The wait before the next cycle, from the last cycle's calls (one line each
+# in RATE_FILE) and the rate limit they left: CYCLE, or longer when the
+# remaining calls at this pace wouldn't last until the limit resets, so they
+# spread evenly over the time left.
+next_wait() {
+  local calls remaining reset left cycles wait=$CYCLE
+  calls="$(grep -c . "$RATE_FILE" || true)"
+  read -r remaining reset < <(grep -E '^[0-9]+ [0-9]+$' "$RATE_FILE" | tail -n1) || true
+  : >"$RATE_FILE"
+  if ((calls > 0)) && [[ -n ${remaining:-} ]]; then
+    left=$((reset - $(date +%s)))
+    cycles=$((remaining / calls))
+    if ((left > 0 && cycles * CYCLE < left)); then
+      wait=$((cycles > 0 ? left / cycles : left + 5))
+      ((wait >= CYCLE)) || wait=$CYCLE
+      log "rate limit: $remaining calls left for ${left}s at $calls a cycle; next cycle in ${wait}s"
+    fi
+  fi
+  printf '%s\n' "$wait"
+}
+
+dry_run() {
+  local jobs queued start
+  load_settings || exit 1
+  load_secrets || exit 1
+  installation_token || exit 1
+  jobs="$(matching_jobs)" || exit 1
+  queued="$(grep -c . <<<"$jobs" || true)"
+  printf 'org %s, runner labels %s, max_jobs %s\n' "$ORG" "$(jq -r 'join(",")' <<<"$LABELS_JSON")" "$MAX_JOBS"
+  printf 'matching queued jobs: %s\n' "$queued"
+  ((queued == 0)) || jq -r '"  \(.repo) run \(.run) job \(.id) \(.name | @json) [\(.labels | join(","))]"' <<<"$jobs"
+  start=$((queued < MAX_JOBS ? queued : MAX_JOBS))
+  printf 'would start %s just-in-time runner(s) named %s-<time>-<random> in %s (dry run: none registered)\n' \
+    "$start" "$PREFIX" "$JOBS"
+}
+
+# Stopping: every runner's session ended and its job dir deleted.
+shutdown() {
+  local pid
+  log "stopping ${#R_NAME[@]} runner(s)"
+  for pid in "${!R_NAME[@]}"; do kill -TERM -- "-$pid" 2>/dev/null || true; done
+  for pid in "${!R_NAME[@]}"; do wait "$pid" 2>/dev/null || true; done
+  for pid in "${!R_NAME[@]}"; do remove_dir "$JOBS/${R_NAME[$pid]}"; done
+  exit 0
+}
+
+RATE_FILE=""
+
+main() {
+  local dry=false wait
+  while (($#)); do
+    case "$1" in
+      --dry-run) dry=true ;;
+      -h | --help) usage; exit 0 ;;
+      *) usage >&2; die "unknown argument: $1" ;;
+    esac
+    shift
+  done
+  RATE_FILE="$(mktemp)"
+  trap 'rm -f "$RATE_FILE"' EXIT
+  if $dry; then
+    dry_run
+    return
+  fi
+
+  # Job dirs left by an earlier run that didn't stop cleanly.
+  install -d -m 700 "$JOBS"
+  find "$JOBS" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} + 2>/dev/null ||
+    log "could not delete all of the old job dirs in $JOBS"
+  trap shutdown TERM INT
+  log "started"
+  wait=$CYCLE
+  while :; do
+    if cycle; then
+      wait="$(next_wait)"
+    else
+      : >"$RATE_FILE"
+      wait=$((wait * 2 > BACKOFF_MAX ? BACKOFF_MAX : wait * 2))
+      log "cycle failed; next try in ${wait}s"
+    fi
+    # In the background, so a stop signal is handled at once.
+    sleep "$wait" &
+    wait $! || true
+  done
+}
+
+main "$@"

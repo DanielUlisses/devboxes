@@ -113,11 +113,27 @@ def resources($p):
                else err("\($p).onboot"; "must be true or false \(got)") end)
   end;
 
+# A runner box'"'"'s dispatcher settings. $required: org and labels must be set
+# (a runner'"'"'s client file; defaults.yaml holds only max_jobs).
+def runners($p; $required):
+  def needed($f): if $required then err("\($p).\($f)"; "required when role is runner") else empty end;
+  if . == null then needed("org"), needed("labels")
+  elif type != "object" then err($p; "must be a mapping \(got)")
+  else
+    unknown_keys("\($p)."; ["org", "labels", "max_jobs"]),
+    (.org | if . == null then needed("org")
+      else str_match("\($p).org"; "^[A-Za-z0-9]([A-Za-z0-9-]{0,38})$"; "a GitHub org name (letters, digits, dashes)") end),
+    (.labels | if . == null then needed("labels")
+      elif . == [] then err("\($p).labels"; "must be a non-empty list of labels \(got)")
+      else str_list("\($p).labels"; "^[A-Za-z0-9._-]+$"; "a runner label (letters, digits, . _ -)") end),
+    (.max_jobs | int_min("\($p).max_jobs"; 1))
+  end;
+
 if . == null then {} else . end
 | if type != "object" then err("(top level)"; "must be a mapping of fields \(got)")
   else
     unknown_keys(""; ["hostname", "host", "role", "claude_account", "git_name", "git_email", "resources", "packages", "tools", "skills",
-                     "repos", "timezone", "backup", "backup_schedule", "backup_keep"]
+                     "repos", "timezone", "backup", "backup_schedule", "backup_keep", "runners"]
                      + if $required then [] else ["runner_resources"] end),
 
     (.hostname | str_match("hostname"; "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$";
@@ -141,6 +157,13 @@ if . == null then {} else . end
 
     (.resources | resources("resources")),
     (.runner_resources | resources("runner_resources")),
+
+    # A client file'"'"'s runners need its effective role, inherited or its own;
+    # defaults.yaml holds the block'"'"'s defaults whatever its role.
+    ((.role // $default_role) as $role
+     | if $required and $role != "runner" and .runners != null
+       then err("runners"; "allowed only when role is runner (role is \($role))")
+       else .runners | runners("runners"; $required and $role == "runner") end),
 
     (.timezone | str_match("timezone"; "^(UTC|[A-Za-z][A-Za-z0-9_+-]*(/[A-Za-z0-9][A-Za-z0-9_+-]*)+)$";
       "an IANA zone like America/Sao_Paulo or UTC")),
@@ -166,7 +189,8 @@ if . == null then {} else . end
 '
 
 # Defaults first, client second: mappings merge, lists replace, skills append.
-# A runner box starts from the defaults' runner_resources instead of resources.
+# A runner box starts from the defaults' runner_resources instead of resources,
+# and only a runner box has runners.
 # shellcheck disable=SC2016 # jq program, not shell expansions
 MERGE='
 def strip_nulls: if type == "object" then with_entries(select(.value != null) | .value |= strip_nulls) else . end;
@@ -176,7 +200,8 @@ def strip_nulls: if type == "object" then with_entries(select(.value != null) | 
 | ($d * $c)
 | .hostname //= "dev-\($name)"
 | .skills = (reduce (($d.skills // []) + ($c.skills // []))[] as $s ([]; if IN(.[]; $s) then . else . + [$s] end))
-| {hostname, host, role, claude_account, git_name, git_email, resources, packages, tools, skills, repos, timezone, backup, backup_schedule, backup_keep}
+| {hostname, host, role, claude_account, git_name, git_email, resources, packages, tools, skills, repos, timezone, backup, backup_schedule, backup_keep, runners}
+| if .role == "runner" then . else del(.runners) end
 '
 
 # Prints the errors of one file, prefixed with its displayed path.

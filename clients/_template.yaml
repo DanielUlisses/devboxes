@@ -24,6 +24,15 @@
 # $DEVBOX_HOST.
 # host: example-host
 
+# A runner box's dispatcher, which starts one just-in-time GitHub Actions
+# runner per queued job of `org` whose runs-on labels are all among `labels`
+# plus self-hosted. Allowed only when role is runner, and required there:
+# org and labels (non-empty) have no default. See README.md, Runner boxes.
+# runners:
+#   org: example-org     # the GitHub org the runners register in
+#   labels: [homelab]    # the box's labels (letters, digits, . _ -)
+#   max_jobs: 2          # jobs run at once (>= 1); default 2
+
 # Which Claude account the devbox signs in with: a label, never an email.
 # Required when role is devbox; a runner box has no Claude.
 claude_account: example

@@ -34,6 +34,11 @@ runner_resources:
   cpuunits: 50       # half a default guest's CPU weight
   onboot: true
 
+# A role: runner box's dispatcher (bin/devbox-runner-dispatch): its client
+# file sets runners.org and runners.labels; allowed only on a runner.
+runners:
+  max_jobs: 2        # jobs run at once, one just-in-time runner each
+
 # IANA time zone the box runs in.
 timezone: America/Sao_Paulo
 
