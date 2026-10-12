@@ -26,8 +26,10 @@ RUNNER_GROUP=1
 CYCLE=20          # seconds between cycles
 BACKOFF_MAX=300   # longest wait after repeated errors
 IDLE_TIMEOUT=900  # a runner still without a job after this long is removed
-# What a job finds on PATH: git, ssh, curl, jq, gh, docker, op.
-JOB_PATH=/usr/local/bin:/usr/bin
+# What a job finds on PATH: git, ssh, curl, jq, gh, docker, op, and the
+# client's tools: through the shims devbox sync writes into /opt/mise.
+RUNNER_MISE_DATA=/opt/mise
+JOB_PATH=$RUNNER_MISE_DATA/shims:/usr/local/bin:/usr/bin
 
 usage() {
   cat <<EOF
@@ -306,7 +308,7 @@ start_runner() {
     # Only what the job's contract names, plus what a process needs.
     while IFS= read -r v; do unset "$v" 2>/dev/null || true; done < <(compgen -e)
     export HOME="$dir/home" USER=ghrunner LOGNAME=ghrunner PATH="$JOB_PATH" LANG=C.UTF-8 \
-      OP_SERVICE_ACCOUNT_TOKEN="$OP_TOKEN"
+      MISE_DATA_DIR="$RUNNER_MISE_DATA" OP_SERVICE_ACCOUNT_TOKEN="$OP_TOKEN"
     cd "$dir/runner"
     exec setsid ./run.sh --jitconfig "$cfg" </dev/null
   ) &

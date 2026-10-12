@@ -627,10 +627,12 @@ runners:
   runner needs (`git openssh curl sudo jq go-yq unzip less mise github-cli
   icu tailscale docker docker-buildx docker-compose`: what a job finds on
   `PATH`, and `icu` for the Actions runner), Docker, Tailscale and the
-  1Password CLI: no Claude, skills, nvim, dotfiles, mise dev tools, repos
-  or git identity. `op` is installed by root with mise into `/opt/mise` and
-  linked as `/usr/local/bin/op`, outside any home, so the runner user can
-  run it. `devbox finish` refuses on a runner box; `devbox sync` converges
+  1Password CLI: no Claude, skills, nvim, dotfiles, repos or git
+  identity. `op` and the client file's `tools:` are installed by root with
+  mise into `/opt/mise`, outside any home, so the runner user can run them:
+  `op` is linked as `/usr/local/bin/op`, and jobs reach the other tools
+  through `/opt/mise/shims` (`tools: [python@3.13]` gives jobs `python3`).
+  A tool dropped from the list is pruned on the next sync. `devbox finish` refuses on a runner box; `devbox sync` converges
   it, and `devbox update` bumps its pinned runner (see [The
   dispatcher](#the-dispatcher)). gh is there for jobs, but the box itself
   never logs it in, so a sync inside the box reuses the config it was last
@@ -780,7 +782,9 @@ runs-on: [self-hosted, homelab]
 and can count on:
 
 - `git`, `ssh`, `curl`, `jq`, `gh`, `op` and `docker` on `PATH`
-  (`/usr/local/bin:/usr/bin`); nothing else is promised;
+  (`/opt/mise/shims:/usr/local/bin:/usr/bin`), plus the client file's
+  `tools:` through the shims (with `MISE_DATA_DIR=/opt/mise`); nothing else
+  is promised;
 - `OP_SERVICE_ACCOUNT_TOKEN` set to the box's service-account token, so
   `op read op://...` works; the job's environment holds nothing else of
   the box's;

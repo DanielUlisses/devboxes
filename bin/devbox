@@ -11,9 +11,10 @@
 # skills and repos, bringing what those installed current, and the cleanup
 # bin/devbox-destroy runs before destroying the box. `devbox rc` starts
 # Claude Remote Control in a new herdr pane in ~/work. A role: runner box
-# gets only base packages, Docker, Tailscale, op, the pinned GitHub Actions
-# runner and its dispatcher: no Claude, skills, nvim, mise tools, repos or
-# git identity, and no finish; its update bumps the pinned runner.
+# gets only base packages, Docker, Tailscale, op and the client's tools: (for
+# jobs), the pinned GitHub Actions runner and its dispatcher: no Claude,
+# skills, nvim, repos or git identity, and no finish; its update bumps the
+# pinned runner.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
@@ -47,11 +48,18 @@ herdr = "latest"
 1password = "latest"
 node = "26"'
 
-# A runner box's only mise tool, op, installed by root into RUNNER_MISE_DATA,
-# outside any home, so ghrunner can run it too; /usr/local/bin/op links to it.
-RUNNER_TOOLS='# Written by devbox sync: the tools of a runner box, installed into /opt/mise.
-[tools]
-1password = "latest"'
+# A runner box's mise tools, op plus the client's tools: list, installed by
+# root into RUNNER_MISE_DATA, outside any home, so ghrunner can run them too;
+# /usr/local/bin/op links to op, and jobs reach the rest through its shims.
+# shellcheck disable=SC2016 # jq program, not shell expansions
+RUNNER_TOOLS='
+"# Written by devbox sync: op and the client'"'"'s tools: list, installed into /opt/mise.",
+"[tools]",
+(reduce (.tools[] | capture("^(?<n>[^@]+)@(?<v>.+)$")) as $t ({}; .[$t.n] += [$t.v])
+ | {"1password": ["latest"]} + .
+ | to_entries[]
+ | "\(.key | tojson) = \(if (.value | length) == 1 then .value[0] else .value end | tojson)")
+'
 RUNNER_MISE_DATA=/opt/mise
 # The system user the runners run as, and where `devbox
 # login` keeps its 1Password service-account token: the directory root:ghrunner
@@ -473,14 +481,19 @@ sync_timezone() {
   fi
 }
 
-# A runner box's op: mise, as root, installs the 1password tool from
-# RUNNER_TOOLS into RUNNER_MISE_DATA, which every user can read (ghrunner can't
-# read a home), upgrades it (quietly: a new version shows as the relink) so op
-# doesn't go stale, and /usr/local/bin/op links to it.
-runner_op() {
-  local op
-  ! write_if_changed /etc/mise/config.toml "$RUNNER_TOOLS" 644 || say "op: wrote /etc/mise/config.toml"
+# A runner box's tools: mise, as root, installs RUNNER_TOOLS for config $1 (op
+# and the client's tools:) into RUNNER_MISE_DATA, which every user can read
+# (ghrunner can't read a home), prunes the versions no longer listed, and
+# writes the shims jobs run them through. It upgrades op (quietly: a new
+# version shows as the relink) so op doesn't go stale, and /usr/local/bin/op
+# links to it.
+runner_tools() {
+  local config="$1" op
+  ! write_if_changed /etc/mise/config.toml "$(jq -r "$RUNNER_TOOLS" <<<"$config")" 644 ||
+    say "tools: wrote /etc/mise/config.toml"
   env -C / MISE_DATA_DIR="$RUNNER_MISE_DATA" MISE_YES=1 mise install
+  env -C / MISE_DATA_DIR="$RUNNER_MISE_DATA" MISE_YES=1 mise prune --yes
+  env -C / MISE_DATA_DIR="$RUNNER_MISE_DATA" mise reshim
   env -C / MISE_DATA_DIR="$RUNNER_MISE_DATA" MISE_YES=1 mise upgrade --quiet 1password
   op="$(env -C / MISE_DATA_DIR="$RUNNER_MISE_DATA" mise which op)" || die "op: mise installed no op"
   if [[ $(readlink /usr/local/bin/op 2>/dev/null) != "$op" ]]; then
@@ -691,7 +704,7 @@ sync() {
   sync_timezone "$config"
   sync_packages "$config"
   if [[ $role == runner ]]; then
-    runner_op
+    runner_tools "$config"
     runner_setup
     runner_release
     runner_dispatcher "$config"

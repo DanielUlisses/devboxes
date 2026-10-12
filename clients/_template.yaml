@@ -12,9 +12,9 @@
 # hostname: dev-example
 
 # What the box is for: devbox, a developer's box, or runner, a locked-down
-# box for CI runners: base packages, Docker, Tailscale (as tag:runner) and
-# op only, no Claude, skills, nvim, mise tools, repos or git identity, and
-# the smaller resources in defaults.yaml's runner_resources. A runner usually
+# box for CI runners: base packages, Docker, Tailscale (as tag:runner), op
+# and the tools: below (for jobs), no Claude, skills, nvim, repos or git
+# identity, and the smaller resources in defaults.yaml's runner_resources. A runner usually
 # sets hostname too, to drop the dev- prefix. Default: devbox.
 # role: devbox
 
@@ -59,7 +59,7 @@ claude_account: example
 packages:
   - jq
 
-# mise tools, as <tool>@<version>.
+# mise tools, as <tool>@<version>. On a runner, jobs get them on PATH.
 tools:
   - terraform@1.9
   - python@3.12
