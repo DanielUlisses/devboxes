@@ -165,9 +165,10 @@ api() {
 
 # The queued jobs this box can take, one JSON object per line: every private,
 # unarchived repo the App can see (public repos never get a self-hosted
-# runner), one call for its latest 100 runs, then, for those queued or in
-# progress (an in-progress matrix run still has queued jobs), their jobs that
-# are queued and whose labels are all among the runner's.
+# runner), one call for its latest 100 runs, then, for those not completed
+# (an in-progress matrix run still has queued jobs, and a run that waited on
+# its concurrency group stays "pending" after its job is queued), their jobs
+# that are queued and whose labels are all among the runner's.
 matching_jobs() {
   local page=1 repos="" chunk repo runs run jobs
   while :; do
@@ -186,7 +187,7 @@ matching_jobs() {
         .jobs[] | select(.status == "queued" and (.labels | length) > 0
                          and all(.labels[]; ascii_downcase | IN($labels[])))
         | {repo: $repo, run: .run_id, id, name, labels}' <<<"$jobs"
-    done < <(jq -r '.workflow_runs[] | select(.status == "queued" or .status == "in_progress") | .id' <<<"$runs")
+    done < <(jq -r '.workflow_runs[] | select(.status != "completed") | .id' <<<"$runs")
   done <<<"$repos"
 }
 
