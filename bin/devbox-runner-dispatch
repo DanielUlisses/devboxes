@@ -13,9 +13,10 @@ CONF=${DISPATCH_CONF:-/etc/ghrunner/dispatcher.json}
 # The 1Password service-account token devbox login stores; an
 # OP_SERVICE_ACCOUNT_TOKEN already set wins (a dry run from your own shell).
 OP_TOKEN_FILE=/etc/ghrunner/op-service-account-token
-# The GitHub App's id and private key, in the homelab-ci vault.
-APP_ID_REF=${DISPATCH_APP_ID_REF:-op://homelab-ci/github-app/app-id}
-APP_KEY_REF=${DISPATCH_APP_KEY_REF:-op://homelab-ci/github-app/private-key}
+# The GitHub App's id (username field) and private key (credential field),
+# in the homelab-ci vault.
+APP_ID_REF=${DISPATCH_APP_ID_REF:-op://homelab-ci/github-app/username}
+APP_KEY_REF=${DISPATCH_APP_KEY_REF:-op://homelab-ci/github-app/credential}
 # The runner devbox sync installs; each job runs a copy of it.
 RUNNER_DIST=/opt/actions-runner/current
 # One directory per running job: runner/ (the copy, with its _work) and home/.
