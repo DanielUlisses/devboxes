@@ -745,9 +745,11 @@ many runners it would start.
 - a GitHub App owned by the org and installed on it, with the repository
   permission **Actions: read** and the organization permission
   **Self-hosted runners: read and write**;
-- its app id and private key (PEM) in the 1Password vault `homelab-ci`, as
+- its app id and private key (PEM) in the 1Password vault `homelab-ci`: the id
+  in the item's `username` field, the key as a file attached to it named
+  `private-key.pem` (a single-line field would drop the key's newlines), so
   `op://homelab-ci/github-app/username` and
-  `op://homelab-ci/github-app/credential`, readable by the box's service
+  `op://homelab-ci/github-app/private-key.pem`, readable by the box's service
   account (`devbox login` stores its token). The item and field names are
   this repo's choice (an assumption, not a GitHub or 1Password name);
   `DISPATCH_APP_ID_REF` and `DISPATCH_APP_KEY_REF`, set in a `systemctl
@@ -791,7 +793,7 @@ and can count on:
 **Safety rules.** A self-hosted runner runs whatever the workflow says, as
 a user that can drive Docker and read the box's 1Password token. That token
 is the dispatcher's too, so **every job can read the GitHub App's private
-key** (`op read op://homelab-ci/github-app/credential`) and act as the App
+key** (`op read op://homelab-ci/github-app/private-key.pem`) and act as the App
 on every repo it is installed on, including registering runners. The
 service account can't be scoped per job; only trusted workflows may run
 here. So use
