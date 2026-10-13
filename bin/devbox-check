@@ -5,6 +5,9 @@
 # Sections:
 #   config  bin/devbox-config rejects each broken client in tests/config/,
 #           naming the field, and resolves the ones marked ok.
+#   schema  every key of defaults.yaml (plus hostname) is documented in
+#           clients/_template.yaml, accepted by the validator and present in
+#           the resolved output.
 #
 # A section is a check_<name> function listed in SECTIONS; it reports each
 # case with pass or fail.
@@ -12,7 +15,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
 
-SECTIONS=(config)
+SECTIONS=(config schema)
 
 passed=0
 failed=0
@@ -75,6 +78,141 @@ check_config() {
   printf 'claude_account: work\ngit_name: "someone%sexample.com"\n' "$at" >"$scratch/email-scan.yaml"
   config_case email-scan 'git_name: looks like an email address; config files hold none' \
     "$scratch/email-scan.yaml"
+}
+
+# --- schema ---------------------------------------------------------------
+# CLAUDE.md: a schema change touches _template.yaml, defaults.yaml and the
+# validator together. For each key K of defaults.yaml plus hostname:
+#   1. _template.yaml has `key:` or `# key:` at the start of a line;
+#   2. the validator accepts it: a client setting the key to its default
+#      value resolves (hostname is derived, so it has no default to set);
+#   3. `devbox-config --json _template` outputs it.
+# Three keys are special, by design:
+#   runner_resources  defaults.yaml only: a client file may not set it (2), and
+#                     the merge folds it into a runner's `resources` (3), so
+#                     (3) compares that to the runner's output.
+#   runners           runner role only: (2) uses a runner client, and (3) looks
+#                     for it in a runner client's output, not the template's.
+#   claude_account    in the output but not in defaults.yaml (it has no
+#                     default; a devbox must set it), so it is the one output
+#                     key allowed outside K.
+# If defaults.yaml makes the validator reject the template, 2 and 3 cannot run:
+# the errors naming a key are reported as that key's assertion 2, the rest as
+# schema/_template, and only 1 still runs for every key.
+
+schema_clients="$scratch/schema"
+schema_err="$scratch/schema.err"
+
+# schema_resolve <client file>: resolves it as client `schema`; prints the
+# JSON, and leaves devbox-config's stderr in $schema_err.
+schema_resolve() {
+  rm -rf "$schema_clients"
+  mkdir -p "$schema_clients/clients"
+  cp "$1" "$schema_clients/clients/schema.yaml"
+  DEVBOX_CLIENTS="$schema_clients" "$ROOT/bin/devbox-config" --json schema 2>"$schema_err"
+}
+
+check_schema() {
+  local keys=() k bad=0 before=$failed ykeys
+  ykeys="$(yq -r '. | keys | .[]' "$ROOT/defaults.yaml")" ||
+    { fail "schema/defaults" "yq could not read the keys of defaults.yaml"; return; }
+  [[ -n $ykeys ]] || { fail "schema/defaults" "defaults.yaml has no keys"; return; }
+  mapfile -t keys <<<"$ykeys"
+  keys+=(hostname)
+
+  # Resolved output of a devbox (the template) and of a runner. If either
+  # fails, 2 and 3 are skipped; errors naming a key are kept for that key.
+  local resolved=1 tmpl_json runner_json tmpl_keys runner_keys err="" line lk
+  local -A key_errs=()
+  local generic=()
+  tmpl_json="$("$ROOT/bin/devbox-config" --json _template 2>"$schema_err")" || resolved=0
+  err="$(<"$schema_err")"
+  if ((resolved)); then
+    printf 'role: runner\nrunners:\n  org: example-org\n  labels: [homelab]\n' >"$scratch/runner.yaml"
+    if runner_json="$(schema_resolve "$scratch/runner.yaml")"; then
+      tmpl_keys="$(jq -r 'keys[]' <<<"$tmpl_json")"
+      runner_keys="$(jq -r 'keys[]' <<<"$runner_json")"
+    else
+      resolved=0
+      fail "schema/runner" "a minimal runner client did not resolve" "$(<"$schema_err")"
+    fi
+  else
+    while IFS= read -r line; do
+      # the trailer devbox-config adds to any validation error names no key
+      [[ -n $line && $line != 'devbox-config: invalid config for client'* ]] || continue
+      lk="$(sed -nE 's/^defaults\.yaml: ([a-z_]+)[:.].*/\1/p' <<<"$line")"
+      if [[ -n $lk ]] && printf '%s\n' "${keys[@]}" | grep -qx "$lk"; then
+        key_errs[$lk]+="${key_errs[$lk]:+ }$line"
+      else
+        generic+=("$line")
+      fi
+    done <<<"$err"
+    # a non-zero exit with no (usable) stderr must still fail
+    ((${#generic[@]} || ${#key_errs[@]})) ||
+      generic+=("devbox-config exited non-zero with no error output")
+    if ((${#generic[@]})); then
+      fail "schema/_template" "devbox-config --json _template failed with errors naming no defaults.yaml key" "$(printf '%s\n' "${generic[@]}")"
+    fi
+  fi
+
+  local problems file p
+  for k in "${keys[@]}"; do
+    problems=()
+
+    # 1. documented in the template
+    grep -Eq "^(# )?$k:" "$ROOT/clients/_template.yaml" ||
+      problems+=("1 (template): not in clients/_template.yaml as '$k:' or '# $k:'")
+
+    # 2. accepted by the validator
+    if [[ -n ${key_errs[$k]:-} ]]; then
+      problems+=("2 (validator): ${key_errs[$k]}")
+    elif ((resolved)) && [[ $k != hostname && $k != runner_resources ]]; then
+      file="$scratch/key.yaml"
+      if [[ $k == runners ]]; then
+        yq '{"role": "runner", "runners": .["runners"]} | .runners.org = "example-org" | .runners.labels = ["homelab"]' \
+          "$ROOT/defaults.yaml" >"$file"
+      else
+        { echo 'claude_account: example'; yq "{\"$k\": .[\"$k\"]}" "$ROOT/defaults.yaml"; } >"$file"
+      fi
+      if ! schema_resolve "$file" >/dev/null; then
+        problems+=("2 (validator): a client setting '$k' to its default does not resolve: $(tr '\n' ' ' <"$schema_err")")
+      fi
+    fi
+
+    # 3. in the resolved output
+    if ((resolved)); then
+      case $k in
+        runner_resources)
+          jq -e --argjson want "$(yq -o=json '.["runner_resources"]' "$ROOT/defaults.yaml")" \
+            '.resources == $want' <<<"$runner_json" >/dev/null ||
+            problems+=("3 (resolved output): a runner client's resources differ from defaults.yaml runner_resources") ;;
+        runners) grep -qx "$k" <<<"$runner_keys" ||
+          problems+=("3 (resolved output): '$k' missing from a runner client's output") ;;
+        *) grep -qx "$k" <<<"$tmpl_keys" ||
+          problems+=("3 (resolved output): '$k' missing from devbox-config --json _template") ;;
+      esac
+    fi
+
+    if ((${#problems[@]})); then
+      for p in "${problems[@]}"; do fail "schema/$k" "assertion $p"; done
+      bad=$((bad + 1))
+    elif ((resolved)); then
+      pass "schema/$k"
+    fi
+  done
+
+  # 3, the other way: neither output holds a key outside K.
+  local extra
+  if ((resolved)); then
+    while IFS= read -r extra; do
+      [[ $extra == claude_account ]] || printf '%s\n' "${keys[@]}" | grep -qx "$extra" ||
+        { fail "schema/$extra" "assertion 3 (resolved output): '$extra' is output but is not a defaults.yaml key or hostname"; bad=$((bad + 1)); }
+    done < <(printf '%s\n%s\n' "$tmpl_keys" "$runner_keys" | sort -u)
+  fi
+
+  printf 'schema: %d keys checked, %d failed (%d assertion failures)%s\n' \
+    "${#keys[@]}" "$bad" "$((failed - before))" \
+    "$( ((resolved)) || echo ' (assertions 2 and 3 skipped: devbox-config did not resolve)')"
 }
 
 for s in "${SECTIONS[@]}"; do
