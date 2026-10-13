@@ -45,6 +45,7 @@ BASE_TOOLS='# Written by devbox (bootstrap and sync): tools every devbox gets.
 [tools]
 herdr = "latest"
 1password = "latest"
+shellcheck = "latest"
 node = "26"'
 
 # A runner box's only mise tool, op, installed by root into RUNNER_MISE_DATA,
@@ -147,7 +148,7 @@ Usage: devbox bootstrap
 Run inside a devbox.
 
   bootstrap  set up a fresh box (user $USER_NAME, base packages, docker, claude,
-             herdr, 1Password CLI, gh, tailscale, mise, dotfiles), then sync
+             herdr, shellcheck, 1Password CLI, gh, tailscale, mise, dotfiles), then sync
   sync       converge the box to its client's config: pull the devboxes
              repo and, once gh is logged in, $CLIENTS_REPO (before
              that, the last config the box was given), then install and
@@ -1271,8 +1272,9 @@ update_pacman() {
   ((${#upgraded[@]} == 0)) || changed "pacman: upgraded ${#upgraded[@]} package(s): ${upgraded[*]}"
 }
 
-# mise tools asked for as "latest" (herdr and 1password in the system config,
-# and any client tool@latest) upgraded; versions no config uses pruned.
+# mise tools asked for as "latest" (herdr, shellcheck and 1password in the
+# system config, and any client tool@latest) upgraded; versions no config
+# uses pruned.
 update_mise() {
   local outdated name current latest tools=()
   outdated="$(mise outdated --json | jq -r 'to_entries[] | select(.value.requested == "latest")
@@ -1561,7 +1563,7 @@ bootstrap() {
     return
   fi
 
-  say "claude, herdr, 1Password CLI"
+  say "claude, herdr, shellcheck, 1Password CLI"
   [[ -x $USER_HOME/.local/bin/claude ]] || as_user bash -c 'curl -fsSL https://claude.ai/install.sh | bash'
   write_if_changed /etc/mise/config.toml "$BASE_TOOLS" 644 || true # installed by the sync below
 
