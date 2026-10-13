@@ -28,3 +28,5 @@ To confirm the validator still names a bad field, don't hand-build a broken
 client file: add a case to `tests/config/`, a client file whose first line is
 `# expect: <substring of the error>` (or `# expect: ok` for one that must
 resolve), and run `bin/devbox-check`.
+
+Hidden gotchas in `bin/devbox` and `bin/devbox-config`: `docs/agents/project-memory.md`.
