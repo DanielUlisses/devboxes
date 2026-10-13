@@ -1,0 +1,5 @@
+# expect: plugins[0].plugin: must be <name>@<marketplace-name>
+claude_account: work
+plugins:
+  - marketplace: some-owner/some-marketplace
+    plugin: some-plugin

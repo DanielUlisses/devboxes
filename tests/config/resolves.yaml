@@ -1,0 +1,9 @@
+# expect: ok
+# A devbox client using the fields the broken cases below get wrong.
+claude_account: work
+resources:
+  memory_mb: 4096
+  disk: 20G
+plugins:
+  - marketplace: some-owner/some-marketplace
+    plugin: some-plugin@some-marketplace

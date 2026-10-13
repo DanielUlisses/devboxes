@@ -97,6 +97,27 @@ if ((${#clients[@]})); then
   fi
 fi
 
+# --- devbox-check -------------------------------------------------------
+check=0
+for f in "${staged[@]}"; do
+  case "$f" in
+    bin/devbox-config | bin/devbox-check | defaults.yaml | clients/_*.yaml | tests/*) check=1 ;;
+  esac
+done
+if ((check)); then
+  mise_specs=()
+  missing=0
+  missing_tool jq && missing=1
+  missing_tool yq && missing=1
+  if ((!missing)); then
+    # Failing cases only: the passing ones would bury them.
+    if ! out="$(with_tools "$tree/bin/devbox-check" 2>&1)"; then
+      grep -v '^ok ' <<<"$out" >&2
+      refuse "bin/devbox-check failed on the staged tree (above)"
+    fi
+  fi
+fi
+
 # --- things the public repo must never hold -----------------------------
 # The line is not printed, so the secret does not land in a terminal log.
 scan() {

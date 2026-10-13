@@ -1,0 +1,9 @@
+# expect: plugins: not allowed when role is runner
+role: runner
+claude_account: work
+runners:
+  org: some-org
+  labels: [linux]
+plugins:
+  - marketplace: some-owner/some-marketplace
+    plugin: some-plugin@some-marketplace

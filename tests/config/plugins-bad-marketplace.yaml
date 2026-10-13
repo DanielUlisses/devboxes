@@ -1,0 +1,5 @@
+# expect: plugins[0].marketplace: must be a GitHub <owner>/<repo>
+claude_account: work
+plugins:
+  - marketplace: just-a-repo
+    plugin: some-plugin@some-marketplace

@@ -1,0 +1,6 @@
+# expect: runners.labels: must be a non-empty list of labels
+role: runner
+claude_account: work
+runners:
+  org: some-org
+  labels: []
