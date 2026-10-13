@@ -1011,9 +1011,14 @@ changed() {
   [[ -z $CHANGES ]] || printf '\n' >>"$CHANGES"
 }
 
+# Whether plugin $1 is installed in user scope (not project, local or synced).
+plugin_installed() {
+  claude plugin list --json | jq -e --arg id "$1" '.[] | select(.id == $id and .scope == "user")' >/dev/null
+}
+
 # Installs plugin $1 (<plugin>@<marketplace>) unless it is installed.
 install_plugin() {
-  claude plugin list --json | jq -e --arg id "$1" '.[] | select(.id == $id)' >/dev/null && return
+  ! plugin_installed "$1" || return 0
   claude plugin install "$1" >&2
   changed "skills: installed plugin $1"
 }
@@ -1035,7 +1040,7 @@ install_listed_plugin() {
       die "plugins: marketplace $repo is not named $name"
     changed "plugins: added marketplace $repo"
   fi
-  if ! claude plugin list --json | jq -e --arg id "$id" '.[] | select(.id == $id and .scope == "user")' >/dev/null; then
+  if ! plugin_installed "$id"; then
     claude plugin install "$id" >&2
     changed "plugins: installed $id"
   fi
@@ -1116,7 +1121,7 @@ herdr_plugins() {
 install_skill_npx() {
   local skill="$1" src="${SKILL_NPX[$1]}" old="$1@$OLD_SKILL_MARKETPLACE"
   local stamp="$SKILL_STAMPS/$1" head installed=""
-  if claude plugin list --json | jq -e --arg id "$old" '.[] | select(.id == $id)' >/dev/null; then
+  if plugin_installed "$old"; then
     claude plugin uninstall "$old" >/dev/null
     changed "skills: uninstalled plugin $old (now from npx skills)"
   fi
