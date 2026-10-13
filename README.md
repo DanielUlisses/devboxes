@@ -408,7 +408,10 @@ reported and the rest still run, then `update` (and the sync) exits 1:
   head of `mattpocock/skills` moved (recorded in
   `~/.local/state/devbox/skills/`). Skills newly listed in the client file
   are installed.
-- **plugins:** `claude plugin marketplace update`, then `claude plugin
+- **plugins:** installs the plugins newly listed under `plugins:` in the
+  client file (adding the marketplace first unless it is configured); a
+  failing plugin doesn't stop the others. Removed entries stay installed.
+- **plugin-versions:** `claude plugin marketplace update`, then `claude plugin
   update` for every user-scope plugin.
 - **herdr:** reinstalls each herdr plugin whose GitHub default branch moved
   past the installed commit (herdr has no plugin update; its config is
@@ -491,6 +494,12 @@ what's missing:
   `install.sh`, a plugin marketplace (`.claude-plugin/marketplace.json`), or
   a `SKILL.md` at its root linked into `~/.claude/skills/` (`-skill` dropped
   from the name);
+- installs the `plugins:` list, after the skills: each entry's `marketplace`
+  (a GitHub `<owner>/<repo>`) is added with `claude plugin marketplace add`
+  unless already configured, then its `plugin` (`<name>@<marketplace-name>`)
+  is installed with `claude plugin install` unless already installed. A plugin
+  that needs a command confirmation (the CLI's `-y`) is not installed by
+  devbox: install it by hand. Runner boxes have none;
 - installs the herdr plugins: [reviewr](https://github.com/persiyanov/herdr-reviewr)
   (`herdr plugin install persiyanov/herdr-reviewr`), a pane to review the
   agent's diff and send line comments back to it;
