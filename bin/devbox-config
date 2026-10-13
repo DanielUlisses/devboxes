@@ -113,6 +113,22 @@ def resources($p):
                else err("\($p).onboot"; "must be true or false \(got)") end)
   end;
 
+# Plugin entries: mappings of exactly marketplace and plugin.
+def plugins($p):
+  if . == null then empty
+  elif type != "array" then err($p; "must be a list \(got)")
+  else
+    to_entries[] | .key as $i | .value | "\($p)[\($i)]" as $e
+    | if type != "object" then err($e; "must be a mapping of marketplace and plugin \(got)")
+      else
+        unknown_keys("\($e)."; ["marketplace", "plugin"]),
+        (.marketplace | if . == null then err("\($e).marketplace"; "required")
+          else str_match("\($e).marketplace"; "^[A-Za-z0-9-]+/[A-Za-z0-9._-]+$"; "a GitHub <owner>/<repo>") end),
+        (.plugin | if . == null then err("\($e).plugin"; "required")
+          else str_match("\($e).plugin"; "^[A-Za-z0-9._-]+@[A-Za-z0-9-]+$"; "<name>@<marketplace-name>") end)
+      end
+  end;
+
 # A runner box'"'"'s dispatcher settings. $required: org and labels must be set
 # (a runner'"'"'s client file; defaults.yaml holds only max_jobs).
 def runners($p; $required):
@@ -133,7 +149,7 @@ if . == null then {} else . end
 | if type != "object" then err("(top level)"; "must be a mapping of fields \(got)")
   else
     unknown_keys(""; ["hostname", "host", "role", "claude_account", "git_name", "git_email", "resources", "packages", "tools", "skills",
-                     "repos", "timezone", "backup", "backup_schedule", "backup_keep", "runners"]
+                     "repos", "plugins", "timezone", "backup", "backup_schedule", "backup_keep", "runners"]
                      + if $required then [] else ["runner_resources"] end),
 
     (.hostname | str_match("hostname"; "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$";
@@ -174,6 +190,12 @@ if . == null then {} else . end
     (.repos | str_list("repos"; "^([A-Za-z0-9-]+/[A-Za-z0-9._-]+|\($ado_re))$";
       "a GitHub <owner>/<repo> or an Azure DevOps git@ssh.dev.azure.com:v3/<org>/<project>/<repo>")),
 
+    # Plugins are installed on a devbox only, like runners on a runner.
+    ((.role // $default_role) as $role
+     | if $required and $role == "runner" and .plugins != null
+       then err("plugins"; "not allowed when role is runner")
+       else .plugins | plugins("plugins") end),
+
     (.backup | if . == null or type == "boolean" then empty
                else err("backup"; "must be true or false \(got)") end),
     (.backup_schedule | str_match("backup_schedule"; "^[A-Za-z0-9][A-Za-z0-9 :.,*/~+-]*$";
@@ -200,7 +222,7 @@ def strip_nulls: if type == "object" then with_entries(select(.value != null) | 
 | ($d * $c)
 | .hostname //= "dev-\($name)"
 | .skills = (reduce (($d.skills // []) + ($c.skills // []))[] as $s ([]; if IN(.[]; $s) then . else . + [$s] end))
-| {hostname, host, role, claude_account, git_name, git_email, resources, packages, tools, skills, repos, timezone, backup, backup_schedule, backup_keep, runners}
+| {hostname, host, role, claude_account, git_name, git_email, resources, packages, tools, skills, repos, plugins, timezone, backup, backup_schedule, backup_keep, runners}
 | if .role == "runner" then . else del(.runners) end
 '
 

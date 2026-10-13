@@ -71,6 +71,19 @@ tools:
 # npx skills from mattpocock/skills.
 skills: []
 
+# Claude Code plugins to install, each a mapping: `marketplace` is the GitHub
+# <owner>/<repo> passed to `claude plugin marketplace add`, `plugin` is
+# <name>@<marketplace-name> passed to `claude plugin install` (the marketplace's
+# name can differ from its repo). `devbox finish` adds each marketplace (unless
+# configured) and installs each plugin (unless installed); `devbox sync` and
+# `update` install newly listed ones, in their own `plugins` step. Removed
+# entries stay installed. A plugin that needs a command confirmation (the CLI's
+# -y) is not installed by devbox: install it by hand. Devbox only: a runner box
+# has none.
+# plugins:
+#   - marketplace: example-org/example-marketplace-repo
+#     plugin: example-plugin@example-marketplace
+
 # Repos to clone into ~/work/<repo>: GitHub ones as <owner>/<repo>, Azure
 # DevOps ones as their SSH URL, git@ssh.dev.azure.com:v3/<org>/<project>/<repo>.
 # `devbox finish` and `devbox sync` clone newly listed ones; removed ones are

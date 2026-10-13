@@ -52,6 +52,8 @@ skills:
   - humanizer-skill
   - mattpocock-skills
 
+plugins: []
+
 repos: []
 
 # Proxmox backup job for the box (vzdump, snapshot mode, zstd), to the

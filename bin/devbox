@@ -161,7 +161,8 @@ Run inside a devbox.
   finish     after login: this box's SSH key on GitHub (auth and signing),
              git identity and signing, agent instructions (~/.claude/CLAUDE.md
              and ~/AGENTS.md, which sync regenerates), skills (mattpocock's
-             with npx skills), the herdr plugins (reviewr), repos;
+             with npx skills), the client's plugins, the herdr plugins (reviewr),
+             repos;
              with Azure DevOps repos, a key for it to add there by hand
   update     after finish: bring current what finish and bootstrap installed
              (skills, plugins, herdr plugins, pacman -Syu unless
@@ -1013,7 +1014,7 @@ changed() {
 # Installs plugin $1 (<plugin>@<marketplace>) unless it is installed.
 install_plugin() {
   claude plugin list --json | jq -e --arg id "$1" '.[] | select(.id == $id)' >/dev/null && return
-  claude plugin install "$1" >/dev/null
+  claude plugin install "$1" >&2
   changed "skills: installed plugin $1"
 }
 
@@ -1021,6 +1022,23 @@ install_plugin() {
 add_marketplace() {
   claude plugin marketplace list --json | jq -e --arg n "$1" '.[] | select(.name == $n)' >/dev/null ||
     claude plugin marketplace add "$2"
+}
+
+# Adds the marketplace at GitHub repo $1 and installs plugin $2
+# (<plugin>@<marketplace>), each unless already there. The marketplace's name
+# is the part of the plugin id after the @.
+install_listed_plugin() {
+  local repo="$1" id="$2" name="${2#*@}"
+  if ! claude plugin marketplace list --json | jq -e --arg n "$name" '.[] | select(.name == $n)' >/dev/null; then
+    claude plugin marketplace add "$repo" >&2
+    claude plugin marketplace list --json | jq -e --arg n "$name" '.[] | select(.name == $n)' >/dev/null ||
+      die "plugins: marketplace $repo is not named $name"
+    changed "plugins: added marketplace $repo"
+  fi
+  if ! claude plugin list --json | jq -e --arg id "$id" '.[] | select(.id == $id and .scope == "user")' >/dev/null; then
+    claude plugin install "$id" >&2
+    changed "plugins: installed $id"
+  fi
 }
 
 # Clones (or fast-forwards) a skill repo into ~/.claude/skill-repos and,
@@ -1131,9 +1149,9 @@ install_skill() {
 
 # After login: this box's own SSH key on GitHub for auth and signing, git
 # signing, the base and client skills (mattpocock's through npx skills), the
-# herdr plugins, then repos.
+# client's plugins, the herdr plugins, then repos.
 finish() {
-  local config title skill
+  local config title skill repo id
   config="$(stored_config)" || exit 1
   [[ $(box_role "$config") != runner ]] || die "a runner box has no finish: devbox login is its last step"
   title="$(jq -r .hostname <<<"$config")" # dev-<client> unless the client file sets one
@@ -1158,6 +1176,10 @@ finish() {
     install_skill "$skill"
   done < <(jq -r '.skills[]' <<<"$config")
   say "skills: all installed"
+  while IFS=' ' read -r repo id; do
+    install_listed_plugin "$repo" "$id" </dev/null
+  done < <(jq -r '(.plugins // [])[] | "\(.marketplace) \(.plugin)"' <<<"$config")
+  say "plugins: all installed"
   herdr_plugins
   say "herdr: plugins installed"
 
@@ -1209,6 +1231,17 @@ update_skills() {
   ((failed == 0))
 }
 
+# Plugins newly listed in the client file installed. One failing plugin doesn't
+# stop the others.
+install_new_plugins() {
+  local config="$1" repo id failed=0
+  while IFS=' ' read -r repo id; do
+    isolated install_listed_plugin "$repo" "$id" </dev/null
+    ((STATUS == 0)) || { say "plugins: $id failed"; failed=1; }
+  done < <(jq -r '(.plugins // [])[] | "\(.marketplace) \(.plugin)"' <<<"$config")
+  ((failed == 0))
+}
+
 # User-scope plugins, "<id> <version>" sorted by id.
 plugin_versions() {
   claude plugin list --json | jq -r '.[] | select(.scope == "user") | "\(.id) \(.version // "?")"' | sort
@@ -1225,7 +1258,7 @@ update_plugins() {
   done <<<"$before"
   while read -r id version; do
     old="$(awk -v id="$id" '$1 == id { print $2 }' <<<"$before")"
-    [[ $old == "$version" ]] || changed "plugins: updated $id (${old:-none} -> $version)"
+    [[ $old == "$version" ]] || changed "plugin-versions: updated $id (${old:-none} -> $version)"
   done < <(plugin_versions)
 }
 
@@ -1312,7 +1345,8 @@ update() {
   trap 'rm -f "$CHANGES"' EXIT
 
   run_step skills update_skills "$config"
-  run_step plugins update_plugins
+  run_step plugins install_new_plugins "$config"
+  run_step plugin-versions update_plugins
   run_step herdr herdr_plugins
   if [[ -n $no_upgrade ]]; then
     say "pacman: skipped (--no-pacman-upgrade)"
