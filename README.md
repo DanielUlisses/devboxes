@@ -50,9 +50,10 @@ commit, naming the file and the reason, when:
 
 The deny-list is local and untracked, one host name per line (`#` comments
 allowed), so the names it blocks never have to be written into this repo.
-`DEVBOX_DENY_HOSTS` points the hook at another file. `shellcheck`, `yq` and
-`jq` come from PATH or, failing that, `mise exec`; a missing tool refuses the
-commit rather than skipping the check.
+`DEVBOX_DENY_HOSTS` points the hook at another file. `shellcheck` comes from
+PATH (every devbox has it, from mise's system config); `yq` and `jq` come from
+PATH or, failing that, `mise exec`. A missing tool refuses the commit rather
+than skipping the check.
 
 ## Client files: the devbox-clients repo
 
@@ -300,8 +301,8 @@ bootstrap`, which:
 - sets Docker's storage driver, enables `docker.service` and adds `daniel`
   to the `docker` group (below);
 - adds user `daniel` with passwordless sudo, and `devbox` on the PATH;
-- installs Claude Code (native installer) and puts herdr, the 1Password
-  CLI (`op`) and node 26 (global, for `npx`) in mise's system config,
+- installs Claude Code (native installer) and puts herdr, shellcheck, the
+  1Password CLI (`op`) and node 26 (global, for `npx`) in mise's system config,
   `/etc/mise/config.toml`;
 - stows this repo's `dotfiles/` `bash` and `git` packages into the user's
   home (files in the way are moved to `<file>.bak`), and copies gh's
@@ -419,8 +420,8 @@ reported and the rest still run, then `update` (and the sync) exits 1:
   is left alone.
 - **pacman:** `pacman -Syu` (Arch upgrades the whole system together, base
   packages included); `--no-pacman-upgrade` skips it.
-- **mise:** `mise upgrade` of the tools asked for as `latest` (herdr and
-  1password, plus any client `<tool>@latest`), then `mise prune`.
+- **mise:** `mise upgrade` of the tools asked for as `latest` (herdr, shellcheck
+  and 1password, plus any client `<tool>@latest`), then `mise prune`.
 - **claude:** `claude update`.
 - **az:** with Azure DevOps repos, `az extension update --name
   azure-devops` (added when missing); `az` itself comes with pacman.

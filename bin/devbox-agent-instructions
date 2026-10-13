@@ -71,7 +71,7 @@ def bullets: if length == 0 then ["- none"] else map("- \(.)") end;
 "## Tools",
 "",
 "- pacman packages: \(if (.packages | length) == 0 then "base image only" else .packages | map("`\(.)`") | join(", ") end).",
-"- mise tools: \(if (.tools | length) == 0 then "none beyond the base" else .tools | map("`\(.)`") | join(", ") end); also `herdr`, the 1Password CLI (`op`) and node 26 (`npx`).",
+"- mise tools: \(if (.tools | length) == 0 then "none beyond the base" else .tools | map("`\(.)`") | join(", ") end); also `herdr`, `shellcheck`, the 1Password CLI (`op`) and node 26 (`npx`).",
 "- Docker, with buildx and compose.",
 "- Secrets only via `op read op://...`, used inline (`$(op read ...)`): never print them, echo them or write them to a file.",
 "",
