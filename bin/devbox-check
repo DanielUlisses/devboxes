@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+# Run this repo's checks: each section runs its cases, one line per case,
+# then a summary. Exits non-zero when any case fails.
+#
+# Sections:
+#   config  bin/devbox-config rejects each broken client in tests/config/,
+#           naming the field, and resolves the ones marked ok.
+#
+# A section is a check_<name> function listed in SECTIONS; it reports each
+# case with pass or fail.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+
+SECTIONS=(config)
+
+passed=0
+failed=0
+pass() {
+  printf 'ok    %s\n' "$1"
+  passed=$((passed + 1))
+}
+# fail <case> <reason> [<output>]: the output, if any, is printed indented.
+fail() {
+  printf 'FAIL  %s: %s\n' "$1" "$2"
+  local line
+  [[ -z ${3:-} ]] || while IFS= read -r line; do printf '      | %s\n' "$line"; done <<<"$3"
+  failed=$((failed + 1))
+}
+
+scratch="$(mktemp -d)"
+trap 'rm -rf "$scratch"' EXIT
+
+# --- config ---------------------------------------------------------------
+# Each case is tests/config/<case>.yaml, a client file whose first line is
+# `# expect: <substring>`: devbox-config must exit non-zero with the
+# substring on stderr, or, for `# expect: ok`, exit 0.
+
+# config_case <case> <expect> <client file>: runs devbox-config on the file
+# as client <case>, from a clients checkout of its own.
+config_case() {
+  local name="$1" expect="$2" file="$3" clients="$scratch/config" err status=0
+  rm -rf "$clients"
+  mkdir -p "$clients/clients"
+  cp "$file" "$clients/clients/$name.yaml"
+  err="$(DEVBOX_CLIENTS="$clients" "$ROOT/bin/devbox-config" "$name" 2>&1 >/dev/null)" || status=$?
+  if [[ $expect == ok ]]; then
+    if ((status == 0)); then pass "config/$name"
+    else fail "config/$name" "expected it to resolve, devbox-config exited $status" "$err"; fi
+  elif ((status == 0)); then
+    fail "config/$name" "expected an error containing '$expect', but it resolved"
+  elif [[ $err != *"$expect"* ]]; then
+    fail "config/$name" "expected an error containing '$expect'" "$err"
+  else
+    pass "config/$name"
+  fi
+}
+
+check_config() {
+  local f name first
+  for f in "$ROOT"/tests/config/*.yaml; do
+    [[ -e $f ]] || continue
+    name="$(basename "$f" .yaml)"
+    IFS= read -r first <"$f" || first=""
+    if [[ $first != "# expect: "?* ]]; then
+      fail "config/$name" "first line must be '# expect: <substring>' or '# expect: ok'"
+      continue
+    fi
+    config_case "$name" "${first#"# expect: "}" "$f"
+  done
+
+  # The email scan's case is built here: the pre-commit hook refuses a
+  # staged file holding an email address, so no case file can hold one.
+  local at="@"
+  printf 'claude_account: work\ngit_name: "someone%sexample.com"\n' "$at" >"$scratch/email-scan.yaml"
+  config_case email-scan 'git_name: looks like an email address; config files hold none' \
+    "$scratch/email-scan.yaml"
+}
+
+for s in "${SECTIONS[@]}"; do
+  "check_$s"
+done
+
+printf 'devbox-check: %d passed, %d failed\n' "$passed" "$failed"
+((failed == 0))

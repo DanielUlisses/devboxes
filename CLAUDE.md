@@ -21,6 +21,10 @@ No test suite. After changing `bin/`, `host/`, `lib/`, `bootstrap.sh` or the sch
 ```
 shellcheck bin/* lib/*.sh host/* bootstrap.sh .githooks/* dotfiles/bash/.[!.]*
 bin/devbox-config _template
+bin/devbox-check
 ```
 
-and run a deliberately broken client file to confirm the error names the field.
+To confirm the validator still names a bad field, don't hand-build a broken
+client file: add a case to `tests/config/`, a client file whose first line is
+`# expect: <substring of the error>` (or `# expect: ok` for one that must
+resolve), and run `bin/devbox-check`.

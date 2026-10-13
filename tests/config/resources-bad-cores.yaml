@@ -1,0 +1,4 @@
+# expect: resources.cores: must be an integer >= 1
+claude_account: work
+resources:
+  cores: 0

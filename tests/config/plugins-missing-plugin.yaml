@@ -1,0 +1,4 @@
+# expect: plugins[0].plugin: required
+claude_account: work
+plugins:
+  - marketplace: some-owner/some-marketplace
