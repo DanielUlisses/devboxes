@@ -55,6 +55,10 @@ claude_account: example
 #   cpuunits: 100      # CPU weight against the host's other guests (1-10000)
 #   onboot: true       # start the VM when the host boots
 
+# Runner boxes use defaults.yaml's runner_resources in place of these
+# defaults; it is not a client field.
+# runner_resources: (defaults.yaml only)
+
 # Extra pacman packages, on top of the base image.
 packages:
   - jq
