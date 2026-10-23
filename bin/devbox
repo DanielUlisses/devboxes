@@ -157,17 +157,17 @@ Run inside a devbox.
              a resolved config (bin/devbox-config --json) instead, without
              pulling; bin/devbox-sync uses it.
   login      the manual logins, interactive: tailscale, gh, the client's
-             1Password service-account token, Claude; with Azure DevOps
-             repos, az (device code) and its azure-devops extension
+             1Password service-account token, Claude, agy and cursor-agent
+             (installed first when missing); with Azure DevOps repos, az (device code) and its azure-devops extension
   finish     after login: this box's SSH key on GitHub (auth and signing),
              git identity and signing, agent instructions (~/.claude/CLAUDE.md
              and ~/AGENTS.md, which sync regenerates), skills (mattpocock's
              with npx skills), the client's plugins, the herdr plugins (reviewr),
-             repos;
+             agy and cursor-agent (when missing), repos;
              with Azure DevOps repos, a key for it to add there by hand
   update     after finish: bring current what finish and bootstrap installed
              (skills, plugins, herdr plugins, pacman -Syu unless
-             --no-pacman-upgrade, mise "latest" tools, Claude Code, the
+             --no-pacman-upgrade, mise "latest" tools, Claude Code, agy and cursor-agent, the
              azure-devops az extension, new gh/nvim config files, nvim
              plugins to lazy-lock.json); sync runs it
   logout     remove this box's SSH keys from GitHub and log out of az and
@@ -850,7 +850,8 @@ runner_login() {
   say "logged in (runner box: no finish)"
 }
 
-# The manual logins. Each step skips when already done, so re-running only
+# The manual logins (tailscale, gh, 1Password, Claude, agy, cursor-agent, az).
+# Each step skips when already done, so re-running only
 # asks for what's missing.
 login() {
   local config account token scopes
@@ -893,6 +894,29 @@ login() {
   else
     say "claude: log in with the '$account' account"
     claude auth login
+  fi
+
+  # Neither has an API key; both print a URL to open on another machine.
+  # Installed here too: login comes before finish on a fresh box.
+  install_agy || true
+  install_cursor_agent || true
+  if agy_logged_in; then
+    say "agy: already logged in"
+  else
+    say "agy: log in (it prints a URL to open on another machine; paste the code back, then exit agy)"
+    agy || true
+    if agy_logged_in; then
+      say "agy: logged in"
+    else
+      say "agy: could not confirm login; run agy to check"
+    fi
+  fi
+  if cursor-agent status 2>/dev/null | grep -q -i 'logged in as'; then
+    say "cursor-agent: already logged in"
+  else
+    say "cursor-agent: log in (open the URL it prints on another machine)"
+    NO_OPEN_BROWSER=1 cursor-agent login
+    cursor-agent status || say "cursor-agent: not logged in: run devbox login again"
   fi
 
   az_login "$config"
@@ -1155,7 +1179,8 @@ install_skill() {
 
 # After login: this box's own SSH key on GitHub for auth and signing, git
 # signing, the base and client skills (mattpocock's through npx skills), the
-# client's plugins, the herdr plugins, then repos.
+# client's plugins, the herdr plugins, agy and cursor-agent (when missing),
+# then repos.
 finish() {
   local config title skill repo id
   config="$(stored_config)" || exit 1
@@ -1188,6 +1213,8 @@ finish() {
   say "plugins: all installed"
   herdr_plugins
   say "herdr: plugins installed"
+  install_agy || true
+  install_cursor_agent || true
 
   sync_repos "$config"
   mkdir -p "${FINISHED%/*}"
@@ -1314,6 +1341,68 @@ update_claude() {
   [[ $before == "$after" ]] || changed "claude: updated ${before%% *} -> ${after%% *}"
 }
 
+# agy and cursor-agent, each from its vendor's installer, for the box user.
+# Both end in ~/.local/bin, already on the box user's PATH.
+# install_vendor_cli <name> <installer url>: returns 1 when already installed.
+install_vendor_cli() {
+  local name="$1" url="$2"
+  [[ -x $USER_HOME/.local/bin/$name ]] && return 1
+  # pipefail: a failed download must not read as an install.
+  # shellcheck disable=SC2016 # $1 expands in the inner shell
+  as_user bash -c 'set -o pipefail; curl -fsSL "$1" | bash' _ "$url" </dev/null
+  [[ -x $USER_HOME/.local/bin/$name ]] || die "$name: install failed"
+  say "$name: installed (run devbox login to sign in)"
+}
+
+install_agy() { install_vendor_cli agy https://antigravity.google/cli/install.sh; }
+install_cursor_agent() { install_vendor_cli cursor-agent https://cursor.com/install; }
+
+# agy has no status command we can rely on (unverified); no output or a
+# failure counts as not logged in.
+agy_logged_in() {
+  timeout 20 agy auth status </dev/null 2>/dev/null |
+    grep -i -E 'logged in|authenticated' | grep -q -v -i -E 'not|false'
+}
+
+# agy's installer exits early when ~/.local/bin/agy exists and never upgrades,
+# so this reinstalls it each run: the old binary is moved aside, the vendor
+# installer runs, and the old one comes back if that fails (a failed download
+# never leaves the box without agy). Reports only when the binary's hash moved,
+# so an identical reinstall stays "up to date". (The installer's -d flag is not
+# used: it also runs `agy install --dir`, which may wire that dir into the
+# shell setup.)
+update_agy() {
+  local bin="$USER_HOME/.local/bin/agy" before="" after
+  if [[ -e $bin ]]; then
+    before="$(sha256sum <"$bin")"
+    mv -f "$bin" "$bin.old"
+  fi
+  # A subshell: install_agy dies on failure, and the old binary must come back.
+  if ! (install_agy); then
+    [[ ! -e $bin.old ]] || mv -f "$bin.old" "$bin"
+    return 1
+  fi
+  after="$(sha256sum <"$bin")"
+  rm -f "$bin.old"
+  if [[ -z $before ]]; then
+    changed "agy: installed"
+  elif [[ $before != "$after" ]]; then
+    changed "agy: updated"
+  fi
+}
+
+update_cursor_agent() {
+  local before after
+  if install_cursor_agent; then
+    changed "cursor-agent: installed"
+    return 0
+  fi
+  before="$(cursor-agent --version)"
+  cursor-agent update >/dev/null </dev/null
+  after="$(cursor-agent --version)"
+  [[ $before == "$after" ]] || changed "cursor-agent: updated $before -> $after"
+}
+
 # The lazy.nvim plugins, "<name> <commit>", one per line.
 nvim_plugin_heads() {
   local dir
@@ -1362,6 +1451,8 @@ update() {
   fi
   run_step mise update_mise
   run_step claude update_claude
+  run_step agy update_agy
+  run_step cursor-agent update_cursor_agent
   [[ -z $(ado_orgs "$config") ]] || run_step az update_az
   run_step configs copy_configs
   run_step nvim update_nvim
