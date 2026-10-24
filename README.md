@@ -103,9 +103,12 @@ Prints `defaults.yaml` merged with the client's file
 (`$DEVBOX_CLIENTS/clients/<client>.yaml`), as YAML (or JSON with
 `--json`). Mappings merge key by key, lists replace, except `skills`, which
 appends the client's extras to the base list (duplicates dropped). `hostname` defaults to
-`dev-<client>`. `role` is `devbox` (the default) or `runner` (see [Runner
-boxes](#runner-boxes)); `claude_account` is required only for a devbox, and a
-runner starts from `runner_resources` instead of `resources`. `runners`
+`dev-<client>`. `role` is `devbox` (the default), `runner` (see [Runner
+boxes](#runner-boxes)) or `hub` (see [Hub box](#hub-box)); `claude_account`
+is required only for a devbox, a runner starts from `runner_resources`
+instead of `resources`, and a hub from `hub_resources`. A hub may not set
+`claude_account`, `git_name`, `git_email`, `tools`, `skills`, `plugins` or
+`repos` (`<field>: not allowed when role is hub`). `runners`
 (`org`, `labels`, `max_jobs`) is allowed only on a runner, where `org` and a
 non-empty `labels` are required; only a runner's resolved config has it. `host`, the ssh name of the Proxmox host the box runs on
 (as in `ssh root@<host>`), defaults to empty, meaning `$DEVBOX_HOST`; it is
@@ -256,7 +259,7 @@ The developer-machine side of each box, run on your machine (WSL):
   exits 1); run `bin/devbox-host add <client>` again after logging in. It
   accepts the box's new host key first (over Tailscale, so trusting it on
   first use is safe), since herdr has no terminal to ask. A client whose
-  resolved config has `role: runner` gets no herdr machine: `add` (and
+  resolved config has `role: runner` or `role: hub` gets no herdr machine: `add` (and
   `--dry-run`) says so and removes one saved earlier for that hostname; it
   still gets both ssh config entries.
 
@@ -266,7 +269,7 @@ each host a client file in `$DEVBOX_CLIENTS` names in `host`, plus
 blocks list exactly the boxes found across those hosts, herdr machines and
 host keys of boxes on none of them are removed, and missing herdr machines
 are added, labelled with the client whose file resolves to that hostname, or
-the hostname. A runner box's herdr machine is removed instead of added (a box
+the hostname. A runner or hub box's herdr machine is removed instead of added (a box
 no client file resolves to counts as a devbox). Boxes are matched by hostname, not VMID, since VMIDs on two
 hosts can coincide. `sync` refuses to change anything when a host can't be
 listed, when a client file doesn't resolve, or when a client sets no `host`
@@ -276,8 +279,8 @@ because another lacks it. It warns of a hostname found on several hosts.
 counts as a failure there, though the `host` it names is still checked):
 listed in both configs, its MagicDNS name
 resolves, `ssh daniel@<hostname> true` works from WSL and from Windows
-(`ssh.exe`), and its herdr machine is reachable (for a runner box: that it
-has none); it also flags entries for
+(`ssh.exe`), and its herdr machine is reachable (for a runner or hub box:
+that it has none); it also flags entries for
 boxes that are gone, and exits 1 on any failure.
 
 With nothing changed, `add`, `remove` and `sync` write nothing. The MagicDNS
@@ -621,7 +624,9 @@ Access controls), with `<you>` your own login:
 
 Merge these into your existing policy, and remove the default allow-all
 rule (`"src": ["*"], "dst": ["*:*"]`) or any other rule whose `src` matches
-`tag:devbox`, or boxes can reach everything again. Check from a box that
+`tag:devbox`, or boxes can reach everything again. The one exception is the
+tk-hub: with a [hub box](#hub-box), one grant lets boxes reach its HTTPS port
+and nothing else. Check from a box that
 `nc -zv dev-<other-client> 22` fails.
 
 ## Runner boxes
@@ -822,6 +827,102 @@ here. So use
 `schedule`, `workflow_dispatch` or `push` to `main`; never in public repos,
 and never on `pull_request` (or `pull_request_target`), where code from a
 branch or a fork would run with those rights.
+
+## Hub box
+
+A client file with `role: hub` describes the tk-hub LXC: the self-hosted
+[ticket-board](https://github.com/DanielUlisses/ticket-board) control plane
+that shows and drives every devbox's ticket boards, over HTTPS on the
+tailnet. It is made, synced, backed up and destroyed by the same scripts as
+any box. Its client file sets the role and usually the hostname, which
+becomes its MagicDNS name and so its URL:
+
+```yaml
+role: hub
+hostname: tk-hub
+```
+
+- **What it gets.** `devbox bootstrap` installs only the base packages the
+  hub needs (`git openssh curl sudo jq go-yq unzip less mise uv
+  tailscale`) and Tailscale: no Docker, Claude, herdr, skills, plugins,
+  nvim, dotfiles, mise dev tools, repos or git identity. A hub client may
+  not set `claude_account`, `git_name`, `git_email`, `tools`, `skills`,
+  `plugins` or `repos`; `packages` still adds pacman packages.
+- **tk-hub.** `devbox sync` clones (or fetches) DanielUlisses/ticket-board
+  into `/opt/ticket-board`, at its default branch's head, owned by `daniel`,
+  and runs its `install.sh hub` as `daniel`: the hub-server venv in
+  `~/.local/share/tk-hub/hub-venv`, `hub-web` built into
+  `/opt/ticket-board/hub-web/dist` (node through mise), the SQLite database
+  in `/var/lib/tk-hub/hub.db`, the `tk-hub` system unit on
+  `127.0.0.1:8000`, and `tailscale serve` publishing it on
+  `https://<hostname>.<tailnet>.ts.net`. Re-running it changes nothing
+  unless ticket-board changed, and restarts the unit only when what it runs
+  did. Its first install takes the HTTPS name from Tailscale, so until
+  `devbox login` has joined the tailnet sync only clones. `devbox update`
+  on a hub (as `daniel` or root) does the same pull and install.
+- **Logins.** `devbox login` asks only for Tailscale, joining as
+  **`tag:tk-hub`**; then run `devbox sync` to install tk-hub. No gh,
+  1Password, Claude or az. `devbox finish` refuses on a hub. `tailscale
+  serve` needs MagicDNS and HTTPS certificates on in the tailnet (admin
+  console, DNS); when they are off, `tailscale serve` (which `install.sh
+  hub` runs) prints the URL to turn them on.
+- **Resources.** `defaults.yaml`'s `hub_resources` replaces `resources`:
+  2 GB memory plus 1 GB swap (the web build is the peak), 2 cores, a 12 GB
+  disk, CPU weight 50. A hub's own `resources:` still overrides it key by
+  key.
+- **No herdr machine.** You reach the hub as `daniel` over Tailscale SSH
+  (`ssh <hostname>`), not through herdr, as with a runner box.
+- **Backups.** Unlike a runner, the hub holds state worth keeping, its
+  database (token hashes, devbox registry, activity log; the boards
+  themselves live on the boxes), so set `backup: true` where the host
+  allows it.
+
+**Tailnet policy.** Merge these into the policy from [Tailscale
+ACL](#tailscale-acl):
+
+```jsonc
+{
+  "tagOwners": {
+    // devbox login on a hub advertises this tag; only you may apply it.
+    "tag:tk-hub": ["<you>"]
+  },
+  "grants": [
+    // Your own devices open the hub's web UI (and ssh in, below).
+    { "src": ["<you>"], "dst": ["tag:tk-hub"], "ip": ["*"] },
+    // Each devbox's tk-daemon connects out to the hub's HTTPS port, and
+    // to nothing else. Nothing grants tag:tk-hub as a source.
+    { "src": ["tag:devbox"], "dst": ["tag:tk-hub"], "ip": ["tcp:443"] }
+  ],
+  "ssh": [
+    {
+      "action": "accept",
+      "src":    ["<you>"],
+      "dst":    ["tag:tk-hub"],
+      "users":  ["daniel"]
+    }
+  ]
+}
+```
+
+Boxes run with `--accept-dns=false`, so a daemon connects to the hub's
+tailnet IP and verifies TLS against its MagicDNS name. Check from a devbox
+that `curl -sS --resolve <hub name>:443:<hub ip> https://<hub name>/`
+answers, where `<hub name>` is `<hostname>.<tailnet>.ts.net` and `<hub ip>`
+is `tailscale ip -4` on the hub, and that `nc -zv <hub ip> 22` still fails.
+
+**A daemon token per devbox.** The hub keeps only a hash of each token. On
+the hub, as `daniel`, mint one for a devbox, named by its short hostname
+(`dev-<client>`, the name its daemon reports):
+
+```
+TK_HUB_DB=/var/lib/tk-hub/hub.db ~/.local/share/tk-hub/hub-venv/bin/hub-server token add dev-<client>
+```
+
+It prints the token once. Store it in a 1Password item the devbox's service
+account can read; the daemon reads it from there at start, with
+`--token-ref op://<vault>/<item>/<field>`, and never writes it to a file.
+`hub-server token revoke dev-<client>` drops it; the daemon is refused on
+its next connect. Minting again for the same devbox needs a revoke first.
 
 ## The Proxmox host
 

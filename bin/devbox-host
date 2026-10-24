@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # The developer-machine side of each devbox: a herdr machine (none for a
-# role: runner box), a Host entry in
+# role: runner or hub box), a Host entry in
 # the WSL ~/.ssh/config and in the Windows one VS Code Remote-SSH reads, and
 # no stale host keys in either known_hosts. devbox-create and devbox-destroy
 # call it; sync rebuilds it all from the boxes on every Proxmox host (each
@@ -29,7 +29,7 @@ Manage this machine's side of the devboxes: for each box, a
 ~/.ssh/config and, on WSL, in the Windows ssh config VS Code reads
 (\$DEVBOX_WINDOWS_SSH_CONFIG, default %USERPROFILE%\\.ssh\\config), and a
 herdr machine $SSH_USER@<hostname> labelled with the client (none for a
-role: runner box: its existing one is removed). Only the
+role: runner or hub box: its existing one is removed). Only the
 block between '$BEGIN_MARK' and '$END_MARK' is ever
 edited; the file is backed up to <file>.devboxes.bak before the first write.
 
@@ -248,10 +248,11 @@ client_hostname_role() {
 }
 
 # Herdr for box <host $1> of role $3, labelled $2: a devbox gets its herdr
-# machine; a runner (reached by ssh only) gets none, and loses one saved before.
+# machine; a runner or hub (reached by ssh only, no herdr there) gets none,
+# and loses one saved before.
 herdr_for_role() {
-  if [[ $3 == runner ]]; then
-    say "herdr: $1 is a runner box; no herdr machine"
+  if [[ $3 == runner || $3 == hub ]]; then
+    say "herdr: $1 is a $3 box; no herdr machine"
     herdr_remove "$1"
   else
     herdr_add "$1" "$2"
@@ -443,9 +444,9 @@ cmd_doctor() {
       check "ssh $SSH_USER@$host true (Windows)" ssh_ok "$host" ssh.exe -F "$(wslpath -w "$windows_config")"
     fi
     role="$(awk -v h="$host" '$1 == h {print $4; exit}' <<<"$entries")"
-    if [[ $role == runner ]] && command -v herdr >/dev/null; then
+    if [[ $role == runner || $role == hub ]] && command -v herdr >/dev/null; then
       id="$(herdr_id "$host")" || id=""
-      check "no herdr machine $SSH_USER@$host (runner box${id:+; sync drops it})" test -z "$id"
+      check "no herdr machine $SSH_USER@$host ($role box${id:+; sync drops it})" test -z "$id"
     elif command -v herdr >/dev/null; then
       id="$(herdr_id "$host")" || id=""
       status="$([[ -z $id ]] || herdr machine status --json "$id" | jq -r '.[0].status // empty')" || status=""

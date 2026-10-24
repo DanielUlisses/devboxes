@@ -87,10 +87,11 @@ check_config() {
 #   2. the validator accepts it: a client setting the key to its default
 #      value resolves (hostname is derived, so it has no default to set);
 #   3. `devbox-config --json _template` outputs it.
-# Three keys are special, by design:
+# Four keys are special, by design:
 #   runner_resources  defaults.yaml only: a client file may not set it (2), and
 #                     the merge folds it into a runner's `resources` (3), so
 #                     (3) compares that to the runner's output.
+#   hub_resources     the same, for a hub client.
 #   runners           runner role only: (2) uses a runner client, and (3) looks
 #                     for it in a runner client's output, not the template's.
 #   claude_account    in the output but not in defaults.yaml (it has no
@@ -120,9 +121,9 @@ check_schema() {
   mapfile -t keys <<<"$ykeys"
   keys+=(hostname)
 
-  # Resolved output of a devbox (the template) and of a runner. If either
+  # Resolved output of a devbox (the template), a runner and a hub. If any
   # fails, 2 and 3 are skipped; errors naming a key are kept for that key.
-  local resolved=1 tmpl_json runner_json tmpl_keys runner_keys err="" line lk
+  local resolved=1 tmpl_json runner_json hub_json tmpl_keys runner_keys hub_keys err="" line lk
   local -A key_errs=()
   local generic=()
   tmpl_json="$("$ROOT/bin/devbox-config" --json _template 2>"$schema_err")" || resolved=0
@@ -135,6 +136,13 @@ check_schema() {
     else
       resolved=0
       fail "schema/runner" "a minimal runner client did not resolve" "$(<"$schema_err")"
+    fi
+    printf 'role: hub\n' >"$scratch/hub.yaml"
+    if hub_json="$(schema_resolve "$scratch/hub.yaml")"; then
+      hub_keys="$(jq -r 'keys[]' <<<"$hub_json")"
+    else
+      resolved=0
+      fail "schema/hub" "a minimal hub client did not resolve" "$(<"$schema_err")"
     fi
   else
     while IFS= read -r line; do
@@ -166,7 +174,7 @@ check_schema() {
     # 2. accepted by the validator
     if [[ -n ${key_errs[$k]:-} ]]; then
       problems+=("2 (validator): ${key_errs[$k]}")
-    elif ((resolved)) && [[ $k != hostname && $k != runner_resources ]]; then
+    elif ((resolved)) && [[ $k != hostname && $k != runner_resources && $k != hub_resources ]]; then
       file="$scratch/key.yaml"
       if [[ $k == runners ]]; then
         yq '{"role": "runner", "runners": .["runners"]} | .runners.org = "example-org" | .runners.labels = ["homelab"]' \
@@ -186,6 +194,10 @@ check_schema() {
           jq -e --argjson want "$(yq -o=json '.["runner_resources"]' "$ROOT/defaults.yaml")" \
             '.resources == $want' <<<"$runner_json" >/dev/null ||
             problems+=("3 (resolved output): a runner client's resources differ from defaults.yaml runner_resources") ;;
+        hub_resources)
+          jq -e --argjson want "$(yq -o=json '.["hub_resources"]' "$ROOT/defaults.yaml")" \
+            '.resources == $want' <<<"$hub_json" >/dev/null ||
+            problems+=("3 (resolved output): a hub client's resources differ from defaults.yaml hub_resources") ;;
         runners) grep -qx "$k" <<<"$runner_keys" ||
           problems+=("3 (resolved output): '$k' missing from a runner client's output") ;;
         *) grep -qx "$k" <<<"$tmpl_keys" ||
@@ -207,7 +219,7 @@ check_schema() {
     while IFS= read -r extra; do
       [[ $extra == claude_account ]] || printf '%s\n' "${keys[@]}" | grep -qx "$extra" ||
         { fail "schema/$extra" "assertion 3 (resolved output): '$extra' is output but is not a defaults.yaml key or hostname"; bad=$((bad + 1)); }
-    done < <(printf '%s\n%s\n' "$tmpl_keys" "$runner_keys" | sort -u)
+    done < <(printf '%s\n%s\n%s\n' "$tmpl_keys" "$runner_keys" "$hub_keys" | sort -u)
   fi
 
   printf 'schema: %d keys checked, %d failed (%d assertion failures)%s\n' \

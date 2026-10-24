@@ -1,0 +1,5 @@
+# expect: runners: allowed only when role is runner (role is hub)
+role: hub
+runners:
+  org: some-org
+  labels: [linux]
