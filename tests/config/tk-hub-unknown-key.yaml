@@ -1,0 +1,9 @@
+# expect: tk_hub.extra: unknown field
+role: devbox
+claude_account: work
+tools: [uv@latest]
+tk_hub:
+  url: https://hub.example.ts.net
+  ip: 100.64.0.10
+  token_ref: op://vault/item/token
+  extra: x

@@ -1,0 +1,8 @@
+# expect: tk_hub.url: must be an https URL
+role: devbox
+claude_account: work
+tools: [uv@latest]
+tk_hub:
+  url: http://hub.example.ts.net
+  ip: 100.64.0.10
+  token_ref: op://vault/item/token

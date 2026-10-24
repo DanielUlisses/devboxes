@@ -1,0 +1,7 @@
+# expect: tk_hub: needs uv
+role: devbox
+claude_account: work
+tk_hub:
+  url: https://hub.example.ts.net
+  ip: 100.64.0.10
+  token_ref: op://vault/item/token
