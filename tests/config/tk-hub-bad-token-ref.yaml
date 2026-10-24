@@ -1,0 +1,8 @@
+# expect: tk_hub.token_ref: must be an op://
+role: devbox
+claude_account: work
+tools: [uv@latest]
+tk_hub:
+  url: https://hub.example.ts.net
+  ip: 100.64.0.10
+  token_ref: abc123

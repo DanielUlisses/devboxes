@@ -54,6 +54,10 @@ skills:
 
 plugins: []
 
+# A devbox's ticket-board hub (url, ip, token_ref): none by default. Set in a
+# client file only; see clients/_template.yaml.
+tk_hub:
+
 repos: []
 
 # Proxmox backup job for the box (vzdump, snapshot mode, zstd), to the

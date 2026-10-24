@@ -88,6 +88,22 @@ skills: []
 #   - marketplace: example-org/example-marketplace-repo
 #     plugin: example-plugin@example-marketplace
 
+# ticket-board hub this devbox's daemon connects to. All three keys required:
+# `url` the hub's https MagicDNS URL, `ip` its tailnet IP (boxes run with
+# --accept-dns=false, so the daemon needs it to resolve the URL), `token_ref`
+# the op:// reference of this box's daemon token (the token itself is never
+# stored here). When set, `devbox finish`, `sync` and `update` clone
+# DanielUlisses/ticket-board into ~/.claude/skill-repos and run
+# `install.sh daemon --url ... --ip ... --token-ref ...`. Devbox only, and it
+# needs `uv@latest` in `tools` (the daemon install runs on uv). The hub prints
+# its address as wss://<host>/ws/daemon; here `url` is https://<host>. Unset
+# changes nothing on the box; removing the field later leaves an installed
+# daemon in place, it is not undone.
+# tk_hub:
+#   url: https://hub.example-tailnet.ts.net
+#   ip: 100.64.0.10
+#   token_ref: op://example-vault/example-item/token
+
 # Repos to clone into ~/work/<repo>: GitHub ones as <owner>/<repo>, Azure
 # DevOps ones as their SSH URL, git@ssh.dev.azure.com:v3/<org>/<project>/<repo>.
 # `devbox finish` and `devbox sync` clone newly listed ones; removed ones are

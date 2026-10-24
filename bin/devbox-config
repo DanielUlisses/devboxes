@@ -145,11 +145,27 @@ def runners($p; $required):
     (.max_jobs | int_min("\($p).max_jobs"; 1))
   end;
 
+# A devbox'"'"'s ticket-board hub: https URL, the hub'"'"'s tailnet IP (CGNAT
+# 100.64.0.0/10, or Tailscale IPv6 fd7a:115c:a1e0::/48), and an op:// reference.
+def tk_hub($p):
+  "(25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})" as $o
+  | if . == null then empty
+  elif type != "object" then err($p; "must be a mapping of url, ip and token_ref \(got)")
+  else
+    unknown_keys("\($p)."; ["url", "ip", "token_ref"]),
+    (.url | if . == null then err("\($p).url"; "required")
+      else str_match("\($p).url"; "^https://[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?(:[0-9]{1,5})?/?$"; "an https URL like https://hub.example.ts.net") end),
+    (.ip | if . == null then err("\($p).ip"; "required")
+      else str_match("\($p).ip"; "^(100\\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\\.\($o)\\.\($o)|fd7a:115c:a1e0:[0-9a-f:]+)$"; "a tailnet IP (100.64.0.0/10 or fd7a:115c:a1e0::/48)") end),
+    (.token_ref | if . == null then err("\($p).token_ref"; "required")
+      else str_match("\($p).token_ref"; "^op://[^/@[:space:]]+/[^/@[:space:]]+(/[^/@[:space:]]+){1,2}$"; "an op://<vault>/<item>/<field> reference") end)
+  end;
+
 if . == null then {} else . end
 | if type != "object" then err("(top level)"; "must be a mapping of fields \(got)")
   else
     unknown_keys(""; ["hostname", "host", "role", "claude_account", "git_name", "git_email", "resources", "packages", "tools", "skills",
-                     "repos", "plugins", "timezone", "backup", "backup_schedule", "backup_keep", "runners"]
+                     "repos", "plugins", "timezone", "backup", "backup_schedule", "backup_keep", "runners", "tk_hub"]
                      + if $required then [] else ["runner_resources"] end),
 
     (.hostname | str_match("hostname"; "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$";
@@ -196,6 +212,15 @@ if . == null then {} else . end
        then err("plugins"; "not allowed when role is runner")
        else .plugins | plugins("plugins") end),
 
+    # The hub daemon runs on a devbox only.
+    ((.role // $default_role) as $role
+     | if $required and $role != "devbox" and .tk_hub != null
+       then err("tk_hub"; "allowed only when role is devbox (role is \($role))")
+       elif $required and .tk_hub != null and ((.tools // []) | any(type == "string" and startswith("uv@")) | not)
+       then err("tk_hub"; "needs uv (the daemon install runs on it): add uv@latest to tools"),
+            (.tk_hub | tk_hub("tk_hub"))
+       else .tk_hub | tk_hub("tk_hub") end),
+
     (.backup | if . == null or type == "boolean" then empty
                else err("backup"; "must be true or false \(got)") end),
     (.backup_schedule | str_match("backup_schedule"; "^[A-Za-z0-9][A-Za-z0-9 :.,*/~+-]*$";
@@ -222,8 +247,9 @@ def strip_nulls: if type == "object" then with_entries(select(.value != null) | 
 | ($d * $c)
 | .hostname //= "dev-\($name)"
 | .skills = (reduce (($d.skills // []) + ($c.skills // []))[] as $s ([]; if IN(.[]; $s) then . else . + [$s] end))
-| {hostname, host, role, claude_account, git_name, git_email, resources, packages, tools, skills, repos, plugins, timezone, backup, backup_schedule, backup_keep, runners}
+| {hostname, host, role, claude_account, git_name, git_email, resources, packages, tools, skills, repos, plugins, timezone, backup, backup_schedule, backup_keep, runners, tk_hub}
 | if .role == "runner" then . else del(.runners) end
+| if .role == "devbox" and .tk_hub != null then . else del(.tk_hub) end
 '
 
 # Prints the errors of one file, prefixed with its displayed path.

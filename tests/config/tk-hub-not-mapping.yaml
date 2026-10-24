@@ -1,0 +1,5 @@
+# expect: tk_hub: must be a mapping
+role: devbox
+claude_account: work
+tools: [uv@latest]
+tk_hub: https://hub.example.ts.net

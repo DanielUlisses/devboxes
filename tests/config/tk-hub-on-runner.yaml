@@ -1,0 +1,10 @@
+# expect: tk_hub: allowed only when role is devbox
+role: runner
+claude_account: work
+runners:
+  org: some-org
+  labels: [linux]
+tk_hub:
+  url: https://hub.example.ts.net
+  ip: 100.64.0.10
+  token_ref: op://vault/item/token

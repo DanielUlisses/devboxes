@@ -1071,6 +1071,18 @@ install_listed_plugin() {
   fi
 }
 
+# Clones $1 (<owner>/<repo>) into ~/.claude/skill-repos, or fast-forwards it.
+fetch_skill_repo() {
+  local repo="$1" dest="$SKILL_REPOS/${1#*/}"
+  if [[ -d $dest/.git ]]; then
+    git -C "$dest" pull -q --ff-only || say "skills: could not update ${dest/#$USER_HOME/\~}; using it as is"
+  else
+    say "skills: cloning $repo"
+    mkdir -p "$SKILL_REPOS"
+    gh repo clone "$repo" "$dest" -- -q
+  fi
+}
+
 # Clones (or fast-forwards) a skill repo into ~/.claude/skill-repos and,
 # unless the commit it last installed is still its head, installs it the way
 # its layout says: its own install.sh, a plugin marketplace, or a single skill
@@ -1079,13 +1091,7 @@ install_listed_plugin() {
 install_skill_repo() {
   local repo="$1" dest="$SKILL_REPOS/${1#*/}" market plugin head installed=""
   local stamp="$dest/.git/devbox-installed"
-  if [[ -d $dest/.git ]]; then
-    git -C "$dest" pull -q --ff-only || say "skills: could not update ${dest/#$USER_HOME/\~}; using it as is"
-  else
-    say "skills: cloning $repo"
-    mkdir -p "$SKILL_REPOS"
-    gh repo clone "$repo" "$dest" -- -q
-  fi
+  fetch_skill_repo "$repo"
   head="$(git -C "$dest" rev-parse HEAD)"
   [[ ! -f $stamp ]] || installed="$(<"$stamp")"
   [[ $installed != "$head" ]] || return 0
@@ -1207,6 +1213,8 @@ finish() {
     install_skill "$skill"
   done < <(jq -r '.skills[]' <<<"$config")
   say "skills: all installed"
+  isolated install_tk_hub "$config"
+  ((STATUS == 0)) || say "tk-hub: failed; rerun devbox update"
   while IFS=' ' read -r repo id; do
     install_listed_plugin "$repo" "$id" </dev/null
   done < <(jq -r '(.plugins // [])[] | "\(.marketplace) \(.plugin)"' <<<"$config")
@@ -1250,6 +1258,30 @@ run_step() {
     FAILED+=("$name")
   elif (($(wc -l <"$CHANGES") == before)); then
     say "$name: up to date"
+  fi
+}
+
+# On a box with tk_hub set: ticket-board cloned like a skill repo and its tk
+# daemon installed (`install.sh daemon`). The stamp holds the commit and the
+# three values, so a change of either reruns it; install.sh is idempotent
+# itself. Nothing at all without tk_hub.
+install_tk_hub() {
+  local config="$1" url ip ref repo=DanielUlisses/ticket-board
+  local dest="$SKILL_REPOS/ticket-board" head want="" have=""
+  IFS=$'\t' read -r url ip ref < <(jq -r '(.tk_hub // empty) | [.url, .ip, .token_ref] | @tsv' <<<"$config") || true
+  [[ -n ${url:-} ]] || return 0
+  fetch_skill_repo "$repo"
+  head="$(git -C "$dest" rev-parse HEAD)"
+  want="$head $url $ip $ref"
+  local stamp="$dest/.git/devbox-tk-daemon"
+  [[ ! -f $stamp ]] || have="$(<"$stamp")"
+  [[ $have != "$want" ]] || return 0
+  bash "$dest/install.sh" daemon --url "$url" --ip "$ip" --token-ref "$ref" >/dev/null
+  printf '%s\n' "$want" >"$stamp"
+  if [[ -z $have ]]; then
+    changed "tk-hub: installed the tk daemon"
+  else
+    changed "tk-hub: updated the tk daemon (${head:0:7})"
   fi
 }
 
@@ -1441,6 +1473,7 @@ update() {
   trap 'rm -f "$CHANGES"' EXIT
 
   run_step skills update_skills "$config"
+  run_step tk-hub install_tk_hub "$config"
   run_step plugins install_new_plugins "$config"
   run_step plugin-versions update_plugins
   run_step herdr herdr_plugins
