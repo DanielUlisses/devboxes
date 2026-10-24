@@ -1,0 +1,3 @@
+# expect: claude_account: not allowed when role is hub
+role: hub
+claude_account: work
