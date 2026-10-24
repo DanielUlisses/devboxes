@@ -1,0 +1,7 @@
+# expect: ok
+# A hub client: its role, a hostname and an extra package.
+role: hub
+hostname: tk-hub
+packages: [htop]
+resources:
+  disk: 16G

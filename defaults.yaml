@@ -3,8 +3,9 @@
 # where the client's list is appended to the base list below.
 # `hostname` has no entry here: it defaults to dev-<client>.
 
-# What the box is for: devbox (a developer's box) or runner (a locked-down
-# box for CI runners, without the developer tooling or credentials).
+# What the box is for: devbox (a developer's box), runner (a locked-down
+# box for CI runners, without the developer tooling or credentials) or hub
+# (the tk-hub LXC: ticket-board's hub server behind tailscale serve).
 role: devbox
 
 # Proxmox host the box runs on, as its ssh name; empty means $DEVBOX_HOST.
@@ -31,6 +32,17 @@ runner_resources:
   swap_mb: 1024
   cores: 2
   disk: 16G
+  cpuunits: 50       # half a default guest's CPU weight
+  onboot: true
+
+# The resources of a role: hub box, in place of `resources` (its client's
+# own resources: still win key by key): tk-hub is one small web service and
+# SQLite, plus a node build of its web UI on install. Set here only.
+hub_resources:
+  memory_mb: 2048    # memory ceiling; the web build is the peak
+  swap_mb: 1024
+  cores: 2
+  disk: 12G          # venv, node_modules, the database
   cpuunits: 50       # half a default guest's CPU weight
   onboot: true
 

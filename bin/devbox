@@ -13,7 +13,9 @@
 # Claude Remote Control in a new herdr pane in ~/work. A role: runner box
 # gets only base packages, Docker, Tailscale, op, the pinned GitHub Actions
 # runner and its dispatcher: no Claude, skills, nvim, mise tools, repos or
-# git identity, and no finish; its update bumps the pinned runner.
+# git identity, and no finish; its update bumps the pinned runner. A role:
+# hub box (the tk-hub LXC) gets base packages, uv and Tailscale, and runs
+# ticket-board's install.sh hub on sync; it has no finish either.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
@@ -38,6 +40,16 @@ BASE_PACKAGES=(base-devel git openssh sudo stow jq go-yq unzip less mise github-
 # icu, which the Actions runner needs. sync_packages never removes a base
 # package of the box's role.
 RUNNER_PACKAGES=(git openssh curl sudo jq go-yq unzip less mise github-cli icu tailscale docker docker-buildx docker-compose)
+
+# A hub box's base packages instead: what ticket-board's install.sh hub needs
+# (uv, jq, tailscale; node comes through mise), no Docker or developer tooling.
+HUB_PACKAGES=(git openssh curl sudo jq go-yq unzip less mise uv tailscale)
+HUB_TAILSCALE_TAG=tag:tk-hub
+# The tk-hub repo (public, so cloned without gh), checked out at its default
+# branch's head, detached, and owned by the box user, who runs its install.sh
+# hub: the tk-hub unit serves its hub-web/dist from this checkout.
+HUB_REPO=https://github.com/DanielUlisses/ticket-board.git
+HUB_DIR=/opt/ticket-board
 
 # mise tools every box gets, kept in the system config so the client's tools:
 # list (the user config) can't drop them.
@@ -184,6 +196,13 @@ the dispatcher (bin/devbox-runner-dispatch) as a systemd unit; login asks
 only for tailscale ($RUNNER_TAILSCALE_TAG) and $RUNNER_USER's 1Password
 service-account token; update pins and installs the latest actions/runner.
 finish doesn't apply.
+
+On a role: hub box, bootstrap installs only base packages (with uv) and
+tailscale; sync pulls DanielUlisses/ticket-board into $HUB_DIR and, once
+tailscale is up, runs its install.sh hub as $USER_NAME (hub server, web
+build, tk-hub unit, tailscale serve on HTTPS); login asks only for tailscale
+($HUB_TAILSCALE_TAG); update does what sync does for tk-hub. finish doesn't
+apply.
 EOF
 }
 
@@ -261,7 +280,7 @@ resolve_config() {
       pull_clients
       json="$(DEVBOX_CLIENTS="$CLIENTS_DIR" "$ROOT/bin/devbox-config" --json "$client")" || exit 1
     else
-      say "config: gh is not logged in (a runner box has none), so using the last config this box was given ($CONFIG)"
+      say "config: gh is not logged in (a runner or hub box has none), so using the last config this box was given ($CONFIG)"
       json="$(stored_config)" || exit 1
     fi
   fi
@@ -274,7 +293,10 @@ resolve_config() {
 # marked explicit, so removing a client package never takes a base one along.
 base_packages() {
   local base=("${BASE_PACKAGES[@]}") missing=()
-  [[ $1 != runner ]] || base=("${RUNNER_PACKAGES[@]}")
+  case $1 in
+    runner) base=("${RUNNER_PACKAGES[@]}") ;;
+    hub) base=("${HUB_PACKAGES[@]}") ;;
+  esac
   mapfile -t missing < <(pacman -T -- "${base[@]}" || true)
   if ((${#missing[@]})); then
     say "base packages: installing ${missing[*]}"
@@ -297,7 +319,10 @@ sync_packages() {
   local -a wanted=()
   [[ -z $want ]] || mapfile -t wanted <<<"$want"
   local -a base=("${BASE_PACKAGES[@]}")
-  [[ $(box_role "$config") != runner ]] || base=("${RUNNER_PACKAGES[@]}")
+  case $(box_role "$config") in
+    runner) base=("${RUNNER_PACKAGES[@]}") ;;
+    hub) base=("${HUB_PACKAGES[@]}") ;;
+  esac
 
   if ((${#wanted[@]})); then
     # pacman -T prints the ones not installed.
@@ -678,6 +703,27 @@ runner_update() {
   say "updated (runner box)"
 }
 
+# A hub box's tk-hub, as root: clones or updates ticket-board in HUB_DIR as
+# the box user, then runs its install.sh hub as that user (it sudoes for the
+# system unit and tailscale serve, and changes nothing when nothing changed).
+# A first install takes the hub's https name from tailscale, so until devbox
+# login has joined the tailnet it only pulls.
+hub_tk() {
+  if [[ ! -d $HUB_DIR/.git ]]; then
+    install -d -o "$USER_NAME" -g "$USER_NAME" "$HUB_DIR"
+    as_user git clone -q "$HUB_REPO" "$HUB_DIR" || die "hub: could not clone $HUB_REPO"
+    say "hub: cloned $HUB_REPO into $HUB_DIR"
+  fi
+  as_user git -C "$HUB_DIR" fetch -q origin HEAD || die "hub: could not fetch $HUB_REPO"
+  as_user git -C "$HUB_DIR" -c advice.detachedHead=false checkout -q --detach FETCH_HEAD ||
+    die "hub: could not check out $HUB_REPO"
+  if ! tailscale_up; then
+    say "hub: tailscale is not up; install.sh hub waits for devbox login, then devbox sync"
+    return
+  fi
+  as_user "$HUB_DIR/install.sh" hub || die "hub: $HUB_DIR/install.sh hub failed (above)"
+}
+
 # $2: --no-pacman-upgrade, passed on to update, or empty.
 sync() {
   local config no_upgrade="${2:-}" before role
@@ -698,6 +744,11 @@ sync() {
     runner_release
     runner_dispatcher "$config"
     say "synced (runner box)"
+    return
+  fi
+  if [[ $role == hub ]]; then
+    hub_tk
+    say "synced (hub box)"
     return
   fi
   sync_tools "$config"
@@ -850,16 +901,23 @@ runner_login() {
   say "logged in (runner box: no finish)"
 }
 
+# A hub box's login: tailscale only, as HUB_TAILSCALE_TAG. No gh, 1Password,
+# Claude or az. Its tk-hub install waits for the tailnet, so sync comes next.
+hub_login() {
+  tailscale_join "$HUB_TAILSCALE_TAG"
+  say "logged in (hub box: no finish); next: devbox sync, which installs tk-hub"
+}
+
 # The manual logins (tailscale, gh, 1Password, Claude, agy, cursor-agent, az).
 # Each step skips when already done, so re-running only
 # asks for what's missing.
 login() {
   local config account token scopes
   config="$(stored_config)" || exit 1
-  if [[ $(box_role "$config") == runner ]]; then
-    runner_login
-    return
-  fi
+  case $(box_role "$config") in
+    runner) runner_login; return ;;
+    hub) hub_login; return ;;
+  esac
   account="$(jq -r .claude_account <<<"$config")"
   scopes="$(IFS=,; echo "${GH_SCOPES[*]}")"
 
@@ -1190,7 +1248,9 @@ install_skill() {
 finish() {
   local config title skill repo id
   config="$(stored_config)" || exit 1
-  [[ $(box_role "$config") != runner ]] || die "a runner box has no finish: devbox login is its last step"
+  case $(box_role "$config") in
+    runner | hub) die "a $(box_role "$config") box has no finish: devbox login is its last step" ;;
+  esac
   title="$(jq -r .hostname <<<"$config")" # dev-<client> unless the client file sets one
   gh_logged_in || die "gh is not logged in: run devbox login first"
   gh_has_scopes || die "gh lacks the ${GH_SCOPES[*]} scopes: run devbox login again"
@@ -1682,6 +1742,13 @@ bootstrap() {
     say "tailscale: no systemd, tailscaled not started"
   fi
 
+  if [[ $role == hub ]]; then
+    # No Docker, Claude, mise tools or dotfiles: tk-hub comes with the sync
+    # (its install waits for devbox login to join the tailnet).
+    sync
+    return
+  fi
+
   say "docker"
   docker_setup
 
@@ -1724,16 +1791,25 @@ main() {
   esac
   [[ -f $STATE/client ]] || die "no client recorded in $STATE/client: is this a devbox? (bootstrap.sh records it)"
 
-  # A runner box's update bumps its pinned runner, as root.
+  # A runner box's update bumps its pinned runner, a hub box's pulls and
+  # reinstalls tk-hub, as root.
   if [[ $cmd == update ]]; then
     local config="$config_json"
     [[ -n $config ]] || config="$(stored_config)" || exit 1
     check_config "$config"
-    if [[ $(box_role "$config") == runner ]]; then
-      ((EUID == 0)) || exec sudo "$0" "${args[@]}"
-      runner_update
-      return
-    fi
+    case $(box_role "$config") in
+      runner)
+        ((EUID == 0)) || exec sudo "$0" "${args[@]}"
+        runner_update
+        return
+        ;;
+      hub)
+        ((EUID == 0)) || exec sudo "$0" "${args[@]}"
+        hub_tk
+        say "updated (hub box)"
+        return
+        ;;
+    esac
   fi
 
   case "$cmd" in

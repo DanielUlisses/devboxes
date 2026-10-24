@@ -1,0 +1,4 @@
+# expect: repos: not allowed when role is hub
+role: hub
+repos:
+  - some-org/some-repo

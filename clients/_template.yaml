@@ -11,11 +11,16 @@
 # VM hostname. Default: dev-<client>.
 # hostname: dev-example
 
-# What the box is for: devbox, a developer's box, or runner, a locked-down
+# What the box is for: devbox, a developer's box; runner, a locked-down
 # box for CI runners: base packages, Docker, Tailscale (as tag:runner) and
 # op only, no Claude, skills, nvim, mise tools, repos or git identity, and
-# the smaller resources in defaults.yaml's runner_resources. A runner usually
-# sets hostname too, to drop the dev- prefix. Default: devbox.
+# the smaller resources in defaults.yaml's runner_resources; or hub, the
+# tk-hub LXC: base packages, uv and Tailscale (as tag:tk-hub), and
+# DanielUlisses/ticket-board's `install.sh hub`, with defaults.yaml's
+# hub_resources. A hub may not set claude_account, git_name, git_email,
+# tools, skills, plugins or repos. A runner or hub usually sets hostname
+# too, to drop the dev- prefix (a hub: tk-hub). See README.md, Runner boxes
+# and Hub box. Default: devbox.
 # role: devbox
 
 # Proxmox host the box runs on: a label, the host's ssh name (as in
@@ -34,7 +39,8 @@
 #   max_jobs: 2          # jobs run at once (>= 1); default 2
 
 # Which Claude account the devbox signs in with: a label, never an email.
-# Required when role is devbox; a runner box has no Claude.
+# Required when role is devbox; a runner box has no Claude, and a hub box
+# may not set it.
 claude_account: example
 
 # Git identity for commits in the box, written to ~/.gitconfig.local by
@@ -46,7 +52,8 @@ claude_account: example
 # git_email: <name>@<client-domain>
 
 # VM resources. Each key is optional; shown values are the defaults for a
-# devbox (a runner's are runner_resources in defaults.yaml).
+# devbox (a runner's are runner_resources in defaults.yaml, a hub's
+# hub_resources).
 # resources:
 #   memory_mb: 10240   # memory ceiling, in MB
 #   swap_mb: 2048      # swap, in MB (0 disables it)
@@ -56,8 +63,9 @@ claude_account: example
 #   onboot: true       # start the VM when the host boots
 
 # Runner boxes use defaults.yaml's runner_resources in place of these
-# defaults; it is not a client field.
+# defaults, and hub boxes its hub_resources; neither is a client field.
 # runner_resources: (defaults.yaml only)
+# hub_resources: (defaults.yaml only)
 
 # Extra pacman packages, on top of the base image.
 packages:
