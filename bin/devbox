@@ -1449,38 +1449,27 @@ install_vendor_cli() {
 install_agy() { install_vendor_cli agy https://antigravity.google/cli/install.sh; }
 install_cursor_agent() { install_vendor_cli cursor-agent https://cursor.com/install; }
 
-# agy has no status command we can rely on (unverified); no output or a
-# failure counts as not logged in.
+# agy has no auth status command; `agy models` exits 1 with "Please sign in"
+# when logged out, and lists the models when logged in.
 agy_logged_in() {
-  timeout 20 agy auth status </dev/null 2>/dev/null |
-    grep -i -E 'logged in|authenticated' | grep -q -v -i -E 'not|false'
+  timeout 30 agy models </dev/null &>/dev/null
 }
 
 # agy's installer exits early when ~/.local/bin/agy exists and never upgrades,
-# so this reinstalls it each run: the old binary is moved aside, the vendor
-# installer runs, and the old one comes back if that fails (a failed download
-# never leaves the box without agy). Reports only when the binary's hash moved,
-# so an identical reinstall stays "up to date". (The installer's -d flag is not
-# used: it also runs `agy install --dir`, which may wire that dir into the
-# shell setup.)
+# and runs `agy install`, which edits ~/.bashrc and so fails on the dotfiles
+# symlink into root-owned /opt/devboxes. So the installer runs only when agy
+# is missing, and `agy update` upgrades it in place. Reports only when the
+# binary's hash moved.
 update_agy() {
-  local bin="$USER_HOME/.local/bin/agy" before="" after
-  if [[ -e $bin ]]; then
-    before="$(sha256sum <"$bin")"
-    mv -f "$bin" "$bin.old"
-  fi
-  # A subshell: install_agy dies on failure, and the old binary must come back.
-  if ! (install_agy); then
-    [[ ! -e $bin.old ]] || mv -f "$bin.old" "$bin"
-    return 1
-  fi
-  after="$(sha256sum <"$bin")"
-  rm -f "$bin.old"
-  if [[ -z $before ]]; then
+  local bin="$USER_HOME/.local/bin/agy" before after
+  if install_agy; then
     changed "agy: installed"
-  elif [[ $before != "$after" ]]; then
-    changed "agy: updated"
+    return 0
   fi
+  before="$(sha256sum <"$bin")"
+  agy update >/dev/null </dev/null
+  after="$(sha256sum <"$bin")"
+  [[ $before == "$after" ]] || changed "agy: updated"
 }
 
 update_cursor_agent() {
