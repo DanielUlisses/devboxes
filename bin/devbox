@@ -1436,13 +1436,18 @@ update_claude() {
 # agy and cursor-agent, each from its vendor's installer, for the box user.
 # Both end in ~/.local/bin, already on the box user's PATH.
 # install_vendor_cli <name> <installer url>: returns 1 when already installed.
+# The installer's output shows only on failure: agy's always tries to add PATH
+# to ~/.bashrc, whose target in /opt/devboxes is read-only, and warns each run.
 install_vendor_cli() {
-  local name="$1" url="$2"
+  local name="$1" url="$2" out
   [[ -x $USER_HOME/.local/bin/$name ]] && return 1
   # pipefail: a failed download must not read as an install.
   # shellcheck disable=SC2016 # $1 expands in the inner shell
-  as_user bash -c 'set -o pipefail; curl -fsSL "$1" | bash' _ "$url" </dev/null
-  [[ -x $USER_HOME/.local/bin/$name ]] || die "$name: install failed"
+  out="$(as_user bash -c 'set -o pipefail; curl -fsSL "$1" | bash' _ "$url" </dev/null 2>&1)" || true
+  if [[ ! -x $USER_HOME/.local/bin/$name ]]; then
+    printf '%s\n' "$out" >&2
+    die "$name: install failed"
+  fi
   say "$name: installed (run devbox login to sign in)"
 }
 
