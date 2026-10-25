@@ -1112,6 +1112,23 @@ add_marketplace() {
     claude plugin marketplace add "$2"
 }
 
+# Removes the marketplace added from skill repo clone $1, and its plugins, once
+# the repo no longer has .claude-plugin/marketplace.json (it became a single
+# skill, say). Left in place, Claude warns about it at every start and
+# `claude plugin marketplace update` fails.
+remove_stale_marketplace() {
+  local dest="$1" market plugin
+  [[ ! -f $dest/.claude-plugin/marketplace.json ]] || return 0
+  market="$(claude plugin marketplace list --json |
+    jq -r --arg p "$dest" '.[] | select(.source == "directory" and .path == $p) | .name')"
+  [[ -n $market ]] || return 0
+  while IFS= read -r plugin; do
+    claude plugin uninstall "$plugin" >/dev/null
+  done < <(claude plugin list --json | jq -r --arg m "$market" '.[] | select(.scope == "user" and (.id | endswith("@" + $m))) | .id')
+  claude plugin marketplace remove "$market" >/dev/null
+  changed "skills: removed marketplace $market (${dest##*/} has no marketplace.json)"
+}
+
 # Adds the marketplace at GitHub repo $1 and installs plugin $2
 # (<plugin>@<marketplace>), each unless already there. The marketplace's name
 # is the part of the plugin id after the @.
@@ -1150,6 +1167,8 @@ install_skill_repo() {
   local repo="$1" dest="$SKILL_REPOS/${1#*/}" market plugin head installed=""
   local stamp="$dest/.git/devbox-installed"
   fetch_skill_repo "$repo"
+  # Before the stamp check: a box may have installed the new layout already.
+  remove_stale_marketplace "$dest"
   head="$(git -C "$dest" rev-parse HEAD)"
   [[ ! -f $stamp ]] || installed="$(<"$stamp")"
   [[ $installed != "$head" ]] || return 0
@@ -1378,8 +1397,9 @@ update_plugins() {
   local before id version old
   claude plugin marketplace update >/dev/null
   before="$(plugin_versions)"
+  # With no plugins, <<< still feeds one empty line, and `claude plugin update ""` fails.
   while read -r id _; do
-    claude plugin update "$id" >/dev/null </dev/null
+    [[ -z $id ]] || claude plugin update "$id" >/dev/null </dev/null
   done <<<"$before"
   while read -r id version; do
     old="$(awk -v id="$id" '$1 == id { print $2 }' <<<"$before")"
