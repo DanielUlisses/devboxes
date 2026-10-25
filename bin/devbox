@@ -125,6 +125,15 @@ ADO_KEY=$USER_HOME/.ssh/id_rsa_ado
 # fingerprint, SHA256:ohD8VZEXGWo6Ez8GSEJQ9WpafgLFsOfLOtGGQCQo6Og, is the one
 # Microsoft documents in "Use SSH key authentication" (Azure Repos).
 ADO_HOST_KEY="$ADO_HOST ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQC7Hr1oTWqNqOlzGJOfGJ4NakVyIzf1rXYd4d7wo6jBlkLvCA4odBlL0mDUyZ0/QUfTTqeu+tm22gOsv+VrVTMk6vwRU75gY/y9ut5Mb3bR5BV58dKXyq9A9UeB5Cakehn5Zgm6x1mKoVyf+FFn26iYqXJRgzIZZcZ5V6hrE0Qg39kZm4az48o0AUbf6Sp4SLdvnuMa2sVNwHBboS7EJkm57XQPVU3/QpyNLHbWDdzwtrlS+ez30S3AdYhLKEOxAG8weOnyrtLJAUen9mTkol8oII1edf7mWWbWVf0nBmly21+nZcmCTISQBtdcyPaEno7fFQMDD26/s0lfKob4Kw8H"
+# github.com's host keys, pinned rather than trusted on first use: claude plugin
+# install and update clone GitHub marketplaces over ssh with strict checking,
+# and gh's https login never adds them. These are the keys GitHub publishes in
+# "GitHub's SSH key fingerprints" (and as ssh_keys in https://api.github.com/meta).
+GITHUB_HOST_KEYS=(
+  "github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl"
+  "github.com ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBEmKSENjQEezOmxkZMy7opKgwFB9nkt5YRrYMjNuG5N87uRgg6CLrbo5wAdT/y6v0mKV0U2w0WZ2YB/++Tpockg="
+  "github.com ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQCj7ndNxQowgcQnjshcLrqPEiiphnt+VTTvDP6mHBL9j1aNUkY4Ue1gvwnGLVlOhGeYrnZaMgRK6+PKCUXaDbC7qtbW8gIkhL7aGCsOr/C56SJMy/BCZfxd1nWzAOxSDPgVsmerOBYfNqltV9/hWCqBywINIR+5dIg6JTJ72pcEpEjcYgXkE2YEFXV1JHnsKgbLWNlhScqb2UmyRkQyytRLtL+38TGxkxCflmO+5Z8CSSNY7GidjMIZ7Q4zMjA2n1nGrlTDkzwDCsw+wqFPGQA179cnfGWOWRVruj16z6XyvxvjJwbz0wQZ75XK5tKSb7FNyeIEs4TT4jk+S4dhPeAUC5y+bDYirYgM4GC7uEnztnZyaVWQ7B381AK4Qdrwt51ZqExKbQpTUNn+EjqoTwvqNj4kqx5QUCI0ThS/YkOxJCXmPUWZbhjpCg56i+2aB6CmK2JGhn57K5mj0MNdBXA4/WnwH6XoPWJzK5Nyu2zB3nAZp+S5hpQs+p1vN1/wsjk="
+)
 # Boxes with Azure DevOps repos also get az and its azure-devops extension, for
 # `az repos pr create` in their clones.
 AZ_PACKAGE=azure-cli
@@ -1060,6 +1069,19 @@ git_identity() {
   fi
 }
 
+# github.com's host keys (GITHUB_HOST_KEYS) added to known_hosts, each unless
+# it is there already.
+pin_github_host_keys() {
+  local known=$USER_HOME/.ssh/known_hosts key added=0
+  install -d -m 700 "${known%/*}"
+  for key in "${GITHUB_HOST_KEYS[@]}"; do
+    grep -qxF "$key" "$known" 2>/dev/null && continue
+    printf '%s\n' "$key" >>"$known"
+    added=1
+  done
+  ((added == 0)) || changed "ssh: pinned github.com's host keys in ${known/#$USER_HOME/\~}"
+}
+
 # For a config with Azure DevOps repos: the box's Azure DevOps key (RSA, which
 # is all Azure DevOps takes), ssh using only that key for $ADO_HOST, and its
 # host key pinned in known_hosts. Registering the key is left to a person.
@@ -1112,6 +1134,23 @@ add_marketplace() {
     claude plugin marketplace add "$2"
 }
 
+# Removes the marketplace added from skill repo clone $1, and its plugins, once
+# the repo no longer has .claude-plugin/marketplace.json (it became a single
+# skill, say). Left in place, Claude warns about it at every start and
+# `claude plugin marketplace update` fails.
+remove_stale_marketplace() {
+  local dest="$1" market plugin
+  [[ ! -f $dest/.claude-plugin/marketplace.json ]] || return 0
+  market="$(claude plugin marketplace list --json |
+    jq -r --arg p "$dest" '.[] | select(.source == "directory" and .path == $p) | .name')"
+  [[ -n $market ]] || return 0
+  while IFS= read -r plugin; do
+    claude plugin uninstall "$plugin" >/dev/null
+  done < <(claude plugin list --json | jq -r --arg m "$market" '.[] | select(.scope == "user" and (.id | endswith("@" + $m))) | .id')
+  claude plugin marketplace remove "$market" >/dev/null
+  changed "skills: removed marketplace $market (${dest##*/} has no marketplace.json)"
+}
+
 # Adds the marketplace at GitHub repo $1 and installs plugin $2
 # (<plugin>@<marketplace>), each unless already there. The marketplace's name
 # is the part of the plugin id after the @.
@@ -1150,6 +1189,8 @@ install_skill_repo() {
   local repo="$1" dest="$SKILL_REPOS/${1#*/}" market plugin head installed=""
   local stamp="$dest/.git/devbox-installed"
   fetch_skill_repo "$repo"
+  # Before the stamp check: a box may have installed the new layout already.
+  remove_stale_marketplace "$dest"
   head="$(git -C "$dest" rev-parse HEAD)"
   [[ ! -f $stamp ]] || installed="$(<"$stamp")"
   [[ $installed != "$head" ]] || return 0
@@ -1268,6 +1309,7 @@ finish() {
   git_identity "$config"
   agent_instructions "$config"
   ado_setup "$config" "$title"
+  pin_github_host_keys
 
   while IFS= read -r skill; do
     install_skill "$skill"
@@ -1378,8 +1420,9 @@ update_plugins() {
   local before id version old
   claude plugin marketplace update >/dev/null
   before="$(plugin_versions)"
+  # With no plugins, <<< still feeds one empty line, and `claude plugin update ""` fails.
   while read -r id _; do
-    claude plugin update "$id" >/dev/null </dev/null
+    [[ -z $id ]] || claude plugin update "$id" >/dev/null </dev/null
   done <<<"$before"
   while read -r id version; do
     old="$(awk -v id="$id" '$1 == id { print $2 }' <<<"$before")"
@@ -1537,6 +1580,7 @@ update() {
   CHANGES="$(mktemp)"
   trap 'rm -f "$CHANGES"' EXIT
 
+  run_step ssh pin_github_host_keys
   run_step skills update_skills "$config"
   run_step tk-hub install_tk_hub "$config"
   run_step plugins install_new_plugins "$config"
