@@ -483,7 +483,9 @@ sync_repos() {
   ((${#pending[@]} == 0)) || [[ ! -f $ADO_KEY ]] || ado_key_instructions "$config"
   for dir in "$WORK"/*; do
     [[ -d $dir/.git ]] || continue
-    repo="$(origin_repo "$dir")"
+    # A repo with no origin (made on the box) was never listed: skip it, as the
+    # failed assignment would otherwise end sync here under set -e.
+    repo="$(origin_repo "$dir")" || continue
     grep -qxF -- "$repo" <<<"$listed" ||
       say "repos: ${dir/#$USER_HOME/\~} ($repo) is no longer listed; left in place"
   done
