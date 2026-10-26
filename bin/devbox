@@ -1161,7 +1161,7 @@ git_identity() {
     as_user tee "$signers" >/dev/null <<<"$entry"
     changed=true
   fi
-  if $wrote; then
+  if $changed; then
     say "git: signing commits as $name <$email> (${file/#$USER_HOME/\~})"
   else
     say "git: identity up to date ($name <$email>)"
