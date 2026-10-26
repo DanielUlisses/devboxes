@@ -15,7 +15,7 @@ bin/devbox-create      creates, starts and bootstraps a client's container on th
 bin/devbox-sync        syncs a client's box to this checkout's config, from your machine
 bin/devbox-destroy     stops and destroys it
 bin/devbox-host        this machine's side of the boxes: ssh config entries, herdr machines, host keys
-bin/devbox             runs inside a box: `devbox bootstrap`, `sync`, `login`, `finish`, `update`, `logout`, `rc`
+bin/devbox             runs inside a box: `devbox bootstrap`, `sync`, `login`, `finish`, `update`, `upgrade`, `logout`, `rc`
 bin/devbox-agent-instructions  prints a box's agent instructions (~/.claude/CLAUDE.md, ~/AGENTS.md) from a resolved config
 bin/devbox-browser     $BROWSER in a box: prints URLs instead of opening them
 bin/devbox-runner-dispatch  a runner box's dispatcher: one just-in-time Actions runner per queued job
@@ -438,6 +438,29 @@ reported and the rest still run, then `update` (and the sync) exits 1:
   once pushed and pulled by a `devbox sync` inside the box.
 - **nvim:** `nvim --headless "+Lazy! restore" +qa`, so the plugins match the
   box's `lazy-lock.json` (the repo's, unless edited on the box).
+
+### Unattended OS upgrades: `devbox upgrade`
+
+`devbox update` upgrades pacman only when someone runs it, and a runner or
+hub box never runs the pacman step. So every box, whatever its role, also
+gets `devbox-upgrade.timer`, written and enabled by `devbox sync`: daily at
+03:30 (up to 30 minutes later, run at the next boot if the box was off),
+starting `devbox upgrade` as root. It is not configurable.
+
+```
+devbox upgrade     # also fine by hand; sudo is added when needed
+systemctl list-timers devbox-upgrade.timer   # next and last run
+journalctl -u devbox-upgrade                 # what it did
+```
+
+It runs `pacman -Syu --noconfirm`, then restarts `tailscaled` and `docker`
+if the binary they run was replaced (the kernel marks it ` (deleted)` in
+`/proc/<pid>/exe`). A package upgrade alone leaves the old daemon running,
+so without the restart a Tailscale fix wouldn't be live. On a runner box
+Docker is left alone while a job runs, as restarting it kills the job; the
+binary stays marked, so the next daily run restarts it. A restart of
+`tailscaled` briefly drops open Tailscale SSH sessions. Without systemd
+(a plain chroot) there is no timer.
 
 ### Logging in and finishing
 
