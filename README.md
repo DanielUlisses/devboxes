@@ -408,10 +408,8 @@ reported and the rest still run, then `update` (and the sync) exits 1:
 - **skills:** pulls each skill repo and re-runs its install (as `finish`
   does) when its head moved since the last install, recorded in the clone's
   `.git/devbox-installed`; a failed install is retried next time.
-  `mattpocock-skills` is re-added with `npx skills@latest add` when the
-  head of `mattpocock/skills` moved (recorded in
-  `~/.local/state/devbox/skills/`). Skills newly listed in the client file
-  are installed.
+  `mattpocock-skills` is a plugin, updated by `plugin-versions`. Skills
+  newly listed in the client file are installed.
 - **plugins:** installs the plugins newly listed under `plugins:` in the
   client file (adding the marketplace first unless it is configured); a
   failing plugin doesn't stop the others. Removed entries stay installed.
@@ -499,11 +497,13 @@ what's missing:
   it in Azure DevOps (User settings -> SSH public keys -> + New Key, titled
   with the box's hostname), `finish` and `sync` print the key and the
   settings page of each org, and report those repos pending;
-- installs the `skills:` list: `mattpocock-skills` is every skill in
-  `mattpocock/skills`, installed with `npx skills@latest add mattpocock/skills
-  --global --agent claude-code --skill '*' --yes` into `~/.claude/skills/`
-  (a box that had it as the `mattpocock-skills@claude-plugins-official`
-  plugin has that uninstalled); every other entry is a
+- installs the `skills:` list: `mattpocock-skills` is the
+  `mattpocock-skills@claude-plugins-official` plugin, the install upstream
+  recommends for Claude Code (adding the `claude-plugins-official`
+  marketplace unless it is configured). A box that had it from `npx skills`
+  (a stamp in `~/.local/state/devbox/skills/`) has those copies removed from
+  `~/.claude/skills/` once, and the skill repo links they had replaced
+  (`tdd`) restored; every other entry is a
   GitHub repo (`<owner>/<repo>`, or a bare name under `DanielUlisses`) cloned
   with gh into `~/.claude/skill-repos/` and installed by its layout: its
   `install.sh`, a plugin marketplace (`.claude-plugin/marketplace.json`), or

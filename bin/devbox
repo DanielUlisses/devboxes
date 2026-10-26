@@ -134,13 +134,16 @@ WORK=$USER_HOME/work
 SKILL_REPOS=$USER_HOME/.claude/skill-repos
 # Owner of skill repos named without one.
 SKILLS_OWNER=DanielUlisses
-# Skills installed with the skills CLI (npx skills add, node from BASE_TOOLS)
-# from a GitHub source, not cloned: skills: entry -> owner/repo. Each one was
-# once the Claude plugin <entry>@claude-plugins-official, which install
-# removes.
-declare -A SKILL_NPX=([mattpocock-skills]=mattpocock/skills)
-OLD_SKILL_MARKETPLACE=claude-plugins-official
-# The GitHub head each SKILL_NPX source was last installed at, one file each.
+# Skills installed as a Claude plugin from the official marketplace, not
+# cloned: skills: entry -> plugin id. update's plugin-versions step keeps them
+# current, as upstream recommends.
+declare -A SKILL_PLUGINS=([mattpocock-skills]=mattpocock-skills@claude-plugins-official)
+OFFICIAL_MARKETPLACE=anthropics/claude-plugins-official
+# Each SKILL_PLUGINS entry once came with the skills CLI (npx skills add) from
+# this GitHub source, copied into ~/.claude/skills: entry -> owner/repo.
+declare -A SKILL_NPX_OLD=([mattpocock-skills]=mattpocock/skills)
+# The GitHub head each of those npx installs was last at, one file each; one
+# left means its copies are still there.
 SKILL_STAMPS=$USER_HOME/.local/state/devbox/skills
 # herdr plugins every box gets: plugin id -> GitHub source (owner/repo[/subdir]).
 declare -A HERDR_PLUGINS=([persiyanov.reviewr]=persiyanov/herdr-reviewr)
@@ -174,7 +177,7 @@ Run inside a devbox.
   finish     after login: this box's SSH key on GitHub (auth and signing),
              git identity and signing, agent instructions (~/.claude/CLAUDE.md
              and ~/AGENTS.md, which sync regenerates), skills (mattpocock's
-             with npx skills), the client's plugins, the herdr plugins (reviewr),
+             as a plugin), the client's plugins, the herdr plugins (reviewr),
              agy and cursor-agent (when missing), repos;
              with Azure DevOps repos, a key for it to add there by hand
   update     after finish: bring current what finish and bootstrap installed
@@ -1204,36 +1207,43 @@ herdr_plugins() {
   done
 }
 
-# Installs skill entry $1 from SKILL_NPX with the skills CLI, every skill in
-# its source, into ~/.claude/skills, when the source's GitHub head moved since
-# the last install; the Claude plugin it used to come as is uninstalled first.
-install_skill_npx() {
-  local skill="$1" src="${SKILL_NPX[$1]}" old="$1@$OLD_SKILL_MARKETPLACE"
-  local stamp="$SKILL_STAMPS/$1" head installed=""
-  if plugin_installed "$old"; then
-    claude plugin uninstall "$old" >/dev/null
-    changed "skills: uninstalled plugin $old (now from npx skills)"
-  fi
-  head="$(git ls-remote "https://github.com/$src.git" HEAD | cut -f1)"
-  [[ -n $head ]] || die "skills: can't read the head of $src"
-  [[ ! -f $stamp ]] || installed="$(<"$stamp")"
-  [[ $installed != "$head" ]] || return 0
-  npx --yes skills@latest add "$src" --global --agent claude-code --skill '*' --yes </dev/null >/dev/null
-  mkdir -p "$SKILL_STAMPS"
-  printf '%s\n' "$head" >"$stamp"
-  if [[ -z $installed ]]; then
-    changed "skills: installed $src"
-  else
-    changed "skills: updated $src (${installed:0:7}..${head:0:7})"
-  fi
+# Removes the copies an npx skills install of entry $1 left in ~/.claude/skills
+# (every skill in its source at the stamped head), once, and relinks the skill
+# repos whose link such a copy had replaced (tdd-skill's tdd).
+remove_npx_skill() {
+  local src="${SKILL_NPX_OLD[$1]}" stamp="$SKILL_STAMPS/$1" sha name dir repo
+  [[ -f $stamp ]] || return 0
+  sha="$(<"$stamp")"
+  while IFS= read -r name; do
+    dir="$USER_HOME/.claude/skills/$name"
+    [[ -d $dir && ! -L $dir ]] || continue
+    rm -rf "$dir"
+    for repo in "$SKILL_REPOS"/*; do
+      [[ -f $repo/SKILL.md && $(basename "$repo" -skill) == "$name" ]] || continue
+      ln -sfn "$repo" "$dir"
+      changed "skills: relinked $name to ${repo/#$USER_HOME/\~}"
+    done
+  done < <(gh api "repos/$src/git/trees/$sha?recursive=1" --jq '.tree[].path | select(endswith("/SKILL.md")) | split("/")[-2]')
+  rm "$stamp"
+  rmdir "$SKILL_STAMPS" 2>/dev/null || true
+  changed "skills: removed the npx skills copies of $src"
 }
 
-# Installs one entry of the skills: list: a skills CLI source (SKILL_NPX) or
+# Installs skill entry $1 from SKILL_PLUGINS as a plugin, adding the official
+# marketplace unless it is configured, after removing an older npx install.
+install_skill_plugin() {
+  local id="${SKILL_PLUGINS[$1]}"
+  remove_npx_skill "$1"
+  add_marketplace "${id#*@}" "$OFFICIAL_MARKETPLACE" >/dev/null
+  install_plugin "$id"
+}
+
+# Installs one entry of the skills: list: a plugin (SKILL_PLUGINS) or
 # a skill repo, <owner>/<repo> or a bare name under SKILLS_OWNER.
 install_skill() {
   local skill="$1"
-  if [[ -n ${SKILL_NPX[$skill]:-} ]]; then
-    install_skill_npx "$skill"
+  if [[ -n ${SKILL_PLUGINS[$skill]:-} ]]; then
+    install_skill_plugin "$skill"
   elif [[ $skill == */* ]]; then
     install_skill_repo "$skill"
   else
@@ -1242,7 +1252,7 @@ install_skill() {
 }
 
 # After login: this box's own SSH key on GitHub for auth and signing, git
-# signing, the base and client skills (mattpocock's through npx skills), the
+# signing, the base and client skills (mattpocock's as a plugin), the
 # client's plugins, the herdr plugins, agy and cursor-agent (when missing),
 # then repos.
 finish() {
