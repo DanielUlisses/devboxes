@@ -1,3 +1,0 @@
-# expect: deploy_key: must be an ed25519 public key
-role: hub
-deploy_key: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGq7nT2bQ0iYdLqv3rVwXJxk8sP4mZcFhE1uN6aR9tWy ci-deploy

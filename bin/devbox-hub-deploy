@@ -1,22 +1,30 @@
 #!/usr/bin/env bash
-# A hub box's deploy key's forced command (installed as
-# /usr/local/libexec/devbox-hub-deploy, run by sshd as daniel). ticket-board's
-# deploy workflow, on the UlissesTech runner box, may only read and push
-# /opt/ticket-board and run its install.sh hub; anything else is refused. The
-# hub never pulls: the push (receive.denyCurrentBranch=updateInstead) is how
-# a commit of main gets here.
+# A hub box's deploy user's login shell (installed as
+# /usr/local/libexec/devbox-hub-deploy, the shell of HUB_DEPLOY_USER).
+# ticket-board's deploy workflow, on the UlissesTech runner box, reaches the
+# hub over Tailscale SSH as that user (the tailnet policy lets tag:runner in
+# as nobody else), and may only read and push /opt/ticket-board (as daniel,
+# who owns it) and reinstall it (devbox update, as root); anything else,
+# including an interactive login, is refused. The hub never pulls: the push
+# (receive.denyCurrentBranch=updateInstead) is how a commit of main gets here.
 set -euo pipefail
 
 HUB_DIR=/opt/ticket-board
+HUB_OWNER=daniel
+
+# Called as a login shell: `<shell> -c <command>`.
+cmd=""
+[[ ${1:-} != -c ]] || cmd="${2:-}"
 
 # git quotes the path ('/opt/ticket-board'); accept it bare too.
-case "${SSH_ORIGINAL_COMMAND:-}" in
-  "git-upload-pack '$HUB_DIR'" | "git-upload-pack $HUB_DIR") exec git-upload-pack "$HUB_DIR" ;;
-  "git-receive-pack '$HUB_DIR'" | "git-receive-pack $HUB_DIR") exec git-receive-pack "$HUB_DIR" ;;
-  install) exec "$HUB_DIR/install.sh" hub ;;
+case "$cmd" in
+  "git-upload-pack '$HUB_DIR'" | "git-upload-pack $HUB_DIR")
+    exec sudo -n -u "$HUB_OWNER" /usr/bin/git-upload-pack "$HUB_DIR" ;;
+  "git-receive-pack '$HUB_DIR'" | "git-receive-pack $HUB_DIR")
+    exec sudo -n -u "$HUB_OWNER" /usr/bin/git-receive-pack "$HUB_DIR" ;;
+  install) exec sudo -n /usr/local/bin/devbox update ;;
   *)
-    printf 'devbox-hub-deploy: refused %q: this key may only push %s and run install\n' \
-      "${SSH_ORIGINAL_COMMAND:-}" "$HUB_DIR" >&2
+    printf 'devbox-hub-deploy: refused %q: this user may only push %s and run install\n' "$cmd" "$HUB_DIR" >&2
     exit 1
     ;;
 esac

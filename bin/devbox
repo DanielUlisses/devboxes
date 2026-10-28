@@ -48,14 +48,13 @@ HUB_TAILSCALE_TAG=tag:tk-hub
 # The tk-hub checkout, owned by the box user, who runs its install.sh hub:
 # the tk-hub unit serves its hub-web/dist from it. UlissesTech/ticket-board is
 # private and the hub has no GitHub login, so it never pulls: ticket-board's
-# deploy workflow pushes main here (updateInstead) over the deploy port, as
-# the box user, with the client's deploy_key, whose forced command
-# (bin/devbox-hub-deploy) allows only that push and install.sh hub.
+# deploy workflow, on a runner box (tag:runner), pushes main here
+# (updateInstead) over Tailscale SSH as HUB_DEPLOY_USER, whose login shell
+# (bin/devbox-hub-deploy) allows only that push and a reinstall.
 HUB_DIR=/opt/ticket-board
-HUB_DEPLOY_PORT=2222
+HUB_DEPLOY_USER=tk-deploy
 HUB_DEPLOY_BIN=/usr/local/libexec/devbox-hub-deploy
-HUB_SSHD_CONF=/etc/ssh/sshd_config.d/50-devbox-hub-deploy.conf
-HUB_DEPLOY_KEYS=/etc/ssh/devbox-hub-deploy.keys
+HUB_DEPLOY_SUDOERS=/etc/sudoers.d/devbox-hub-deploy
 
 # mise tools every box gets, kept in the system config so the client's tools:
 # list (the user config) can't drop them.
@@ -227,9 +226,9 @@ finish doesn't apply.
 
 On a role: hub box, bootstrap installs only base packages (with uv) and
 tailscale; sync makes $HUB_DIR a repo that ticket-board's deploy workflow
-pushes to (the hub never pulls), opens sshd on port $HUB_DEPLOY_PORT for the
-config's deploy_key alone and, once something is deployed and tailscale is
-up, runs its install.sh hub as $USER_NAME (hub server, web build, tk-hub
+pushes to (the hub never pulls) over Tailscale SSH as $HUB_DEPLOY_USER (a
+login shell that allows only that push and a reinstall) and, once something
+is deployed and tailscale is up, runs its install.sh hub as $USER_NAME (hub server, web build, tk-hub
 unit, tailscale serve on HTTPS); login asks only for tailscale
 ($HUB_TAILSCALE_TAG); update does what sync does for tk-hub. finish doesn't
 apply.
@@ -736,13 +735,12 @@ runner_update() {
 }
 
 # A hub box's tk-hub, as root: makes HUB_DIR a repo the deploy workflow can
-# push to, opens the deploy port (hub_deploy_ssh), then runs the checkout's
+# push to, adds its deploy user (hub_deploy_user), then runs the checkout's
 # install.sh hub as the box user (it sudoes for the system unit and tailscale
 # serve, and changes nothing when nothing changed). Until the first deploy
 # there is nothing to install. A first install takes the hub's https name
 # from tailscale, so until devbox login has joined the tailnet it waits.
 hub_tk() {
-  local config="$1"
   if [[ ! -d $HUB_DIR/.git ]]; then
     install -d -o "$USER_NAME" -g "$USER_NAME" "$HUB_DIR"
     as_user git init -q -b main "$HUB_DIR"
@@ -759,7 +757,7 @@ hub_tk() {
   fi
   [[ $(as_user git -C "$HUB_DIR" config receive.denyCurrentBranch) == updateInstead ]] ||
     as_user git -C "$HUB_DIR" config receive.denyCurrentBranch updateInstead
-  hub_deploy_ssh "$config"
+  hub_deploy_user
   if ! as_user git -C "$HUB_DIR" rev-parse -q --verify HEAD >/dev/null; then
     say "hub: nothing deployed yet; run ticket-board's deploy workflow (see README.md, Hub box)"
     return
@@ -771,53 +769,29 @@ hub_tk() {
   as_user "$HUB_DIR/install.sh" hub || die "hub: $HUB_DIR/install.sh hub failed (above)"
 }
 
-# The hub's deploy door, as root: sshd on HUB_DEPLOY_PORT only (Tailscale SSH
-# keeps port 22), public key only, as the box user only, with the config's
-# deploy_key as the one key, forced to bin/devbox-hub-deploy. Without a
-# deploy_key, sshd is stopped and the key file emptied.
-hub_deploy_ssh() {
-  local key conf restart=false
-  key="$(jq -r '.deploy_key // empty' <<<"$1")"
+# The hub's deploy user, as root: HUB_DEPLOY_USER, a system user with
+# bin/devbox-hub-deploy as its login shell, and sudo for exactly what that
+# shell runs: git-upload-pack and git-receive-pack of HUB_DIR as the box
+# user, and devbox update as root. Who may log in as it is the tailnet
+# policy's call (tag:runner only; see README.md, Deploys from ticket-board).
+hub_deploy_user() {
+  local rules
   if write_if_changed "$HUB_DEPLOY_BIN" "$(<"$ROOT/bin/devbox-hub-deploy")" 755; then
     say "hub: installed $HUB_DEPLOY_BIN"
   fi
-  if [[ -z $key ]]; then
-    if [[ -s $HUB_DEPLOY_KEYS ]]; then
-      : >"$HUB_DEPLOY_KEYS"
-      say "hub: no deploy_key in the config; emptied $HUB_DEPLOY_KEYS"
-    fi
-    if [[ -d /run/systemd/system ]] && systemctl is-active -q sshd.service; then
-      systemctl disable --now -q sshd.service
-      say "hub: no deploy_key; stopped sshd"
-    fi
-    return
+  if ! id "$HUB_DEPLOY_USER" &>/dev/null; then
+    useradd --system --user-group --create-home --home-dir "/var/lib/$HUB_DEPLOY_USER" \
+      --shell "$HUB_DEPLOY_BIN" "$HUB_DEPLOY_USER"
+    say "hub: added $HUB_DEPLOY_USER, the deploy workflow's user"
+  elif [[ $(getent passwd "$HUB_DEPLOY_USER" | cut -d: -f7) != "$HUB_DEPLOY_BIN" ]]; then
+    usermod --shell "$HUB_DEPLOY_BIN" "$HUB_DEPLOY_USER"
+    say "hub: $HUB_DEPLOY_USER's shell is $HUB_DEPLOY_BIN again"
   fi
-  if write_if_changed "$HUB_DEPLOY_KEYS" \
-    "restrict,command=\"$HUB_DEPLOY_BIN\" $key devbox-hub-deploy" 644; then
-    say "hub: wrote the deploy key to $HUB_DEPLOY_KEYS"
-  fi
-  conf="# Written by devbox: the deploy workflow's door (see README.md, Hub box).
-Port $HUB_DEPLOY_PORT
-AuthorizedKeysFile $HUB_DEPLOY_KEYS
-AuthenticationMethods publickey
-PasswordAuthentication no
-KbdInteractiveAuthentication no
-PermitRootLogin no
-AllowUsers $USER_NAME
-DisableForwarding yes"
-  if write_if_changed "$HUB_SSHD_CONF" "$conf" 644; then
-    sshd -t || { rm -f "$HUB_SSHD_CONF"; die "hub: sshd rejected $HUB_SSHD_CONF"; }
-    say "hub: wrote $HUB_SSHD_CONF (port $HUB_DEPLOY_PORT)"
-    restart=true
-  fi
-  if [[ ! -d /run/systemd/system ]]; then
-    say "hub: no systemd, sshd not started"
-    return
-  fi
-  ! $restart || systemctl try-restart sshd.service
-  if ! systemctl is-active -q sshd.service; then
-    systemctl enable --now -q sshd.service
-    say "hub: started sshd on port $HUB_DEPLOY_PORT for the deploy workflow"
+  rules="$HUB_DEPLOY_USER ALL=($USER_NAME) NOPASSWD: /usr/bin/git-upload-pack $HUB_DIR, /usr/bin/git-receive-pack $HUB_DIR
+$HUB_DEPLOY_USER ALL=(root) NOPASSWD: /usr/local/bin/devbox update"
+  if write_if_changed "$HUB_DEPLOY_SUDOERS" "$rules" 440; then
+    visudo -cqf "$HUB_DEPLOY_SUDOERS" || { rm -f "$HUB_DEPLOY_SUDOERS"; die "hub: invalid sudoers entry"; }
+    say "hub: wrote $HUB_DEPLOY_SUDOERS"
   fi
 }
 
@@ -931,7 +905,7 @@ sync() {
     return
   fi
   if [[ $role == hub ]]; then
-    hub_tk "$config"
+    hub_tk
     say "synced (hub box)"
     return
   fi
@@ -2044,7 +2018,7 @@ main() {
         ;;
       hub)
         ((EUID == 0)) || exec sudo "$0" "${args[@]}"
-        hub_tk "$config"
+        hub_tk
         say "updated (hub box)"
         return
         ;;

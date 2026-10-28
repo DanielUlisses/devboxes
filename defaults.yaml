@@ -70,11 +70,6 @@ plugins: []
 # client file only; see clients/_template.yaml.
 tk_hub:
 
-# A hub's deploy key (the public half; ticket-board's deploy workflow holds
-# the private one in 1Password): none by default, so the hub's deploy port
-# stays shut. Set in a hub client file only; see clients/_template.yaml.
-deploy_key:
-
 repos: []
 
 # Proxmox backup job for the box (vzdump, snapshot mode, zstd), to the

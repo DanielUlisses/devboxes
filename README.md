@@ -19,7 +19,7 @@ bin/devbox             runs inside a box: `devbox bootstrap`, `sync`, `login`, `
 bin/devbox-agent-instructions  prints a box's agent instructions (~/.claude/CLAUDE.md, ~/AGENTS.md) from a resolved config
 bin/devbox-browser     $BROWSER in a box: prints URLs instead of opening them
 bin/devbox-runner-dispatch  a runner box's dispatcher: one just-in-time Actions runner per queued job
-bin/devbox-hub-deploy  a hub box's deploy key's forced command: only push /opt/ticket-board and run its install.sh hub
+bin/devbox-hub-deploy  a hub box's deploy user's shell: only push /opt/ticket-board and reinstall it
 bootstrap.sh           first thing a new box runs: clones this repo, hands over to devbox
 dotfiles/              bash, git, gh and nvim config stowed into every box (no identity, no secrets)
 lib/pve.sh             the one way bin/ scripts talk to the host
@@ -727,7 +727,7 @@ runners:
 In the tailnet policy, `tag:runner` needs its own `tagOwners` entry and the
 same kind of grant and ssh rule as `tag:devbox` (see [Tailscale
 ACL](#tailscale-acl)), with nothing granting `tag:runner` as a source but
-the hub's deploy port (see [Deploys from
+the hub's Tailscale SSH, as its deploy user (see [Deploys from
 ticket-board](#deploys-from-ticket-board)).
 
 ### The dispatcher
@@ -924,9 +924,9 @@ ACL](#tailscale-acl):
     // Each devbox's tk-daemon connects out to the hub's HTTPS port, and
     // to nothing else. Nothing grants tag:tk-hub as a source.
     { "src": ["tag:devbox"], "dst": ["tag:tk-hub"], "ip": ["tcp:443"] },
-    // The runner box pushes ticket-board deploys to the hub's deploy port,
-    // and nothing else (see Deploys from ticket-board).
-    { "src": ["tag:runner"], "dst": ["tag:tk-hub"], "ip": ["tcp:2222"] }
+    // The runner box pushes ticket-board deploys over Tailscale SSH, and
+    // reaches nothing else of the hub (see Deploys from ticket-board).
+    { "src": ["tag:runner"], "dst": ["tag:tk-hub"], "ip": ["tcp:22"] }
   ],
   "ssh": [
     {
@@ -934,6 +934,14 @@ ACL](#tailscale-acl):
       "src":    ["<you>"],
       "dst":    ["tag:tk-hub"],
       "users":  ["daniel"]
+    },
+    // The runner box, as the deploy user only (its shell refuses anything
+    // but a push and a reinstall).
+    {
+      "action": "accept",
+      "src":    ["tag:runner"],
+      "dst":    ["tag:tk-hub"],
+      "users":  ["tk-deploy"]
     }
   ]
 }
@@ -961,42 +969,37 @@ its next connect. Minting again for the same devbox needs a revoke first.
 
 ### Deploys from ticket-board
 
-ticket-board's `.github/workflows/deploy.yml` follows UlissesTech/home-assistant's
-deploy: on every push to `main` it runs on `[self-hosted, homelab]`, waits for
-that commit's other checks (CI, compat, security) to pass, and pushes it to the
-hub over SSH, with a key it reads from 1Password into a per-job `ssh-agent` and
-the hub's host key pinned. Its side, variables and 1Password items are in
-ticket-board's `docs/deploy.md`. The hub's side:
+ticket-board's `.github/workflows/deploy.yml` runs on every push to `main` on
+`[self-hosted, homelab]`, like UlissesTech/home-assistant's deploy: it waits for
+that commit's other checks (CI, compat, security) to pass, then pushes it into
+the hub and reinstalls. Where home-assistant uses an SSH key from 1Password,
+this one uses the runner box's tailnet identity: it connects with Tailscale SSH,
+so there is no key or host key to keep. Its side is in ticket-board's
+`docs/deploy.md`. The hub's side:
 
-- **The door.** With `deploy_key` set in the hub's client file (the public
-  half, `ssh-ed25519 <base64>`), `devbox sync` runs sshd on port **2222**
-  (Tailscale SSH keeps 22): public key only, as `daniel` only, with that one
-  key in `/etc/ssh/devbox-hub-deploy.keys`, `restrict`ed and forced to
-  `/usr/local/libexec/devbox-hub-deploy` (`bin/devbox-hub-deploy`), which
-  allows `git push`/`git ls-remote` of `/opt/ticket-board` and `install`
-  (its `install.sh hub`), and refuses anything else. Without `deploy_key` the
-  key file is empty and sshd stopped.
-- **The grant.** `tag:runner` reaches `tag:tk-hub` on `tcp:2222` only (the
-  grant in the policy above). Runner boxes run with `--accept-dns=false`, so
-  the workflow connects to the hub's tailnet IP.
+- **The deploy user.** `devbox sync` adds `tk-deploy`, a system user whose
+  login shell is `/usr/local/libexec/devbox-hub-deploy`
+  (`bin/devbox-hub-deploy`). That shell allows `git ls-remote`/`git push` of
+  `/opt/ticket-board` (run as `daniel`, who owns it) and `install` (`devbox
+  update`, as root, which runs its `install.sh hub`), and refuses anything
+  else, an interactive login included. `/etc/sudoers.d/devbox-hub-deploy`
+  lets it run those three commands and nothing more.
+- **The policy.** The grant and ssh rule above let `tag:runner` reach the hub
+  on port 22 only, as `tk-deploy` only. Runner boxes run with
+  `--accept-dns=false`, so the workflow connects to the hub's tailnet IP.
+  WireGuard binds that IP to the hub's node key, so the workflow doesn't pin
+  an SSH host key.
 - **Safety.** The push is refused when the hub's `main` isn't an ancestor of
   the pushed commit, or when files in `/opt/ticket-board` were edited by hand
-  (`updateInstead`). Anything able to deploy can run code on the hub as
-  `daniel` (who has sudo): that is what deploying is, and why the key lives in
-  `homelab-ci`, readable only by the runner boxes' service account.
+  (`updateInstead`). Any job on a runner box can deploy, and a deploy runs
+  ticket-board's code on the hub as `daniel` (who has sudo): that is what
+  deploying is, and why runner boxes take only trusted workflows (see [The
+  dispatcher](#the-dispatcher)).
 
-One time, to set it up:
-
-1. Make an SSH Key item in 1Password's `homelab-ci` vault (ed25519), named
-   `tk-hub-deploy`, and put its public key, without the comment, in the hub's
-   client file as `deploy_key:`. Then `bin/devbox-sync tk-hub`.
-2. On the hub, `ssh-keyscan -t ed25519 -p 2222 localhost`, and save the
-   `ssh-ed25519 <base64>` part as a Secure Note `tk-hub-ssh-known-hosts` in
-   `homelab-ci`.
-3. Add the `tag:runner` grant above to the tailnet policy.
-4. In ticket-board, set the repository variable `TK_HUB_SSH_HOST` to the
-   hub's `tailscale ip -4`, and run the deploy workflow once by hand
-   (Actions, Run workflow) for the first install.
+One time, to set it up: merge these rules into the tailnet policy, run
+`bin/devbox-sync tk-hub`, then in ticket-board set the repository variable
+`TK_HUB_HOST` to the hub's `tailscale ip -4` and run the deploy workflow once
+by hand (Actions, Run workflow) for the first install.
 
 ## The Proxmox host
 
