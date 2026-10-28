@@ -1,0 +1,5 @@
+# expect: ok
+# A hub with its deploy key.
+role: hub
+hostname: tk-hub
+deploy_key: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGq7nT2bQ0iYdLqv3rVwXJxk8sP4mZcFhE1uN6aR9tWy

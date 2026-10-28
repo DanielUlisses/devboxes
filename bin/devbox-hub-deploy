@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# A hub box's deploy key's forced command (installed as
+# /usr/local/libexec/devbox-hub-deploy, run by sshd as daniel). ticket-board's
+# deploy workflow, on the UlissesTech runner box, may only read and push
+# /opt/ticket-board and run its install.sh hub; anything else is refused. The
+# hub never pulls: the push (receive.denyCurrentBranch=updateInstead) is how
+# a commit of main gets here.
+set -euo pipefail
+
+HUB_DIR=/opt/ticket-board
+
+# git quotes the path ('/opt/ticket-board'); accept it bare too.
+case "${SSH_ORIGINAL_COMMAND:-}" in
+  "git-upload-pack '$HUB_DIR'" | "git-upload-pack $HUB_DIR") exec git-upload-pack "$HUB_DIR" ;;
+  "git-receive-pack '$HUB_DIR'" | "git-receive-pack $HUB_DIR") exec git-receive-pack "$HUB_DIR" ;;
+  install) exec "$HUB_DIR/install.sh" hub ;;
+  *)
+    printf 'devbox-hub-deploy: refused %q: this key may only push %s and run install\n' \
+      "${SSH_ORIGINAL_COMMAND:-}" "$HUB_DIR" >&2
+    exit 1
+    ;;
+esac

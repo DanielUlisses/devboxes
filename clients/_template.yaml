@@ -16,7 +16,7 @@
 # op only, no Claude, skills, nvim, mise tools, repos or git identity, and
 # the smaller resources in defaults.yaml's runner_resources; or hub, the
 # tk-hub LXC: base packages, uv and Tailscale (as tag:tk-hub), and
-# DanielUlisses/ticket-board's `install.sh hub`, with defaults.yaml's
+# UlissesTech/ticket-board's `install.sh hub`, with defaults.yaml's
 # hub_resources. A hub may not set claude_account, git_name, git_email,
 # tools, skills, plugins or repos. A runner or hub usually sets hostname
 # too, to drop the dev- prefix (a hub: tk-hub). See README.md, Runner boxes
@@ -101,7 +101,7 @@ skills: []
 # --accept-dns=false, so the daemon needs it to resolve the URL), `token_ref`
 # the op:// reference of this box's daemon token (the token itself is never
 # stored here). When set, `devbox finish`, `sync` and `update` clone
-# DanielUlisses/ticket-board into ~/.claude/skill-repos and run
+# UlissesTech/ticket-board into ~/.claude/skill-repos and run
 # `install.sh daemon --url ... --ip ... --token-ref ...`. Devbox only, and it
 # needs `uv@latest` in `tools` (the daemon install runs on uv). The hub prints
 # its address as wss://<host>/ws/daemon; here `url` is https://<host>. Unset
@@ -111,6 +111,14 @@ skills: []
 #   url: https://hub.example-tailnet.ts.net
 #   ip: 100.64.0.10
 #   token_ref: op://example-vault/example-item/token
+
+# A hub's deploy key: the public half, `ssh-ed25519 <base64>` with no comment,
+# of the key ticket-board's deploy workflow reads from 1Password. When set,
+# `devbox sync` on the hub runs sshd on port 2222 for it alone, as daniel,
+# forced to bin/devbox-hub-deploy (push /opt/ticket-board, run its install.sh
+# hub). Unset (the default), the port stays shut and nothing deploys. Hub
+# only. See README.md, Hub box.
+# deploy_key: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExampleExampleExampleExampleExampleExample0
 
 # Repos to clone into ~/work/<repo>: GitHub ones as <owner>/<repo>, Azure
 # DevOps ones as their SSH URL, git@ssh.dev.azure.com:v3/<org>/<project>/<repo>.

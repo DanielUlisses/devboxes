@@ -201,6 +201,7 @@ check_schema() {
         runners) grep -qx "$k" <<<"$runner_keys" ||
           problems+=("3 (resolved output): '$k' missing from a runner client's output") ;;
         tk_hub) ;; # optional: absent from the output unless a devbox sets it
+        deploy_key) ;; # optional: absent from the output unless a hub sets it
         *) grep -qx "$k" <<<"$tmpl_keys" ||
           problems+=("3 (resolved output): '$k' missing from devbox-config --json _template") ;;
       esac

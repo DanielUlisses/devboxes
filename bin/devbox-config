@@ -165,7 +165,7 @@ if . == null then {} else . end
 | if type != "object" then err("(top level)"; "must be a mapping of fields \(got)")
   else
     unknown_keys(""; ["hostname", "host", "role", "claude_account", "git_name", "git_email", "resources", "packages", "tools", "skills",
-                     "repos", "plugins", "timezone", "backup", "backup_schedule", "backup_keep", "runners", "tk_hub"]
+                     "repos", "plugins", "timezone", "backup", "backup_schedule", "backup_keep", "runners", "tk_hub", "deploy_key"]
                      + if $required then [] else ["runner_resources", "hub_resources"] end),
 
     (.hostname | str_match("hostname"; "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$";
@@ -231,6 +231,13 @@ if . == null then {} else . end
             (.tk_hub | tk_hub("tk_hub"))
        else .tk_hub | tk_hub("tk_hub") end),
 
+    # The deploy key opens a door on the hub only.
+    ((.role // $default_role) as $role
+     | if $required and $role != "hub" and .deploy_key != null
+       then err("deploy_key"; "allowed only when role is hub (role is \($role))")
+       else .deploy_key | str_match("deploy_key"; "^ssh-ed25519 [A-Za-z0-9+/]+={0,2}$";
+         "an ed25519 public key, ssh-ed25519 <base64>, with no comment") end),
+
     (.backup | if . == null or type == "boolean" then empty
                else err("backup"; "must be true or false \(got)") end),
     (.backup_schedule | str_match("backup_schedule"; "^[A-Za-z0-9][A-Za-z0-9 :.,*/~+-]*$";
@@ -260,8 +267,9 @@ def strip_nulls: if type == "object" then with_entries(select(.value != null) | 
 | ($d * $c)
 | .hostname //= "dev-\($name)"
 | .skills = (reduce (($d.skills // []) + ($c.skills // []))[] as $s ([]; if IN(.[]; $s) then . else . + [$s] end))
-| {hostname, host, role, claude_account, git_name, git_email, resources, packages, tools, skills, repos, plugins, timezone, backup, backup_schedule, backup_keep, runners, tk_hub}
+| {hostname, host, role, claude_account, git_name, git_email, resources, packages, tools, skills, repos, plugins, timezone, backup, backup_schedule, backup_keep, runners, tk_hub, deploy_key}
 | if .role == "runner" then . else del(.runners) end
+| if .role == "hub" and .deploy_key != null then . else del(.deploy_key) end
 | if .role == "devbox" and .tk_hub != null then . else del(.tk_hub) end
 '
 
