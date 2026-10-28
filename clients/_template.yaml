@@ -16,7 +16,7 @@
 # op only, no Claude, skills, nvim, mise tools, repos or git identity, and
 # the smaller resources in defaults.yaml's runner_resources; or hub, the
 # tk-hub LXC: base packages, uv and Tailscale (as tag:tk-hub), and
-# DanielUlisses/ticket-board's `install.sh hub`, with defaults.yaml's
+# UlissesTech/ticket-board's `install.sh hub`, with defaults.yaml's
 # hub_resources. A hub may not set claude_account, git_name, git_email,
 # tools, skills, plugins or repos. A runner or hub usually sets hostname
 # too, to drop the dev- prefix (a hub: tk-hub). See README.md, Runner boxes
@@ -101,7 +101,7 @@ skills: []
 # --accept-dns=false, so the daemon needs it to resolve the URL), `token_ref`
 # the op:// reference of this box's daemon token (the token itself is never
 # stored here). When set, `devbox finish`, `sync` and `update` clone
-# DanielUlisses/ticket-board into ~/.claude/skill-repos and run
+# UlissesTech/ticket-board into ~/.claude/skill-repos and run
 # `install.sh daemon --url ... --ip ... --token-ref ...`. Devbox only, and it
 # needs `uv@latest` in `tools` (the daemon install runs on uv). The hub prints
 # its address as wss://<host>/ws/daemon; here `url` is https://<host>. Unset

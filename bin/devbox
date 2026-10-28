@@ -45,11 +45,16 @@ RUNNER_PACKAGES=(git openssh curl sudo jq go-yq unzip less mise github-cli icu t
 # (uv, jq, tailscale; node comes through mise), no Docker or developer tooling.
 HUB_PACKAGES=(git openssh curl sudo jq go-yq unzip less mise uv tailscale)
 HUB_TAILSCALE_TAG=tag:tk-hub
-# The tk-hub repo (public, so cloned without gh), checked out at its default
-# branch's head, detached, and owned by the box user, who runs its install.sh
-# hub: the tk-hub unit serves its hub-web/dist from this checkout.
-HUB_REPO=https://github.com/DanielUlisses/ticket-board.git
+# The tk-hub checkout, owned by the box user, who runs its install.sh hub:
+# the tk-hub unit serves its hub-web/dist from it. UlissesTech/ticket-board is
+# private and the hub has no GitHub login, so it never pulls: ticket-board's
+# deploy workflow, on a runner box (tag:runner), pushes main here
+# (updateInstead) over Tailscale SSH as HUB_DEPLOY_USER, whose login shell
+# (bin/devbox-hub-deploy) allows only that push and a reinstall.
 HUB_DIR=/opt/ticket-board
+HUB_DEPLOY_USER=tk-deploy
+HUB_DEPLOY_BIN=/usr/local/libexec/devbox-hub-deploy
+HUB_DEPLOY_SUDOERS=/etc/sudoers.d/devbox-hub-deploy
 
 # mise tools every box gets, kept in the system config so the client's tools:
 # list (the user config) can't drop them.
@@ -220,9 +225,11 @@ service-account token; update pins and installs the latest actions/runner.
 finish doesn't apply.
 
 On a role: hub box, bootstrap installs only base packages (with uv) and
-tailscale; sync pulls DanielUlisses/ticket-board into $HUB_DIR and, once
-tailscale is up, runs its install.sh hub as $USER_NAME (hub server, web
-build, tk-hub unit, tailscale serve on HTTPS); login asks only for tailscale
+tailscale; sync makes $HUB_DIR a repo that ticket-board's deploy workflow
+pushes to (the hub never pulls) over Tailscale SSH as $HUB_DEPLOY_USER (a
+login shell that allows only that push and a reinstall) and, once something
+is deployed and tailscale is up, runs its install.sh hub as $USER_NAME (hub server, web build, tk-hub
+unit, tailscale serve on HTTPS); login asks only for tailscale
 ($HUB_TAILSCALE_TAG); update does what sync does for tk-hub. finish doesn't
 apply.
 EOF
@@ -727,25 +734,65 @@ runner_update() {
   say "updated (runner box)"
 }
 
-# A hub box's tk-hub, as root: clones or updates ticket-board in HUB_DIR as
-# the box user, then runs its install.sh hub as that user (it sudoes for the
-# system unit and tailscale serve, and changes nothing when nothing changed).
-# A first install takes the hub's https name from tailscale, so until devbox
-# login has joined the tailnet it only pulls.
+# A hub box's tk-hub, as root: makes HUB_DIR a repo the deploy workflow can
+# push to, adds its deploy user (hub_deploy_user), then runs the checkout's
+# install.sh hub as the box user (it sudoes for the system unit and tailscale
+# serve, and changes nothing when nothing changed). Until the first deploy
+# there is nothing to install. A first install takes the hub's https name
+# from tailscale, so until devbox login has joined the tailnet it waits.
 hub_tk() {
   if [[ ! -d $HUB_DIR/.git ]]; then
     install -d -o "$USER_NAME" -g "$USER_NAME" "$HUB_DIR"
-    as_user git clone -q "$HUB_REPO" "$HUB_DIR" || die "hub: could not clone $HUB_REPO"
-    say "hub: cloned $HUB_REPO into $HUB_DIR"
+    as_user git init -q -b main "$HUB_DIR"
+    say "hub: made $HUB_DIR a repo for the deploy workflow to push to"
   fi
-  as_user git -C "$HUB_DIR" fetch -q origin HEAD || die "hub: could not fetch $HUB_REPO"
-  as_user git -C "$HUB_DIR" -c advice.detachedHead=false checkout -q --detach FETCH_HEAD ||
-    die "hub: could not check out $HUB_REPO"
+  # A hub that used to pull: on main at the commit it has, and no origin.
+  if ! as_user git -C "$HUB_DIR" symbolic-ref -q HEAD >/dev/null; then
+    as_user git -C "$HUB_DIR" checkout -q -B main
+    say "hub: $HUB_DIR on branch main (it was detached)"
+  fi
+  if as_user git -C "$HUB_DIR" remote get-url origin &>/dev/null; then
+    as_user git -C "$HUB_DIR" remote remove origin
+    say "hub: removed $HUB_DIR's origin: the hub never pulls, the deploy workflow pushes"
+  fi
+  [[ $(as_user git -C "$HUB_DIR" config receive.denyCurrentBranch) == updateInstead ]] ||
+    as_user git -C "$HUB_DIR" config receive.denyCurrentBranch updateInstead
+  hub_deploy_user
+  if ! as_user git -C "$HUB_DIR" rev-parse -q --verify HEAD >/dev/null; then
+    say "hub: nothing deployed yet; run ticket-board's deploy workflow (see README.md, Hub box)"
+    return
+  fi
   if ! tailscale_up; then
     say "hub: tailscale is not up; install.sh hub waits for devbox login, then devbox sync"
     return
   fi
   as_user "$HUB_DIR/install.sh" hub || die "hub: $HUB_DIR/install.sh hub failed (above)"
+}
+
+# The hub's deploy user, as root: HUB_DEPLOY_USER, a system user with
+# bin/devbox-hub-deploy as its login shell, and sudo for exactly what that
+# shell runs: git-upload-pack and git-receive-pack of HUB_DIR as the box
+# user, and devbox update as root. Who may log in as it is the tailnet
+# policy's call (tag:runner only; see README.md, Deploys from ticket-board).
+hub_deploy_user() {
+  local rules
+  if write_if_changed "$HUB_DEPLOY_BIN" "$(<"$ROOT/bin/devbox-hub-deploy")" 755; then
+    say "hub: installed $HUB_DEPLOY_BIN"
+  fi
+  if ! id "$HUB_DEPLOY_USER" &>/dev/null; then
+    useradd --system --user-group --create-home --home-dir "/var/lib/$HUB_DEPLOY_USER" \
+      --shell "$HUB_DEPLOY_BIN" "$HUB_DEPLOY_USER"
+    say "hub: added $HUB_DEPLOY_USER, the deploy workflow's user"
+  elif [[ $(getent passwd "$HUB_DEPLOY_USER" | cut -d: -f7) != "$HUB_DEPLOY_BIN" ]]; then
+    usermod --shell "$HUB_DEPLOY_BIN" "$HUB_DEPLOY_USER"
+    say "hub: $HUB_DEPLOY_USER's shell is $HUB_DEPLOY_BIN again"
+  fi
+  rules="$HUB_DEPLOY_USER ALL=($USER_NAME) NOPASSWD: /usr/bin/git-upload-pack $HUB_DIR, /usr/bin/git-receive-pack $HUB_DIR
+$HUB_DEPLOY_USER ALL=(root) NOPASSWD: /usr/local/bin/devbox update"
+  if write_if_changed "$HUB_DEPLOY_SUDOERS" "$rules" 440; then
+    visudo -cqf "$HUB_DEPLOY_SUDOERS" || { rm -f "$HUB_DEPLOY_SUDOERS"; die "hub: invalid sudoers entry"; }
+    say "hub: wrote $HUB_DEPLOY_SUDOERS"
+  fi
 }
 
 # Whether service $1 runs a binary that has since been replaced on disk: the
@@ -1271,9 +1318,17 @@ install_listed_plugin() {
 }
 
 # Clones $1 (<owner>/<repo>) into ~/.claude/skill-repos, or fast-forwards it.
+# A clone whose origin names another owner (the repo moved, e.g. ticket-board
+# to UlissesTech) is pointed at $1 first, so it doesn't follow GitHub's
+# redirect from the old name, which breaks once that name is reused.
 fetch_skill_repo() {
-  local repo="$1" dest="$SKILL_REPOS/${1#*/}"
+  local repo="$1" dest="$SKILL_REPOS/${1#*/}" lower
   if [[ -d $dest/.git ]]; then
+    lower="$(tr '[:upper:]' '[:lower:]' <<<"$repo")"
+    if [[ $(origin_repo "$dest") != "$lower" ]]; then
+      git -C "$dest" remote set-url origin "https://github.com/$repo.git"
+      changed "skills: ${dest/#$USER_HOME/\~} now pulls from $repo"
+    fi
     git -C "$dest" pull -q --ff-only || say "skills: could not update ${dest/#$USER_HOME/\~}; using it as is"
   else
     say "skills: cloning $repo"
@@ -1477,7 +1532,7 @@ run_step() {
 # three values, so a change of either reruns it; install.sh is idempotent
 # itself. Nothing at all without tk_hub.
 install_tk_hub() {
-  local config="$1" url ip ref repo=DanielUlisses/ticket-board
+  local config="$1" url ip ref repo=UlissesTech/ticket-board
   local dest="$SKILL_REPOS/ticket-board" head want="" have=""
   IFS=$'\t' read -r url ip ref < <(jq -r '(.tk_hub // empty) | [.url, .ip, .token_ref] | @tsv' <<<"$config") || true
   [[ -n ${url:-} ]] || return 0
