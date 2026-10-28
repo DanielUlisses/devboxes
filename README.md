@@ -425,9 +425,7 @@ reported and the rest still run, then `update` (and the sync) exits 1:
 - **mise:** `mise upgrade` of the tools asked for as `latest` (herdr, shellcheck
   and 1password, plus any client `<tool>@latest`), then `mise prune`.
 - **claude:** `claude update`.
-- **agy:** installs it when missing. Its installer never upgrades, so each run
-  reinstalls it (the old binary is restored if that fails) and reports only
-  when the binary changed.
+- **agy:** installs it when missing, else `agy update`.
 - **cursor-agent:** installs it when missing, else `cursor-agent update`.
 - **az:** with Azure DevOps repos, `az extension update --name
   azure-devops` (added when missing); `az` itself comes with pacman.
@@ -488,7 +486,7 @@ what's missing:
 - **agy** (Google Antigravity) and **cursor-agent** (Cursor): each CLI's own
   login, no API key; both print a URL to open on another machine. `agy`
   asks you to paste a code back, then exit it. Check with `cursor-agent
-  status`; `agy auth status` is unverified (if it errors, run `agy`).
+  status` and `agy models` (it asks you to sign in when logged out).
 - **az**, with Azure DevOps repos only: `az login --use-device-code
   --allow-no-subscriptions` (open the URL, enter the code). When the login
   reaches several tenants it lists them and asks which one holds the Azure
