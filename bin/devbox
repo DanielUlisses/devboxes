@@ -1691,7 +1691,7 @@ After=network-online.target
 
 [Service]
 Environment=PATH=%h/.local/bin:%h/.local/share/mise/shims:/usr/local/bin:/usr/bin
-Environment=DEVBOX_METRICS_TOKEN_REF=$ref
+Environment=\"DEVBOX_METRICS_TOKEN_REF=$ref\"
 ExecStart=/bin/bash -c 'f=\"\$\$HOME/.config/op/service-account-token\"; if [ -s \"\$\$f\" ]; then OP_SERVICE_ACCOUNT_TOKEN=\"\$\$(cat \"\$\$f\")\"; export OP_SERVICE_ACCOUNT_TOKEN; fi; INFLUX_TOKEN=\"\$\$(op read \"\$\$DEVBOX_METRICS_TOKEN_REF\")\" || exit 1; unset OP_SERVICE_ACCOUNT_TOKEN; export INFLUX_TOKEN; exec \"\$\$@\"' telegraf %h/.local/share/devbox/telegraf/current/telegraf --config $TELEGRAF_CONF
 Restart=on-failure
 RestartSec=30

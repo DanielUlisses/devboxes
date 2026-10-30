@@ -175,8 +175,10 @@ def metrics($p):
       else str_match("\($p).org"; "^[A-Za-z0-9][A-Za-z0-9._-]*$"; "an InfluxDB org name (letters, digits, . _ -)") end),
     (.bucket | if . == null then err("\($p).bucket"; "required")
       else str_match("\($p).bucket"; "^[A-Za-z0-9][A-Za-z0-9._-]*$"; "an InfluxDB bucket name (letters, digits, . _ -)") end),
+    # Names may hold inner spaces (1Password item titles do); nothing a systemd
+    # Environment= line or op would read as special.
     (.token_ref | if . == null then err("\($p).token_ref"; "required")
-      else str_match("\($p).token_ref"; "^op://[^/@[:space:]]+/[^/@[:space:]]+(/[^/@[:space:]]+){1,2}$"; "an op://<vault>/<item>/<field> reference") end)
+      else str_match("\($p).token_ref"; "^op://[A-Za-z0-9._-]([A-Za-z0-9._ -]*[A-Za-z0-9._-])?(/[A-Za-z0-9._-]([A-Za-z0-9._ -]*[A-Za-z0-9._-])?){2,3}$"; "an op://<vault>/<item>/<field> reference") end)
   end;
 
 if . == null then {} else . end
