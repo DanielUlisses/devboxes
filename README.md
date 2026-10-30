@@ -889,7 +889,11 @@ hostname: tk-hub
   `127.0.0.1:8000`, and `tailscale serve` publishing it on
   `https://<hostname>.<tailnet>.ts.net`. Re-running it changes nothing
   unless ticket-board changed, and restarts the unit only when what it runs
-  did. Its first install takes the HTTPS name from Tailscale.
+  did. Its first install takes the HTTPS name from Tailscale. Never Funnel:
+  the hub is tailnet-only, and its UI wants a passkey on top (ticket-board's
+  `docs/security.md`: the first `hub-server passkey enroll`, scoped tokens,
+  the audit log and the tailnet policy, including only `tag:tk-hub` reaching
+  PostgreSQL).
 - **Logins.** `devbox login` asks only for Tailscale, joining as
   **`tag:tk-hub`**; then run `devbox sync` to install tk-hub. No gh,
   1Password, Claude or az. `devbox finish` refuses on a hub. `tailscale
