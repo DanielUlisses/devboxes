@@ -170,6 +170,18 @@ declare -A HERDR_PLUGINS=([persiyanov.reviewr]=persiyanov/herdr-reviewr)
 # Written by `devbox finish`; sync runs `devbox update` only once it exists.
 FINISHED=$USER_HOME/.local/state/devbox/finished
 
+# Telegraf, on a devbox whose config sets metrics: the latest
+# influxdata/telegraf release (its linux_amd64 tarball, checked against the
+# sha256 digest GitHub publishes), unpacked per version under TELEGRAF_DIR and
+# run from there by the box user's TELEGRAF_UNIT. TELEGRAF_PORT is the local
+# line-protocol listener other programs (the tk daemon) send events to.
+TELEGRAF_REPO=influxdata/telegraf
+TELEGRAF_DIR=$USER_HOME/.local/share/devbox/telegraf
+TELEGRAF_CONF=$USER_HOME/.config/devbox-telegraf/telegraf.conf
+TELEGRAF_UNIT=devbox-telegraf.service
+TELEGRAF_UNIT_FILE=$USER_HOME/.config/systemd/user/$TELEGRAF_UNIT
+TELEGRAF_PORT=8094
+
 usage() {
   cat <<EOF
 Usage: devbox bootstrap
@@ -1481,6 +1493,8 @@ finish() {
   say "skills: all installed"
   isolated install_tk_hub "$config"
   ((STATUS == 0)) || say "tk-hub: failed; rerun devbox update"
+  isolated install_metrics "$config"
+  ((STATUS == 0)) || say "metrics: failed; rerun devbox update"
   while IFS=' ' read -r repo id; do
     install_listed_plugin "$repo" "$id" </dev/null
   done < <(jq -r '(.plugins // [])[] | "\(.marketplace) \(.plugin)"' <<<"$config")
@@ -1548,6 +1562,161 @@ install_tk_hub() {
     changed "tk-hub: installed the tk daemon"
   else
     changed "tk-hub: updated the tk daemon (${head:0:7})"
+  fi
+}
+
+# systemctl --user for the box user, from finish or update (as that user).
+user_systemctl() {
+  XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}" systemctl --user "$@"
+}
+
+# The latest Telegraf release as "<version> <sha256>", the digest GitHub
+# publishes for its linux_amd64 tarball.
+telegraf_latest() {
+  local release version sha
+  release="$(gh api "repos/$TELEGRAF_REPO/releases/latest")" || die "metrics: could not read the latest Telegraf release"
+  version="$(jq -r '.tag_name | ltrimstr("v")' <<<"$release")"
+  sha="$(jq -r --arg n "telegraf-${version}_linux_amd64.tar.gz" \
+    '.assets[] | select(.name == $n) | .digest // "" | ltrimstr("sha256:")' <<<"$release")"
+  [[ $version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ && $sha =~ ^[0-9a-f]{64}$ ]] ||
+    die "metrics: the latest Telegraf release has no linux_amd64 tarball with a sha256 digest (got v$version '$sha')"
+  printf '%s %s\n' "$version" "$sha"
+}
+
+# Telegraf release $1 (tarball sha256 $2) unpacked into TELEGRAF_DIR/$1, with
+# TELEGRAF_DIR/current linking it and older versions removed. Returns 1 when
+# it was already the current one.
+telegraf_install() {
+  local version="$1" sha="$2" name tmp
+  [[ $(readlink "$TELEGRAF_DIR/current" 2>/dev/null) == "$version" && -x $TELEGRAF_DIR/$version/telegraf ]] && return 1
+  name="telegraf-${version}_linux_amd64.tar.gz"
+  tmp="$(mktemp -d)"
+  if ! gh release download "v$version" -R "$TELEGRAF_REPO" -p "$name" -D "$tmp" >/dev/null ||
+    ! sha256sum -c --quiet <<<"$sha  $tmp/$name"; then
+    rm -rf "$tmp"
+    die "metrics: could not download Telegraf v$version with sha256 $sha"
+  fi
+  # The tarball holds ./telegraf-<version>/usr/bin/telegraf and its sample config.
+  tar -xzf "$tmp/$name" -C "$tmp" --no-same-owner --wildcards '*/usr/bin/telegraf' ||
+    { rm -rf "$tmp"; die "metrics: could not unpack Telegraf v$version"; }
+  install -D -m 755 "$tmp"/telegraf-*/usr/bin/telegraf "$TELEGRAF_DIR/$version/telegraf"
+  rm -rf "$tmp"
+  ln -sfn "$version" "$TELEGRAF_DIR/current"
+  find "$TELEGRAF_DIR" -mindepth 1 -maxdepth 1 ! -name "$version" ! -name current -exec rm -rf {} +
+}
+
+# Telegraf's config for resolved config $1: host metrics every 30 s, the local
+# listener, and the InfluxDB output. The token is ${INFLUX_TOKEN}, which the
+# unit fills from op at start; nothing secret is written.
+telegraf_config() {
+  jq -r --arg port "$TELEGRAF_PORT" '"# Written by devbox (finish and update) from the client'"'"'s metrics field.
+[agent]
+  interval = \"30s\"
+  flush_interval = \"30s\"
+  hostname = \"\(.hostname)\"
+  omit_hostname = false
+
+[[outputs.influxdb_v2]]
+  urls = [\"\(.metrics.url | rtrimstr("/"))\"]
+  token = \"${INFLUX_TOKEN}\"
+  organization = \"\(.metrics.org)\"
+  bucket = \"\(.metrics.bucket)\"
+
+# Events from local programs (the tk daemon), as InfluxDB line protocol.
+[[inputs.socket_listener]]
+  service_address = \"udp://127.0.0.1:\($port)\"
+  data_format = \"influx\"
+
+[[inputs.cpu]]
+  percpu = false
+  totalcpu = true
+
+[[inputs.mem]]
+[[inputs.swap]]
+[[inputs.system]]
+[[inputs.processes]]
+
+[[inputs.disk]]
+  mount_points = [\"/\"]
+
+[[inputs.diskio]]
+
+[[inputs.net]]
+  ignore_protocol_stats = true
+
+# Container counts and resource use; no labels (they can carry anything).
+[[inputs.docker]]
+  endpoint = \"unix:///var/run/docker.sock\"
+  perdevice_include = []
+  total_include = [\"cpu\", \"blkio\", \"network\"]
+  docker_label_exclude = [\"*\"]"' <<<"$1"
+}
+
+# On a box with metrics set: Telegraf installed (or upgraded to the latest
+# release, on update) and run as the box user's TELEGRAF_UNIT, its InfluxDB
+# token read by `op read <token_ref>` at start and held in its environment
+# only. Removing metrics stops and disables the unit. $2: upgrade, to move
+# to a newer Telegraf release when there is one.
+install_metrics() {
+  local config="$1" upgrade="${2:-}" ref latest version sha unit restart=false
+  ref="$(jq -r '.metrics.token_ref // empty' <<<"$config")"
+  if [[ -z $ref ]]; then
+    [[ -f $TELEGRAF_UNIT_FILE ]] || return 0
+    if [[ -d /run/systemd/system ]]; then
+      user_systemctl disable --now "$TELEGRAF_UNIT" 2>/dev/null || true
+    fi
+    rm -f "$TELEGRAF_UNIT_FILE"
+    changed "metrics: stopped Telegraf (metrics is no longer set)"
+    return 0
+  fi
+
+  if [[ -n $upgrade || ! -x $TELEGRAF_DIR/current/telegraf ]]; then
+    latest="$(telegraf_latest)"
+    read -r version sha <<<"$latest"
+    if telegraf_install "$version" "$sha"; then
+      changed "metrics: installed Telegraf v$version"
+      restart=true
+    fi
+  fi
+
+  if write_if_changed "$TELEGRAF_CONF" "$(telegraf_config "$config")" 644; then
+    changed "metrics: wrote ${TELEGRAF_CONF/#$USER_HOME/\~}"
+    restart=true
+  fi
+  # The op service-account token is loaded the way the box's .bashrc does;
+  # the InfluxDB token goes only into Telegraf's environment.
+  unit="[Unit]
+Description=Telegraf: this devbox's metrics to InfluxDB
+After=network-online.target
+
+[Service]
+Environment=PATH=%h/.local/bin:%h/.local/share/mise/shims:/usr/local/bin:/usr/bin
+Environment=\"DEVBOX_METRICS_TOKEN_REF=$ref\"
+ExecStart=/bin/bash -c 'f=\"\$\$HOME/.config/op/service-account-token\"; if [ -s \"\$\$f\" ]; then OP_SERVICE_ACCOUNT_TOKEN=\"\$\$(cat \"\$\$f\")\"; export OP_SERVICE_ACCOUNT_TOKEN; fi; INFLUX_TOKEN=\"\$\$(op read \"\$\$DEVBOX_METRICS_TOKEN_REF\")\" || exit 1; unset OP_SERVICE_ACCOUNT_TOKEN; export INFLUX_TOKEN; exec \"\$\$@\"' telegraf %h/.local/share/devbox/telegraf/current/telegraf --config $TELEGRAF_CONF
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=default.target"
+  if write_if_changed "$TELEGRAF_UNIT_FILE" "$unit" 644; then
+    changed "metrics: wrote ${TELEGRAF_UNIT_FILE/#$USER_HOME/\~}"
+    restart=true
+  fi
+
+  if [[ ! -d /run/systemd/system ]]; then
+    say "metrics: no systemd, Telegraf not started"
+    return 0
+  fi
+  # A user unit runs without a login only with linger on.
+  [[ $(loginctl show-user "$USER_NAME" -p Linger --value 2>/dev/null) == yes ]] ||
+    sudo loginctl enable-linger "$USER_NAME"
+  user_systemctl daemon-reload
+  if ! user_systemctl is-enabled -q "$TELEGRAF_UNIT" 2>/dev/null || ! user_systemctl is-active -q "$TELEGRAF_UNIT"; then
+    user_systemctl enable --now "$TELEGRAF_UNIT"
+    changed "metrics: started Telegraf"
+  elif $restart; then
+    user_systemctl restart "$TELEGRAF_UNIT"
+    changed "metrics: restarted Telegraf"
   fi
 }
 
@@ -1736,6 +1905,7 @@ update() {
   run_step ssh pin_github_host_keys
   run_step skills update_skills "$config"
   run_step tk-hub install_tk_hub "$config"
+  run_step metrics install_metrics "$config" upgrade
   run_step plugins install_new_plugins "$config"
   run_step plugin-versions update_plugins
   run_step herdr herdr_plugins

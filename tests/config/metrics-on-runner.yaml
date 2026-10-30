@@ -1,0 +1,10 @@
+# expect: metrics: allowed only when role is devbox
+role: runner
+runners:
+  org: example-org
+  labels: [homelab]
+metrics:
+  url: http://influx.example.lan:8086
+  org: homelab
+  bucket: devboxes
+  token_ref: op://vault/influx/token

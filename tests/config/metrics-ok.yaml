@@ -1,0 +1,7 @@
+# expect: ok
+claude_account: work
+metrics:
+  url: http://172.16.0.20:8086
+  org: homelab
+  bucket: devboxes
+  token_ref: op://work/influx devboxes/token

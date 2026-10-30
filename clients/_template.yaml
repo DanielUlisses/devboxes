@@ -112,6 +112,24 @@ skills: []
 #   ip: 100.64.0.10
 #   token_ref: op://example-vault/example-item/token
 
+# Where this devbox's metrics go: an InfluxDB 2 (or 3, which takes the same
+# write API). All four keys required: `url` the InfluxDB the box reaches
+# (http or https, LAN or tailnet), `org` and `bucket` to write to, and
+# `token_ref` the op:// reference of a token that may write that bucket (the
+# token itself is never stored here, nor on the box: Telegraf reads it with
+# op at start). When set, `devbox finish` and `update` install Telegraf
+# (a pinned upstream release, checksum-verified) and run it as the box
+# user's devbox-telegraf unit: CPU, memory, swap, disk, network, processes
+# and Docker, every 30 s, plus whatever local programs (the tk daemon) send
+# to its line-protocol listener on udp://127.0.0.1:8094. Points carry the
+# box's hostname as their `host` tag. Devbox only. Removing the field stops
+# and disables the unit.
+# metrics:
+#   url: http://influx.example.lan:8086
+#   org: example-org
+#   bucket: devboxes
+#   token_ref: op://example-vault/example-influx/token
+
 # Repos to clone into ~/work/<repo>: GitHub ones as <owner>/<repo>, Azure
 # DevOps ones as their SSH URL, git@ssh.dev.azure.com:v3/<org>/<project>/<repo>.
 # `devbox finish` and `devbox sync` clone newly listed ones; removed ones are

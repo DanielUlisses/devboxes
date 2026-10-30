@@ -1,0 +1,7 @@
+# expect: metrics.token_ref: must be an op://
+claude_account: work
+metrics:
+  url: http://influx.example.lan:8086
+  org: homelab
+  bucket: devboxes
+  token_ref: plain-token-value
