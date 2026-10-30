@@ -469,7 +469,8 @@ A devbox whose client file sets `metrics` (`url`, `org`, `bucket`,
 `devbox finish` and kept current by `update`:
 
 - the latest `influxdata/telegraf` release, its `linux_amd64` tarball
-  checked against the sha256 digest GitHub publishes, unpacked under
+  (from `dl.influxdata.com`) checked against the sha256 its release notes
+  list, unpacked under
   `~/.local/share/devbox/telegraf/<version>`;
 - `~/.config/devbox-telegraf/telegraf.conf`: CPU, memory, swap, load,
   processes, `/` disk, disk I/O, network and Docker totals every 30 s, with
