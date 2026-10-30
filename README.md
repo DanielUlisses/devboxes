@@ -411,6 +411,9 @@ reported and the rest still run, then `update` (and the sync) exits 1:
   `.git/devbox-installed`; a failed install is retried next time.
   `mattpocock-skills` is a plugin, updated by `plugin-versions`. Skills
   newly listed in the client file are installed.
+- **metrics:** with `metrics` set, moves Telegraf to the latest release
+  and rewrites its config and unit (see [Metrics](#metrics-telegraf-to-influxdb));
+  without it, stops a Telegraf left from before.
 - **plugins:** installs the plugins newly listed under `plugins:` in the
   client file (adding the marketplace first unless it is configured); a
   failing plugin doesn't stop the others. Removed entries stay installed.
@@ -458,6 +461,36 @@ Docker is left alone while a job runs, as restarting it kills the job; the
 binary stays marked, so the next daily run restarts it. A restart of
 `tailscaled` briefly drops open Tailscale SSH sessions. Without systemd
 (a plain chroot) there is no timer.
+
+### Metrics: Telegraf to InfluxDB
+
+A devbox whose client file sets `metrics` (`url`, `org`, `bucket`,
+`token_ref`; see `clients/_template.yaml`) runs Telegraf, installed by
+`devbox finish` and kept current by `update`:
+
+- the latest `influxdata/telegraf` release, its `linux_amd64` tarball
+  checked against the sha256 digest GitHub publishes, unpacked under
+  `~/.local/share/devbox/telegraf/<version>`;
+- `~/.config/devbox-telegraf/telegraf.conf`: CPU, memory, swap, load,
+  processes, `/` disk, disk I/O, network and Docker totals every 30 s, with
+  the box's hostname as the `host` tag, written to the InfluxDB 2 write API
+  (InfluxDB 3 takes the same);
+- a line-protocol listener on `udp://127.0.0.1:8094`, where the tk daemon
+  sends its events (agents running, phase and RPC durations, failures,
+  usage %), so the box holds one InfluxDB credential, Telegraf's;
+- the box user's `devbox-telegraf.service` (linger on), which reads the
+  token with `op read <token_ref>` at start into Telegraf's environment
+  only; it is never written to disk.
+
+```
+systemctl --user status devbox-telegraf
+journalctl --user -u devbox-telegraf
+```
+
+The token needs write access to the bucket and nothing else. Boxes reach a
+LAN InfluxDB directly; one on the tailnet needs a grant from `tag:devbox`
+to its port (see [Tailscale ACL](#tailscale-acl)). Removing `metrics`
+stops and disables the unit at the next `update`.
 
 ### Logging in and finishing
 

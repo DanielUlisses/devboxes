@@ -70,6 +70,10 @@ plugins: []
 # client file only; see clients/_template.yaml.
 tk_hub:
 
+# A devbox's metrics sink (url, org, bucket, token_ref): none by default. Set
+# in a client file only; see clients/_template.yaml.
+metrics:
+
 repos: []
 
 # Proxmox backup job for the box (vzdump, snapshot mode, zstd), to the

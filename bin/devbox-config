@@ -161,11 +161,29 @@ def tk_hub($p):
       else str_match("\($p).token_ref"; "^op://[^/@[:space:]]+/[^/@[:space:]]+(/[^/@[:space:]]+){1,2}$"; "an op://<vault>/<item>/<field> reference") end)
   end;
 
+# A devbox'"'"'s metrics sink: the InfluxDB 2 write API its Telegraf sends to
+# (http or https, LAN or tailnet), the org and bucket, and an op:// reference
+# to a token that may write that bucket.
+def metrics($p):
+  if . == null then empty
+  elif type != "object" then err($p; "must be a mapping of url, org, bucket and token_ref \(got)")
+  else
+    unknown_keys("\($p)."; ["url", "org", "bucket", "token_ref"]),
+    (.url | if . == null then err("\($p).url"; "required")
+      else str_match("\($p).url"; "^https?://[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?(:[0-9]{1,5})?/?$"; "an http(s) URL like http://influx.example.lan:8086") end),
+    (.org | if . == null then err("\($p).org"; "required")
+      else str_match("\($p).org"; "^[A-Za-z0-9][A-Za-z0-9._-]*$"; "an InfluxDB org name (letters, digits, . _ -)") end),
+    (.bucket | if . == null then err("\($p).bucket"; "required")
+      else str_match("\($p).bucket"; "^[A-Za-z0-9][A-Za-z0-9._-]*$"; "an InfluxDB bucket name (letters, digits, . _ -)") end),
+    (.token_ref | if . == null then err("\($p).token_ref"; "required")
+      else str_match("\($p).token_ref"; "^op://[^/@[:space:]]+/[^/@[:space:]]+(/[^/@[:space:]]+){1,2}$"; "an op://<vault>/<item>/<field> reference") end)
+  end;
+
 if . == null then {} else . end
 | if type != "object" then err("(top level)"; "must be a mapping of fields \(got)")
   else
     unknown_keys(""; ["hostname", "host", "role", "claude_account", "git_name", "git_email", "resources", "packages", "tools", "skills",
-                     "repos", "plugins", "timezone", "backup", "backup_schedule", "backup_keep", "runners", "tk_hub"]
+                     "repos", "plugins", "timezone", "backup", "backup_schedule", "backup_keep", "runners", "tk_hub", "metrics"]
                      + if $required then [] else ["runner_resources", "hub_resources"] end),
 
     (.hostname | str_match("hostname"; "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$";
@@ -231,6 +249,12 @@ if . == null then {} else . end
             (.tk_hub | tk_hub("tk_hub"))
        else .tk_hub | tk_hub("tk_hub") end),
 
+    # Telegraf runs on a devbox only, where its token comes from op.
+    ((.role // $default_role) as $role
+     | if $required and $role != "devbox" and .metrics != null
+       then err("metrics"; "allowed only when role is devbox (role is \($role))")
+       else .metrics | metrics("metrics") end),
+
     (.backup | if . == null or type == "boolean" then empty
                else err("backup"; "must be true or false \(got)") end),
     (.backup_schedule | str_match("backup_schedule"; "^[A-Za-z0-9][A-Za-z0-9 :.,*/~+-]*$";
@@ -260,9 +284,10 @@ def strip_nulls: if type == "object" then with_entries(select(.value != null) | 
 | ($d * $c)
 | .hostname //= "dev-\($name)"
 | .skills = (reduce (($d.skills // []) + ($c.skills // []))[] as $s ([]; if IN(.[]; $s) then . else . + [$s] end))
-| {hostname, host, role, claude_account, git_name, git_email, resources, packages, tools, skills, repos, plugins, timezone, backup, backup_schedule, backup_keep, runners, tk_hub}
+| {hostname, host, role, claude_account, git_name, git_email, resources, packages, tools, skills, repos, plugins, timezone, backup, backup_schedule, backup_keep, runners, tk_hub, metrics}
 | if .role == "runner" then . else del(.runners) end
 | if .role == "devbox" and .tk_hub != null then . else del(.tk_hub) end
+| if .role == "devbox" and .metrics != null then . else del(.metrics) end
 '
 
 # Prints the errors of one file, prefixed with its displayed path.

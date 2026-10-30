@@ -1,0 +1,6 @@
+# expect: metrics.bucket: required
+claude_account: work
+metrics:
+  url: http://influx.example.lan:8086
+  org: homelab
+  token_ref: op://vault/influx/token
