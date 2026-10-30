@@ -171,11 +171,13 @@ declare -A HERDR_PLUGINS=([persiyanov.reviewr]=persiyanov/herdr-reviewr)
 FINISHED=$USER_HOME/.local/state/devbox/finished
 
 # Telegraf, on a devbox whose config sets metrics: the latest
-# influxdata/telegraf release (its linux_amd64 tarball, checked against the
-# sha256 digest GitHub publishes), unpacked per version under TELEGRAF_DIR and
-# run from there by the box user's TELEGRAF_UNIT. TELEGRAF_PORT is the local
-# line-protocol listener other programs (the tk daemon) send events to.
+# influxdata/telegraf release (its linux_amd64 tarball from TELEGRAF_DOWNLOADS,
+# checked against the sha256 its release notes list), unpacked per version
+# under TELEGRAF_DIR and run from there by the box user's TELEGRAF_UNIT.
+# TELEGRAF_PORT is the local line-protocol listener other programs (the tk
+# daemon) send events to.
 TELEGRAF_REPO=influxdata/telegraf
+TELEGRAF_DOWNLOADS=https://dl.influxdata.com/telegraf/releases
 TELEGRAF_DIR=$USER_HOME/.local/share/devbox/telegraf
 TELEGRAF_CONF=$USER_HOME/.config/devbox-telegraf/telegraf.conf
 TELEGRAF_UNIT=devbox-telegraf.service
@@ -1570,14 +1572,15 @@ user_systemctl() {
   XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}" systemctl --user "$@"
 }
 
-# The latest Telegraf release as "<version> <sha256>", the digest GitHub
-# publishes for its linux_amd64 tarball.
+# The latest Telegraf release as "<version> <sha256>". Its GitHub releases
+# carry no assets: the linux_amd64 tarball is on TELEGRAF_DOWNLOADS, its sha256
+# in the release notes' table ("amd64 | Linux | [<name>](<url>) | <sha256>").
 telegraf_latest() {
   local release version sha
   release="$(gh api "repos/$TELEGRAF_REPO/releases/latest")" || die "metrics: could not read the latest Telegraf release"
   version="$(jq -r '.tag_name | ltrimstr("v")' <<<"$release")"
   sha="$(jq -r --arg n "telegraf-${version}_linux_amd64.tar.gz" \
-    '.assets[] | select(.name == $n) | .digest // "" | ltrimstr("sha256:")' <<<"$release")"
+    '.body // "" | split("\n") | map(select(contains("[\($n)]")))[0] // "" | split("|")[-1] | gsub("\\s"; "")' <<<"$release")"
   [[ $version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ && $sha =~ ^[0-9a-f]{64}$ ]] ||
     die "metrics: the latest Telegraf release has no linux_amd64 tarball with a sha256 digest (got v$version '$sha')"
   printf '%s %s\n' "$version" "$sha"
@@ -1591,7 +1594,7 @@ telegraf_install() {
   [[ $(readlink "$TELEGRAF_DIR/current" 2>/dev/null) == "$version" && -x $TELEGRAF_DIR/$version/telegraf ]] && return 1
   name="telegraf-${version}_linux_amd64.tar.gz"
   tmp="$(mktemp -d)"
-  if ! gh release download "v$version" -R "$TELEGRAF_REPO" -p "$name" -D "$tmp" >/dev/null ||
+  if ! curl -fsSL -o "$tmp/$name" "$TELEGRAF_DOWNLOADS/$name" ||
     ! sha256sum -c --quiet <<<"$sha  $tmp/$name"; then
     rm -rf "$tmp"
     die "metrics: could not download Telegraf v$version with sha256 $sha"
