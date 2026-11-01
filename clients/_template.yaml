@@ -130,6 +130,15 @@ skills: []
 #   bucket: devboxes
 #   token_ref: op://example-vault/example-influx/token
 
+# Whether ticket-skill starts each ticket's agent under Claude Remote Control
+# (`claude --remote-control`), so tk-hub's Sessions page can open the session
+# in the Claude app. `devbox finish` and `update` write it as `remote_control`
+# in the box policy, ~/.config/tk-daemon/policy.json, which the launcher
+# reads. Leave it false for a client whose Claude plan has Remote Control
+# turned off: its sessions are still reached with herdr over Tailscale SSH.
+# Devbox only. Default: false.
+# remote_control: true
+
 # Repos to clone into ~/work/<repo>: GitHub ones as <owner>/<repo>, Azure
 # DevOps ones as their SSH URL, git@ssh.dev.azure.com:v3/<org>/<project>/<repo>.
 # `devbox finish` and `devbox sync` clone newly listed ones; removed ones are

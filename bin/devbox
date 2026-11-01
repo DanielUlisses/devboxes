@@ -1497,6 +1497,8 @@ finish() {
   ((STATUS == 0)) || say "tk-hub: failed; rerun devbox update"
   isolated install_metrics "$config"
   ((STATUS == 0)) || say "metrics: failed; rerun devbox update"
+  isolated write_box_policy "$config"
+  ((STATUS == 0)) || say "remote-control: failed; rerun devbox update"
   while IFS=' ' read -r repo id; do
     install_listed_plugin "$repo" "$id" </dev/null
   done < <(jq -r '(.plugins // [])[] | "\(.marketplace) \(.plugin)"' <<<"$config")
@@ -1564,6 +1566,41 @@ install_tk_hub() {
     changed "tk-hub: installed the tk daemon"
   else
     changed "tk-hub: updated the tk daemon (${head:0:7})"
+  fi
+}
+
+# The box policy's remote_control: ticket-skill's launcher starts each ticket's
+# agent with claude --remote-control when it is true, so tk-hub's Sessions page
+# can link the session in the Claude app. Only that key of
+# ~/.config/tk-daemon/policy.json is written (the tk daemon and tk.sh read the
+# rest); an absent file stays absent while the value is false (absent is off).
+write_box_policy() {
+  local config="$1" file="$USER_HOME/.config/tk-daemon/policy.json" want have tmp
+  [[ $(jq -r .role <<<"$config") == devbox ]] || return 0
+  want="$(jq '.remote_control == true' <<<"$config")"
+  if [[ -s $file ]]; then
+    have="$(jq '.remote_control' "$file")" || die "remote-control: $file is not valid JSON"
+  else
+    [[ $want == true ]] || return 0
+    have=null
+  fi
+  [[ $have != "$want" ]] || return 0
+  mkdir -p "${file%/*}"
+  tmp="$(mktemp "$file.XXXXXX")"
+  if [[ -s $file ]]; then
+    jq --argjson v "$want" '.remote_control = $v' "$file" >"$tmp"
+  else
+    jq -n --argjson v "$want" '{remote_control: $v}' >"$tmp"
+  fi || {
+    rm -f "$tmp"
+    die "remote-control: could not write $file"
+  }
+  chmod 644 "$tmp"
+  mv "$tmp" "$file"
+  if [[ $want == true ]]; then
+    changed "remote-control: on for ticket agents"
+  else
+    changed "remote-control: off for ticket agents"
   fi
 }
 
@@ -1909,6 +1946,7 @@ update() {
   run_step skills update_skills "$config"
   run_step tk-hub install_tk_hub "$config"
   run_step metrics install_metrics "$config" upgrade
+  run_step remote-control write_box_policy "$config"
   run_step plugins install_new_plugins "$config"
   run_step plugin-versions update_plugins
   run_step herdr herdr_plugins

@@ -414,6 +414,12 @@ reported and the rest still run, then `update` (and the sync) exits 1:
 - **metrics:** with `metrics` set, moves Telegraf to the latest release
   and rewrites its config and unit (see [Metrics](#metrics-telegraf-to-influxdb));
   without it, stops a Telegraf left from before.
+- **remote-control:** writes the client file's `remote_control` into the
+  box policy (`~/.config/tk-daemon/policy.json`, that key only), which
+  ticket-skill's launcher reads to start ticket agents with
+  `claude --remote-control`; tk-hub's Sessions page then links each session
+  in the Claude app. Off where the client's plan has Remote Control turned
+  off; the session is still reached with `herdr --remote` over Tailscale SSH.
 - **plugins:** installs the plugins newly listed under `plugins:` in the
   client file (adding the marketplace first unless it is configured); a
   failing plugin doesn't stop the others. Removed entries stay installed.

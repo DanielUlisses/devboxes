@@ -1,0 +1,3 @@
+# expect: remote_control: must be true or false
+claude_account: example
+remote_control: "yes"

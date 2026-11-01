@@ -1,0 +1,6 @@
+# expect: remote_control: allowed only when role is devbox
+role: runner
+runners:
+  org: example-org
+  labels: [homelab]
+remote_control: true
