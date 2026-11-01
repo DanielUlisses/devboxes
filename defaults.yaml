@@ -74,6 +74,10 @@ tk_hub:
 # in a client file only; see clients/_template.yaml.
 metrics:
 
+# Ticket agents start under Claude Remote Control (the Claude app link on
+# tk-hub's Sessions page): off by default; see clients/_template.yaml.
+remote_control: false
+
 repos: []
 
 # Proxmox backup job for the box (vzdump, snapshot mode, zstd), to the
