@@ -532,6 +532,13 @@ doctor timers, Terraform processes left running for over a day, and the gh login
 `bin/devbox-host doctor` is a different check: this machine's ssh entries for
 the boxes.
 
+A box with `tk_hub` tells the hub after every run, with the tk daemon's token,
+and the hub's own box tells it directly with `hub-server doctor report`, which
+needs no token and works with the web service down. A failure opens an urgent
+inbox item, which also notifies; warnings alone open a normal one; a clean run
+resolves it. A hub that couldn't be told marks the unit failed, and the next run
+tries again. A runner box has no token, so its report stays on the box.
+
 ### Metrics: Telegraf to InfluxDB
 
 A devbox whose client file sets `metrics` (`url`, `org`, `bucket`,
