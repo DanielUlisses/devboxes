@@ -78,6 +78,10 @@ metrics:
 # tk-hub's Sessions page): off by default; see clients/_template.yaml.
 remote_control: false
 
+# The skills catalog (DanielUlisses/skills-catalog) synced to /opt/skills for
+# ticket agents: off by default; see clients/_template.yaml.
+skills_catalog: false
+
 repos: []
 
 # Proxmox backup job for the box (vzdump, snapshot mode, zstd), to the

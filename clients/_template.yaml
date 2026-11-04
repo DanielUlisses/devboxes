@@ -139,6 +139,16 @@ skills: []
 # Devbox only. Default: false.
 # remote_control: true
 
+# Whether the box gets the skills catalog (the private
+# DanielUlisses/skills-catalog repo): `devbox finish` and `update` clone it and
+# copy the skills approved for this client, each at its pinned commit, into
+# /opt/skills/<name>/, with /opt/skills/index.json listing them. That is outside
+# ~/.claude/skills, so none is on by itself: tk-hub's project Skills tab turns
+# skills on per board (the board policy `skills`), and ticket-skill links those
+# into each ticket's worktree. Turning it off removes /opt/skills. Devbox only.
+# Default: false.
+# skills_catalog: true
+
 # Repos to clone into ~/work/<repo>: GitHub ones as <owner>/<repo>, Azure
 # DevOps ones as their SSH URL, git@ssh.dev.azure.com:v3/<org>/<project>/<repo>.
 # `devbox finish` and `devbox sync` clone newly listed ones; removed ones are
