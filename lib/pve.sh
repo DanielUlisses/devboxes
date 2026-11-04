@@ -14,10 +14,28 @@ VMID_MIN=2000
 VMID_MAX=2099
 DEVBOX_TAG=devbox
 BACKUP_STORAGE="${DEVBOX_BACKUP_STORAGE:-local}"
+ROOTFS_STORAGE="${DEVBOX_STORAGE:-local-lvm}"
 
 die() {
   printf '%s: %s\n' "${0##*/}" "$*" >&2
   exit 1
+}
+
+# "40G" -> 40, in whole GB as pct's volume sizes want; M rounds up.
+disk_gb() {
+  local n="${1%?}"
+  case "$1" in
+    *M) echo $(((n + 1023) / 1024)) ;;
+    *G) echo "$n" ;;
+    *T) echo $((n * 1024)) ;;
+  esac
+}
+
+# The pct mount point spec of a $1 GB /tmp volume. discard hands deleted files'
+# blocks back to the thin pool; nosuid and nodev match the tmpfs it replaces.
+# Mount points stay out of vzdump backups unless they ask for backup=1.
+tmp_disk_spec() {
+  printf '%s:%s,mp=/tmp,mountoptions=discard;nosuid;nodev' "$ROOTFS_STORAGE" "$1"
 }
 
 say() {
@@ -34,8 +52,12 @@ pve() {
   [[ -n $DEVBOX_HOST ]] || die "DEVBOX_HOST is not set: export it to the Proxmox host's name (it is kept out of this public repo)"
   case "$1 ${2:-}" in
     "pct list") ;;
-    "pct create" | "pct start" | "pct stop" | "pct destroy" | "pct exec" | "pct config" | "pct status")
+    "pct create" | "pct start" | "pct stop" | "pct shutdown" | "pct destroy" | "pct exec" | "pct config" | "pct status")
       in_range "${3:-}" || die "refusing 'pct $2' on VMID '${3:-}': outside $VMID_MIN-$VMID_MAX" ;;
+    "pct set")
+      in_range "${3:-}" || die "refusing 'pct $2' on VMID '${3:-}': outside $VMID_MIN-$VMID_MAX"
+      [[ ${4:-} == --mp0 && ${5:-} == *,mp=/tmp,* && $# == 5 ]] ||
+        die "refusing 'pct set ${*:3}': only adding /tmp's volume is allowed" ;;
     "pvesh get")
       [[ ${3:-} == /cluster/resources || ${3:-} == /cluster/backup ]] ||
         die "refusing 'pvesh get ${3:-}': only /cluster/resources and /cluster/backup are read" ;;

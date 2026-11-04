@@ -14,8 +14,9 @@ bin/devbox-config      prints a client's resolved config, or fails naming the ba
 bin/devbox-create      creates, starts and bootstraps a client's container on the Proxmox host
 bin/devbox-sync        syncs a client's box to this checkout's config, from your machine
 bin/devbox-destroy     stops and destroys it
+bin/devbox-tmp-disk    moves an existing box's /tmp onto its own volume, restarting the box
 bin/devbox-host        this machine's side of the boxes: ssh config entries, herdr machines, host keys
-bin/devbox             runs inside a box: `devbox bootstrap`, `sync`, `login`, `finish`, `update`, `upgrade`, `logout`, `rc`
+bin/devbox             runs inside a box: `devbox bootstrap`, `sync`, `login`, `finish`, `update`, `upgrade`, `maintenance`, `logout`, `rc`
 bin/devbox-agent-instructions  prints a box's agent instructions (~/.claude/CLAUDE.md, ~/AGENTS.md) from a resolved config
 bin/devbox-browser     $BROWSER in a box: prints URLs instead of opening them
 bin/devbox-runner-dispatch  a runner box's dispatcher: one just-in-time Actions runner per queued job
@@ -474,6 +475,46 @@ Docker is left alone while a job runs, as restarting it kills the job; the
 binary stays marked, so the next daily run restarts it. A restart of
 `tailscaled` briefly drops open Tailscale SSH sessions. Without systemd
 (a plain chroot) there is no timer.
+
+### `/tmp` and maintenance: `devbox maintenance`
+
+Arch mounts `/tmp` as a tmpfs, whose files stay in the box's memory and swap
+where no OOM kill can free them. Agents keep Terraform providers in their
+scratchpads there, and 10 GB of them once locked a box up. So a box with
+`resources.tmp_disk` (15 GB by default; runner and hub boxes have none) gets
+`/tmp` on its own thin volume: page cache the kernel can drop, and a limit that
+stops at `/tmp` rather than filling the root disk. `devbox-create` adds the
+volume and `devbox sync` masks `tmp.mount`. An existing box needs a restart for
+it, so that's a separate step:
+
+```
+bin/devbox-tmp-disk --restart <client>
+```
+
+Every box also gets `devbox-maintenance.timer`, written and enabled by `devbox
+sync`: daily at 04:30 (up to 30 minutes later, run at the next boot if the box
+was off), at idle priority. It is not configurable.
+
+```
+devbox maintenance --dry-run   # what it would delete; deletes nothing
+cat /var/lib/devbox/maintenance-report.txt   # the last run
+```
+
+It deletes:
+
+- Claude scratchpads with no write for 3 days, unless a process has a file open
+  or its cwd there, or runs in that scratchpad's project.
+- Docker images no container uses (a stopped one counts as using it) and build
+  cache, created over 7 days ago. That's when the image was built, not when it
+  was pulled, so an old image pulled today goes at the next run if nothing uses
+  it. Images come back with a pull; one built locally needs its build again.
+
+It only reports, for a person to act on: disk use, the pacman cache, journal and
+tool caches, and worktrees that are clean, with no stash and every commit
+pushed. Pushed doesn't mean finished, so it never removes a worktree.
+
+systemd's own `systemd-tmpfiles-clean` still removes anything in `/tmp` untouched
+for 10 days.
 
 ### Metrics: Telegraf to InfluxDB
 

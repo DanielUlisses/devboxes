@@ -101,6 +101,14 @@ RUNNER_DISPATCH_UNIT=devbox-runner-dispatch.service
 # The unattended OS upgrade every box gets: a systemd timer running `devbox
 # upgrade` daily, so a box is patched without anyone running sync or update.
 UPGRADE_UNIT=devbox-upgrade
+MAINTENANCE_UNIT=devbox-maintenance
+# What `devbox maintenance` leaves alone: scratchpads written to more recently,
+# and unused images created more recently (docker's until filter goes by when
+# the image was built, not when it was pulled).
+MAINTENANCE_TMP_DAYS=3
+MAINTENANCE_IMAGE_HOURS=168
+# The last run's report, readable by the box user.
+MAINTENANCE_REPORT=$STATE/maintenance-report.txt
 # Daemons `devbox upgrade` restarts once pacman has replaced their binary.
 UPGRADE_RESTART=(tailscaled docker)
 
@@ -198,6 +206,7 @@ Usage: devbox bootstrap
        devbox update [--config-json <json>] [--no-pacman-upgrade]
        devbox logout
        devbox upgrade
+       devbox maintenance [--dry-run]
        devbox rc [<name>]
 
 Run inside a devbox.
@@ -900,6 +909,169 @@ WantedBy=timers.target"
   fi
 }
 
+# The daily maintenance, every role, as upgrade_timer does the upgrade.
+maintenance_timer() {
+  local service timer wrote=false
+  if [[ ! -d /run/systemd/system ]]; then
+    say "maintenance: no systemd, no timer"
+    return
+  fi
+  service="[Unit]
+Description=devbox: delete unused scratchpads and images, report the rest
+
+[Service]
+Type=oneshot
+Nice=19
+IOSchedulingClass=idle
+ExecStart=/usr/local/bin/devbox maintenance"
+  timer="[Unit]
+Description=devbox: daily maintenance
+
+[Timer]
+OnCalendar=*-*-* 04:30
+RandomizedDelaySec=30min
+Persistent=true
+
+[Install]
+WantedBy=timers.target"
+  ! write_if_changed "/etc/systemd/system/$MAINTENANCE_UNIT.service" "$service" 644 || wrote=true
+  ! write_if_changed "/etc/systemd/system/$MAINTENANCE_UNIT.timer" "$timer" 644 || wrote=true
+  if $wrote; then
+    systemctl daemon-reload
+    say "maintenance: wrote $MAINTENANCE_UNIT.service and .timer"
+  fi
+  if [[ $(systemctl is-enabled "$MAINTENANCE_UNIT.timer" 2>/dev/null) != enabled ]] ||
+    ! systemctl is-active -q "$MAINTENANCE_UNIT.timer"; then
+    systemctl enable --now "$MAINTENANCE_UNIT.timer"
+    say "maintenance: enabled $MAINTENANCE_UNIT.timer (daily 04:30)"
+  fi
+}
+
+# With resources.tmp_disk, stops systemd mounting a tmpfs on /tmp at the next
+# boot, so /tmp is the volume bin/devbox-tmp-disk attaches. A tmpfs holds its
+# files in memory, where no OOM kill can free them. Until that volume is
+# attached, the next boot leaves /tmp on the root disk.
+tmp_on_disk() {
+  [[ -d /run/systemd/system ]] || return 0
+  [[ -n $(jq -r '.resources.tmp_disk // empty' <<<"$1") ]] || return 0
+  [[ $(systemctl is-enabled tmp.mount 2>/dev/null) == masked ]] && return
+  systemctl mask tmp.mount >/dev/null
+  say "tmp: masked tmp.mount; /tmp leaves tmpfs at the next boot"
+}
+
+# The size of what $@ name, for the report; nothing when they don't exist.
+maintenance_sizes() {
+  du -sh "$@" 2>/dev/null | sort -rh | sed 's/^/  /' || true
+}
+
+# Claude's per-session scratchpads (/tmp/claude-<uid>/<project>/<session uuid>)
+# nothing wrote to for $MAINTENANCE_TMP_DAYS days, unless a process has a file
+# open or its cwd there, or a process runs in the project the scratchpad belongs
+# to (its directory name is that cwd with / and . as -): a session can sit idle
+# for days and still want its scratchpad. Deletes them unless $1 is true.
+clean_tmp() {
+  local dry_run="$1" link dir project session size
+  local -A in_use=() projects=()
+  shopt -s nullglob
+  for link in /proc/[0-9]*/cwd /proc/[0-9]*/fd/*; do
+    dir="$(readlink "$link" 2>/dev/null)" || continue
+    if [[ $dir == /tmp/claude-* ]]; then
+      IFS=/ read -r _ _ _ project session _ <<<"$dir"
+      in_use[$project/$session]=1
+    elif [[ $link == */cwd ]]; then
+      projects[${dir//[\/.]/-}]=1
+    fi
+  done
+  for dir in /tmp/claude-*/*/*/; do
+    dir="${dir%/}"
+    [[ ! -L $dir && ${dir##*/} =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] || continue
+    project="${dir%/*}"
+    project="${project##*/}"
+    [[ -z ${in_use[$project/${dir##*/}]:-} && -z ${projects[$project]:-} ]] || continue
+    [[ -z $(find "$dir" -xdev -mmin "-$((MAINTENANCE_TMP_DAYS * 1440))" -print -quit 2>/dev/null) ]] || continue
+    size="$(du -sh "$dir" 2>/dev/null | cut -f1)"
+    if [[ $dry_run == true ]]; then
+      printf '  would delete %s %s\n' "$size" "$dir"
+    else
+      rm -rf --one-file-system -- "$dir"
+      rmdir --ignore-fail-on-non-empty -- "${dir%/*}"
+      printf '  deleted %s %s\n' "$size" "$dir"
+    fi
+  done
+  shopt -u nullglob
+}
+
+# Images no container, stopped ones included, uses, created over
+# $MAINTENANCE_IMAGE_HOURS hours ago, and build cache as old. Deletes them
+# unless $1 is true.
+clean_docker() {
+  local dry_run="$1" used
+  if ! command -v docker >/dev/null || ! docker info >/dev/null 2>&1; then
+    echo "  no docker running"
+    return 0
+  fi
+  if [[ $dry_run == true ]]; then
+    used="$(docker ps -aq | xargs -r docker inspect -f '{{.Image}}')"
+    docker image ls --no-trunc --filter "until=${MAINTENANCE_IMAGE_HOURS}h" \
+      --format '{{.ID}} {{.Size}} {{.Repository}}:{{.Tag}}' |
+      { if [[ -n $used ]]; then grep -vF "$used"; else cat; fi; } |
+      sed -E 's/^[^ ]+ /  would delete /' || true
+  else
+    docker image prune -af --filter "until=${MAINTENANCE_IMAGE_HOURS}h" | tail -n1 | sed 's/^/  images: /' || echo "  image prune failed"
+    docker builder prune -af --filter "until=${MAINTENANCE_IMAGE_HOURS}h" | tail -n1 | sed 's/^/  build cache: /' || echo "  build cache prune failed"
+  fi
+}
+
+# Worktrees in ~/work (<repo>--<branch>) with nothing to lose: a clean tree, no
+# stash, every commit on a remote. Listed for a person to remove, never removed:
+# whether the work is finished is not something this can tell.
+report_worktrees() {
+  local dir
+  shopt -s nullglob
+  for dir in "$USER_HOME"/work/*--*/; do
+    dir="${dir%/}"
+    [[ -f $dir/.git ]] || continue
+    [[ -z $(as_user git -C "$dir" status --porcelain 2>/dev/null) ]] || continue
+    [[ -z $(as_user git -C "$dir" stash list 2>/dev/null) ]] || continue
+    [[ -z $(as_user git -C "$dir" log -1 --format=%h HEAD --not --remotes 2>/dev/null) ]] || continue
+    printf '  %s %s (last commit %s)\n' "$(du -sh "$dir" 2>/dev/null | cut -f1)" "${dir##*/}" \
+      "$(as_user git -C "$dir" log -1 --format=%cr 2>/dev/null)"
+  done
+  shopt -u nullglob
+}
+
+# Everything but the deleting is a report: what took space, what could go by
+# hand. The journal gets it, and $MAINTENANCE_REPORT keeps the last one.
+maintenance() {
+  local dry_run=false
+  [[ ${1:-} != --dry-run ]] || dry_run=true
+  {
+    printf 'devbox maintenance, %s%s\n' "$(date '+%F %T')" "$($dry_run && echo ' (dry run, nothing deleted)')"
+    echo "Scratchpads unused for $MAINTENANCE_TMP_DAYS days:"
+    clean_tmp "$dry_run"
+    echo "Docker, unused for $((MAINTENANCE_IMAGE_HOURS / 24)) days:"
+    clean_docker "$dry_run"
+    echo "Disk:"
+    df -h / /tmp | sed 's/^/  /'
+    echo "Could go by hand, if not needed:"
+    maintenance_sizes /var/cache/pacman/pkg /var/log/journal "$USER_HOME/.cache" "$USER_HOME/.npm" \
+      "$USER_HOME/.vscode-server" "$USER_HOME/.local/share/cursor-agent/versions" "$USER_HOME/.local/share/claude/versions"
+    echo "Finished-looking worktrees (clean, no stash, all pushed):"
+    report_worktrees
+    if command -v docker >/dev/null && docker info >/dev/null 2>&1; then
+      echo "Docker totals:"
+      docker system df | sed 's/^/  /'
+    fi
+  } | tee "$MAINTENANCE_REPORT.new"
+  # A dry run reports what it would do, so it doesn't replace the last real run.
+  if $dry_run; then
+    rm -f "$MAINTENANCE_REPORT.new"
+  else
+    chmod 644 "$MAINTENANCE_REPORT.new"
+    mv "$MAINTENANCE_REPORT.new" "$MAINTENANCE_REPORT"
+  fi
+}
+
 # $2: --no-pacman-upgrade, passed on to update, or empty.
 sync() {
   local config no_upgrade="${2:-}" before role
@@ -915,6 +1087,8 @@ sync() {
   sync_timezone "$config"
   sync_packages "$config"
   upgrade_timer
+  maintenance_timer
+  tmp_on_disk "$config"
   if [[ $role == runner ]]; then
     runner_op
     runner_setup
@@ -2235,6 +2409,7 @@ main() {
         shift
       done
       ;;
+    maintenance) [[ $# == 0 || ($# == 1 && $1 == --dry-run) ]] || die "maintenance takes only --dry-run" ;;
     rc) (($# <= 1)) || die "rc takes at most one argument, the session name" ;;
     *) usage >&2; die "unknown command: $cmd" ;;
   esac
@@ -2286,6 +2461,7 @@ main() {
       case "$cmd" in
         bootstrap) bootstrap ;;
         upgrade) upgrade ;;
+        maintenance) maintenance "$@" ;;
         sync) sync "$config_json" "$no_upgrade" ;;
       esac
       ;;

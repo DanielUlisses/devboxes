@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+# Move an existing box's /tmp onto its own thin volume, from this machine. New
+# boxes get the volume from devbox-create. A volume attached to a running box
+# would mount over /tmp and hide the files its processes have open, so this
+# stops the box first. What's in /tmp now goes, as at any restart.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+# shellcheck source-path=SCRIPTDIR/.. source=lib/pve.sh
+source "$ROOT/lib/pve.sh"
+
+usage() {
+  cat <<EOF
+Usage: devbox-tmp-disk [--restart | --dry-run] <client>
+
+Give <client>'s box a resources.tmp_disk volume at /tmp: mask tmp.mount, shut
+the box down, attach the volume, start it. --restart is required, since that
+ends everything running in the box and empties /tmp. --dry-run prints the
+commands instead. Does nothing on a box that already has the volume.
+EOF
+}
+
+main() {
+  local restart=false dry_run=false client=""
+  while (($#)); do
+    case "$1" in
+      --restart) restart=true ;;
+      --dry-run) dry_run=true ;;
+      -h | --help) usage; exit 0 ;;
+      -*) usage >&2; die "unknown option: $1" ;;
+      *) [[ -z $client ]] || die "expected one client, got '$client' and '$1'"; client="$1" ;;
+    esac
+    shift
+  done
+  if [[ -z $client ]] || ! { $restart || $dry_run; }; then
+    usage >&2
+    exit 1
+  fi
+
+  local config hostname vmid tmp_disk spec box_config
+  config="$("$ROOT/bin/devbox-config" --json "$client")" || exit 1
+  hostname="$(jq -r .hostname <<<"$config")"
+  tmp_disk="$(jq -r '.resources.tmp_disk // empty' <<<"$config")"
+  [[ -n $tmp_disk ]] || die "$client has no resources.tmp_disk"
+  spec="$(tmp_disk_spec "$(disk_gb "$tmp_disk")")"
+  use_config_host "$config"
+  vmid="$(find_devbox "$hostname")"
+  [[ -n $vmid ]] || die "no $hostname on $DEVBOX_HOST; create it with bin/devbox-create $client"
+  assert_devbox "$vmid" "$hostname"
+  box_config="$(pve pct config "$vmid")"
+  if grep -q '^mp[0-9]*:.*mp=/tmp\b' <<<"$box_config"; then
+    say "$hostname already has its /tmp volume"
+    return
+  fi
+  ! grep -q '^mp0:' <<<"$box_config" || die "$hostname already uses mp0 for something else"
+  [[ $(pve pct status "$vmid") == "status: running" ]] || die "$hostname (VMID $vmid) is not running"
+
+  if $dry_run; then
+    printf 'pct exec %s -- systemctl mask tmp.mount\n' "$vmid"
+    printf 'pct shutdown %s\n' "$vmid"
+    printf 'pct set %s --mp0 %s\n' "$vmid" "$spec"
+    printf 'pct start %s\n' "$vmid"
+    printf 'pct exec %s -- chmod 1777 /tmp\n' "$vmid"
+    exit 0
+  fi
+
+  pve pct exec "$vmid" -- systemctl mask tmp.mount >/dev/null
+  say "shutting down $hostname (VMID $vmid)"
+  pve pct shutdown "$vmid"
+  pve pct set "$vmid" --mp0 "$spec"
+  say "attached a ${tmp_disk} /tmp volume; starting $hostname"
+  pve pct start "$vmid"
+  pve pct exec "$vmid" -- chmod 1777 /tmp
+  pve pct exec "$vmid" -- df -h /tmp
+}
+
+main "$@"
