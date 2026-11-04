@@ -38,6 +38,16 @@ tmp_disk_spec() {
   printf '%s:%s,mp=/tmp,mountoptions=discard;nosuid;nodev' "$ROOTFS_STORAGE" "$1"
 }
 
+# Removes the lost+found that formatting running box $1's /tmp volume made. It
+# belongs to the host's root, so the box can neither open nor delete it, and
+# systemd-tmpfiles --clean fails on it even when told to exclude it. ext4 doesn't
+# need it; fsck makes another if it has to.
+remove_tmp_lost_found() {
+  local pid
+  pid="$(pve lxc-info -n "$1" -p -H)"
+  pve rmdir "/proc/$pid/root/tmp/lost+found"
+}
+
 say() {
   printf '%s: %s\n' "${0##*/}" "$*" >&2
 }
@@ -63,6 +73,12 @@ pve() {
         die "refusing 'pvesh get ${3:-}': only /cluster/resources and /cluster/backup are read" ;;
     "pvesh create" | "pvesh set" | "pvesh delete") assert_backup_job_call "$@" ;;
     "pveam list" | "cat /proc/meminfo") ;;
+    "lxc-info -n")
+      in_range "${3:-}" && [[ ${4:-} == -p && ${5:-} == -H && $# == 5 ]] ||
+        die "refusing 'lxc-info ${*:2}': only a devbox's init pid is read" ;;
+    "rmdir /proc/"*)
+      [[ $2 =~ ^/proc/[0-9]+/root/tmp/lost\+found$ && $# == 2 ]] ||
+        die "refusing 'rmdir ${*:2}': only a box's /tmp/lost+found is removed" ;;
     *) die "refusing to run '$*' on $DEVBOX_HOST: not an allowed command" ;;
   esac
   # ssh joins its arguments into one string for the remote shell; quote them.

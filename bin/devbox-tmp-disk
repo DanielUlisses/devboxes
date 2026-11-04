@@ -60,6 +60,7 @@ main() {
     printf 'pct shutdown %s\n' "$vmid"
     printf 'pct set %s --mp0 %s\n' "$vmid" "$spec"
     printf 'pct start %s\n' "$vmid"
+    printf 'rmdir /proc/<init pid of %s>/root/tmp/lost+found\n' "$vmid"
     printf 'pct exec %s -- chmod 1777 /tmp\n' "$vmid"
     exit 0
   fi
@@ -70,6 +71,7 @@ main() {
   pve pct set "$vmid" --mp0 "$spec"
   say "attached a ${tmp_disk} /tmp volume; starting $hostname"
   pve pct start "$vmid"
+  remove_tmp_lost_found "$vmid" || say "could not remove /tmp/lost+found, so systemd-tmpfiles-clean will fail; on the host, rmdir it"
   pve pct exec "$vmid" -- chmod 1777 /tmp
   pve pct exec "$vmid" -- df -h /tmp
 }
