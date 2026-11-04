@@ -1087,11 +1087,11 @@ maintenance() {
 }
 
 # One line of the doctor's report: level $1 (ok, warn or fail), message $2.
-# Counts into DOCTOR_WARNINGS and DOCTOR_FAILURES.
+# Collects into DOCTOR_WARNINGS and DOCTOR_FAILURES.
 doctor_line() {
   case "$1" in
-    warn) DOCTOR_WARNINGS=$((DOCTOR_WARNINGS + 1)) ;;
-    fail) DOCTOR_FAILURES=$((DOCTOR_FAILURES + 1)) ;;
+    warn) DOCTOR_WARNINGS+=("$2") ;;
+    fail) DOCTOR_FAILURES+=("$2") ;;
   esac
   printf '  %-4s %s\n' "$1" "$2"
 }
@@ -1217,13 +1217,34 @@ doctor_stale() {
   fi
 }
 
-# Reads and reports only, changing nothing but its report. Warnings want a look;
-# a failure also exits 1, so the unit shows up as failed.
+# Posts the findings to the box's tk_hub (config $1), whose inbox opens or
+# resolves an item for the box; clean runs too, to resolve one. The token is the
+# tk daemon's, read with op as its unit does, and goes to curl on stdin so it
+# never shows in a process list. Fails when the hub didn't take it.
+doctor_notify() {
+  local url ip ref host token
+  IFS=$'\t' read -r url ip ref < <(jq -r '(.tk_hub // empty) | [.url, .ip, .token_ref] | @tsv' <<<"$1") || true
+  [[ -n ${url:-} ]] || return 0
+  host="${url#*://}"
+  host="${host%%/*}"
+  # shellcheck disable=SC2016 # for the box user's shell, as the tk daemon's unit
+  token="$(as_user bash -c 'OP_SERVICE_ACCOUNT_TOKEN="$(<"$HOME/.config/op/service-account-token")" op read "$1"' _ "$ref")" ||
+    return 1
+  jq -n '{failures: $ARGS.named.f, warnings: $ARGS.named.w}' \
+    --argjson f "$(jq -n '$ARGS.positional' --args -- ${DOCTOR_FAILURES[@]+"${DOCTOR_FAILURES[@]}"})" \
+    --argjson w "$(jq -n '$ARGS.positional' --args -- ${DOCTOR_WARNINGS[@]+"${DOCTOR_WARNINGS[@]}"})" |
+    curl -fsS -m 30 -o /dev/null --resolve "$host:443:$ip" -H @<(printf 'Authorization: Bearer %s\n' "$token") \
+      -H 'Content-Type: application/json' --data-binary @- "https://$host/api/doctor"
+}
+
+# Reads and reports only, changing nothing on the box but its report, and tells
+# the hub. Warnings want a look; a failure, or a hub that couldn't be told, also
+# exits 1, so the unit shows up as failed.
 doctor() {
-  local config="$1" role
+  local config="$1" role notified=true
   role="$(box_role "$config")"
-  DOCTOR_WARNINGS=0
-  DOCTOR_FAILURES=0
+  DOCTOR_WARNINGS=()
+  DOCTOR_FAILURES=()
   {
     printf 'devbox doctor, %s\n' "$(date '+%F %T')"
     doctor_disk "root disk" /
@@ -1240,12 +1261,16 @@ doctor() {
         doctor_line warn "gh isn't logged in; run devbox login"
       fi
     fi
-    printf '%s warnings, %s failures\n' "$DOCTOR_WARNINGS" "$DOCTOR_FAILURES"
+    printf '%s warnings, %s failures\n' "${#DOCTOR_WARNINGS[@]}" "${#DOCTOR_FAILURES[@]}"
+    doctor_notify "$config" || {
+      notified=false
+      echo "Could not tell the hub."
+    }
   } >"$DOCTOR_REPORT.new"
   chmod 644 "$DOCTOR_REPORT.new"
   mv "$DOCTOR_REPORT.new" "$DOCTOR_REPORT"
   cat "$DOCTOR_REPORT"
-  ((DOCTOR_FAILURES == 0))
+  $notified && ((${#DOCTOR_FAILURES[@]} == 0))
 }
 
 # $2: --no-pacman-upgrade, passed on to update, or empty.
