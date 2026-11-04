@@ -61,7 +61,6 @@ tools: []
 # Base skills every devbox gets: skill repos, plus mattpocock's (a plugin).
 skills:
   - ticket-skill
-  - tdd-skill
   - humanizer-skill
   - mattpocock-skills
 
