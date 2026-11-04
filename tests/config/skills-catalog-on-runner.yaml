@@ -1,0 +1,6 @@
+# expect: skills_catalog: allowed only when role is devbox
+role: runner
+runners:
+  org: example-org
+  labels: [homelab]
+skills_catalog: true

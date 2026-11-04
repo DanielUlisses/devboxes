@@ -420,6 +420,13 @@ reported and the rest still run, then `update` (and the sync) exits 1:
   `claude --remote-control`; tk-hub's Sessions page then links each session
   in the Claude app. Off where the client's plan has Remote Control turned
   off; the session is still reached with `herdr --remote` over Tailscale SSH.
+- **skills-catalog:** with `skills_catalog: true`, pulls
+  DanielUlisses/skills-catalog into `~/.claude/skill-repos` and runs its
+  `bin/catalog-sync --client <client> --dest /opt/skills`: the skills
+  approved for this client, each at its pinned commit, plus
+  `/opt/skills/index.json`, which the tk daemon reports to tk-hub. Nothing in
+  `/opt/skills` is on by itself; a board's policy `skills` links some into a
+  ticket's worktree. Without it, removes a `/opt/skills` left from before.
 - **plugins:** installs the plugins newly listed under `plugins:` in the
   client file (adding the marketplace first unless it is configured); a
   failing plugin doesn't stop the others. Removed entries stay installed.

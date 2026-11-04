@@ -1,0 +1,3 @@
+# expect: skills_catalog: must be true or false
+claude_account: example
+skills_catalog: "yes"
