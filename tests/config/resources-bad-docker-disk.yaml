@@ -1,0 +1,4 @@
+# expect: resources.docker_disk: must be a size like 30G
+claude_account: work
+resources:
+  docker_disk: lots

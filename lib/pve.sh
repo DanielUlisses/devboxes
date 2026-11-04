@@ -38,6 +38,12 @@ tmp_disk_spec() {
   printf '%s:%s,mp=/tmp,mountoptions=discard;nosuid;nodev' "$ROOTFS_STORAGE" "$1"
 }
 
+# The pct mount point spec of a $1 GB /var/lib/docker volume. No nosuid or nodev,
+# unlike /tmp's: images need setuid binaries and device nodes on it.
+docker_disk_spec() {
+  printf '%s:%s,mp=/var/lib/docker,mountoptions=discard' "$ROOTFS_STORAGE" "$1"
+}
+
 # Removes the lost+found that formatting running box $1's /tmp volume made. It
 # belongs to the host's root, so the box can neither open nor delete it, and
 # systemd-tmpfiles --clean fails on it even when told to exclude it. ext4 doesn't

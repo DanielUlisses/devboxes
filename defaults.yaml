@@ -33,6 +33,7 @@ runner_resources:
   swap_mb: 1024
   cores: 2
   disk: 16G
+  docker_disk: 30G   # /var/lib/docker's own volume: jobs' sandboxes and the image mirror
   cpuunits: 50       # half a default guest's CPU weight
   onboot: true
 

@@ -85,7 +85,7 @@ RUNNER_TAILSCALE_TAG=tag:runner
 # The GitHub Actions runner a runner box installs: this pinned release unless
 # the box's own pin (RUNNER_PIN, "<version> <sha256>", written by `devbox
 # update`) is newer. Each version unpacks into RUNNER_DIST/<version>, with
-# RUNNER_DIST/current linking the one in use; the dispatcher copies it per job.
+# RUNNER_DIST/current linking the one in use; each job's sandbox copies it.
 RUNNER_VERSION=2.338.0
 RUNNER_SHA256=af4b794c1bc41d73d40535e3fe092a39f9679cd8d965954c2aca25a05ca41d32
 RUNNER_PIN=$STATE/runner-version
@@ -97,6 +97,9 @@ RUNNER_RELEASES=https://github.com/actions/runner/releases/download
 RUNNER_DISPATCH_CONF=$RUNNER_OP_DIR/dispatcher.json
 RUNNER_DISPATCH_BIN=/usr/local/libexec/devbox-runner-dispatch
 RUNNER_DISPATCH_UNIT=devbox-runner-dispatch.service
+# What each job's sandbox runs: under /usr, so it reaches the sandbox with the
+# box's /usr, at the path bin/devbox-runner-dispatch names.
+RUNNER_JOB_BIN=/usr/local/libexec/devbox-runner-job
 
 # The unattended OS upgrade every box gets: a systemd timer running `devbox
 # upgrade` daily, so a box is patched without anyone running sync or update.
@@ -249,9 +252,10 @@ Run inside a devbox.
              was replaced; sync schedules it daily (devbox-upgrade.timer) on
              every box, whatever the role
   maintenance
-             delete unused scratchpads and Docker images and report what else
-             could go; --dry-run deletes nothing; sync schedules it weekly
-             (devbox-maintenance.timer) on every box
+             delete unused scratchpads and Docker images (and, on a runner box,
+             Docker volumes) and report what else could go; --dry-run deletes
+             nothing; sync schedules it (devbox-maintenance.timer) on every box,
+             weekly, or nightly on a runner box
   doctor     check disks, /tmp, memory, OOM kills, services, timers and stale
              processes; exits 1 on a failure; sync schedules it weekly
              (devbox-doctor.timer) on every box
@@ -262,7 +266,8 @@ Run inside a devbox.
 On a role: runner box, bootstrap installs only base packages, docker,
 tailscale and op; sync adds the $RUNNER_USER system user (in docker), masks
 sshd, turns off LLMNR and mDNS, installs the pinned actions/runner and runs
-the dispatcher (bin/devbox-runner-dispatch) as a systemd unit; login asks
+the dispatcher (bin/devbox-runner-dispatch, which starts each job in its own
+sandbox, bin/devbox-runner-job) as a systemd unit; login asks
 only for tailscale ($RUNNER_TAILSCALE_TAG) and $RUNNER_USER's 1Password
 service-account token; update pins and installs the latest actions/runner.
 finish doesn't apply.
@@ -606,8 +611,9 @@ runner_setup() {
     say "runner: took $RUNNER_USER out of wheel"
     changed=true
   fi
-  # Jobs run docker. The docker group is root on the box, which is acceptable
-  # only here: a dedicated, unprivileged box that holds nothing else.
+  # The dispatcher runs each job's sandbox with docker. The docker group is root
+  # on the box, which is acceptable only here: a dedicated, unprivileged box
+  # that holds nothing else. Jobs get their sandbox's dockerd, not this one.
   if ! id -nG "$RUNNER_USER" | grep -qw docker; then
     usermod -aG docker "$RUNNER_USER"
     say "runner: added $RUNNER_USER to docker"
@@ -642,10 +648,12 @@ runner_setup() {
 
   # tailscaled's own WireGuard port listens everywhere, but takes only tailnet
   # peers' packets, and systemd-networkd's DHCP client sockets only answer
-  # the leases it asked for; anything else listening beyond loopback and the
-  # tailnet is reported.
+  # the leases it asked for; the registry mirror's address (172.30.0.1, the
+  # gateway of bin/devbox-runner-dispatch's sandbox network) is on a bridge only
+  # sandboxes are on; anything else listening beyond loopback and the tailnet is
+  # reported.
   listeners="$(ss -Htulnp | grep -vE '"(tailscaled|systemd-network)"' |
-    awk '$5 !~ /^(127\.|\[::1\]|100\.|\[fd7a:115c:a1e0:)/ {print $1 " " $5}' | sort -u | paste -sd, -)" || true
+    awk '$5 !~ /^(127\.|\[::1\]|100\.|\[fd7a:115c:a1e0:|172\.30\.0\.1:)/ {print $1 " " $5}' | sort -u | paste -sd, -)" || true
   if [[ -n $listeners ]]; then
     say "runner: warning: listening beyond loopback and the tailnet: $listeners"
   else
@@ -705,13 +713,16 @@ runner_release() {
 # The dispatcher: its settings from config $1, its script and its unit, run
 # as RUNNER_USER, restarting on failure and started at boot. Settings changes
 # (max_jobs, labels, org) need no restart, as it re-reads them every cycle; a
-# new script or unit restarts it, which stops any job running.
+# new script or unit restarts it, which stops any job running. A new sandbox
+# script needs no restart either: the next job runs it.
 runner_dispatcher() {
   local config="$1" settings restart=false unit
   settings="$(jq '.runners + {hostname}' <<<"$config")"
   install -d -o root -g "$RUNNER_USER" -m 750 "$RUNNER_OP_DIR"
   ! write_if_changed "$RUNNER_DISPATCH_CONF" "$settings" 644 ||
     say "dispatcher: wrote $RUNNER_DISPATCH_CONF ($(jq -c '{org, labels, max_jobs}' <<<"$settings"))"
+  ! write_if_changed "$RUNNER_JOB_BIN" "$(<"$ROOT/bin/devbox-runner-job")" 755 ||
+    say "dispatcher: installed $RUNNER_JOB_BIN"
   if write_if_changed "$RUNNER_DISPATCH_BIN" "$(<"$ROOT/bin/devbox-runner-dispatch")" 755; then
     say "dispatcher: installed $RUNNER_DISPATCH_BIN"
     restart=true
@@ -924,11 +935,11 @@ WantedBy=timers.target"
   fi
 }
 
-# A weekly job, every role, as upgrade_timer does the upgrade: unit name $1,
-# description $2, devbox subcommand $3, OnCalendar weekday and time $4, at idle
-# priority (randomised by up to 30 minutes, and run at the next boot if the box
-# was off at the time). Not configurable.
-weekly_timer() {
+# A scheduled job, every role, as upgrade_timer does the upgrade: unit name $1,
+# description $2, devbox subcommand $3, OnCalendar event $4, at idle priority
+# (randomised by up to 30 minutes, and run at the next boot if the box was off
+# at the time). Not configurable.
+calendar_timer() {
   local unit="$1" description="$2" command="$3" calendar="$4" service timer wrote=false
   if [[ ! -d /run/systemd/system ]]; then
     say "$command: no systemd, no timer"
@@ -943,7 +954,7 @@ Nice=19
 IOSchedulingClass=idle
 ExecStart=/usr/local/bin/devbox $command"
   timer="[Unit]
-Description=devbox: weekly $command
+Description=devbox: scheduled $command
 
 [Timer]
 OnCalendar=$calendar
@@ -1040,6 +1051,25 @@ clean_docker() {
   fi
 }
 
+# Anonymous volumes no container, stopped ones included, uses: what a runner's
+# job containers leave behind, up to a GB a job from a service like Postgres.
+# Named volumes stay. Deletes them unless $1 is true.
+clean_docker_volumes() {
+  local dry_run="$1" volume
+  if ! command -v docker >/dev/null || ! docker info >/dev/null 2>&1; then
+    echo "  no docker running"
+    return 0
+  fi
+  if [[ $dry_run == true ]]; then
+    docker volume ls -q --filter dangling=true --filter label=com.docker.volume.anonymous |
+      while read -r volume; do
+        printf '  would delete %s %s\n' "$(du -sh "$(docker volume inspect -f '{{.Mountpoint}}' "$volume")" | cut -f1)" "$volume"
+      done
+  else
+    docker volume prune -f | tail -n1 | sed 's/^/  volumes: /' || echo "  volume prune failed"
+  fi
+}
+
 # Worktrees in ~/work (<repo>--<branch>) with nothing to lose: a clean tree, no
 # stash, every commit on a remote. Listed for a person to remove, never removed:
 # whether the work is finished is not something this can tell.
@@ -1061,14 +1091,18 @@ report_worktrees() {
 # Everything but the deleting is a report: what took space, what could go by
 # hand. The journal gets it, and $MAINTENANCE_REPORT keeps the last one.
 maintenance() {
-  local dry_run=false
-  [[ ${1:-} != --dry-run ]] || dry_run=true
+  local config="$1" dry_run=false
+  [[ ${2:-} != --dry-run ]] || dry_run=true
   {
     printf 'devbox maintenance, %s%s\n' "$(date '+%F %T')" "$($dry_run && echo ' (dry run, nothing deleted)')"
     echo "Scratchpads unused for $MAINTENANCE_TMP_DAYS days:"
     clean_tmp "$dry_run"
     echo "Docker, unused for $((MAINTENANCE_IMAGE_HOURS / 24)) days:"
     clean_docker "$dry_run"
+    if [[ $(box_role "$config") == runner ]]; then
+      echo "Docker volumes no container uses:"
+      clean_docker_volumes "$dry_run"
+    fi
     echo "Disk:"
     df -h / /tmp | sed 's/^/  /'
     echo "Could go by hand, if not needed:"
@@ -1311,9 +1345,14 @@ sync() {
   sync_timezone "$config"
   sync_packages "$config"
   upgrade_timer
-  weekly_timer "$MAINTENANCE_UNIT" "delete unused scratchpads and images, report the rest" maintenance "Sun 04:30"
+  # A runner's jobs can fill its small disk in far less than a week.
+  if [[ $role == runner ]]; then
+    calendar_timer "$MAINTENANCE_UNIT" "delete unused scratchpads, images and volumes, report the rest" maintenance "*-*-* 04:30"
+  else
+    calendar_timer "$MAINTENANCE_UNIT" "delete unused scratchpads and images, report the rest" maintenance "Sun 04:30"
+  fi
   # After the cleanup, so it reports what the cleanup left.
-  weekly_timer "$DOCTOR_UNIT" "check the box's health" doctor "Sun 05:30"
+  calendar_timer "$DOCTOR_UNIT" "check the box's health" doctor "Sun 05:30"
   tmp_on_disk "$config"
   if [[ $role == runner ]]; then
     runner_op
@@ -2687,7 +2726,7 @@ main() {
       case "$cmd" in
         bootstrap) bootstrap ;;
         upgrade) upgrade ;;
-        maintenance) maintenance "$@" ;;
+        maintenance) maintenance "$(stored_config)" "$@" ;;
         doctor) doctor "$(stored_config)" ;;
         sync) sync "$config_json" "$no_upgrade" ;;
       esac
