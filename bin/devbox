@@ -103,6 +103,10 @@ RUNNER_DISPATCH_UNIT=devbox-runner-dispatch.service
 UPGRADE_UNIT=devbox-upgrade
 MAINTENANCE_UNIT=devbox-maintenance
 DOCTOR_UNIT=devbox-doctor
+# How a hub box's doctor reaches the hub: ticket-board's install.sh hub puts them
+# here.
+HUB_CTL=$USER_HOME/.local/share/tk-hub/hub-venv/bin/hub-server
+HUB_ENV_FILE=/etc/tk-hub/hub.env
 # What `devbox maintenance` leaves alone: scratchpads written to more recently,
 # and unused images created more recently (docker's until filter goes by when
 # the image was built, not when it was pulled).
@@ -1163,6 +1167,13 @@ doctor_services() {
   else
     doctor_line fail "tailscale isn't running, so the box can't be reached over the tailnet"
   fi
+  if [[ $1 == hub ]]; then
+    if systemctl is-active -q tk-hub.service; then
+      doctor_line ok "tk-hub is running"
+    else
+      doctor_line fail "tk-hub isn't running, so the hub is down"
+    fi
+  fi
   if command -v docker >/dev/null; then
     if systemctl is-active -q docker.service; then
       doctor_line ok "docker is running"
@@ -1217,12 +1228,26 @@ doctor_stale() {
   fi
 }
 
-# Posts the findings to the box's tk_hub (config $1), whose inbox opens or
-# resolves an item for the box; clean runs too, to resolve one. The token is the
-# tk daemon's, read with op as its unit does, and goes to curl on stdin so it
-# never shows in a process list. Fails when the hub didn't take it.
+# The doctor's findings as JSON, for the hub.
+doctor_findings() {
+  jq -n '{failures: $ARGS.named.f, warnings: $ARGS.named.w}' \
+    --argjson f "$(jq -n '$ARGS.positional' --args -- ${DOCTOR_FAILURES[@]+"${DOCTOR_FAILURES[@]}"})" \
+    --argjson w "$(jq -n '$ARGS.positional' --args -- ${DOCTOR_WARNINGS[@]+"${DOCTOR_WARNINGS[@]}"})"
+}
+
+# Tells the hub's inbox the findings, which opens or resolves an item for the
+# box; clean runs too, to resolve one. The hub's own box writes straight to the
+# database with hub-server, so it needs no token and still reports while the web
+# service is down. Another box posts to its tk_hub (config $1) with the tk
+# daemon's token, read with op as its unit does, which goes to curl through a
+# file descriptor so it never shows in a process list. Fails when the hub didn't
+# take it. A box with neither, a runner, keeps its report to itself.
 doctor_notify() {
   local url ip ref host token
+  if [[ $(box_role "$1") == hub ]]; then
+    doctor_findings | as_user "$HUB_CTL" --env-file "$HUB_ENV_FILE" doctor report "$(jq -r .hostname <<<"$1")"
+    return
+  fi
   IFS=$'\t' read -r url ip ref < <(jq -r '(.tk_hub // empty) | [.url, .ip, .token_ref] | @tsv' <<<"$1") || true
   [[ -n ${url:-} ]] || return 0
   host="${url#*://}"
@@ -1230,9 +1255,7 @@ doctor_notify() {
   # shellcheck disable=SC2016 # for the box user's shell, as the tk daemon's unit
   token="$(as_user bash -c 'OP_SERVICE_ACCOUNT_TOKEN="$(<"$HOME/.config/op/service-account-token")" op read "$1"' _ "$ref")" ||
     return 1
-  jq -n '{failures: $ARGS.named.f, warnings: $ARGS.named.w}' \
-    --argjson f "$(jq -n '$ARGS.positional' --args -- ${DOCTOR_FAILURES[@]+"${DOCTOR_FAILURES[@]}"})" \
-    --argjson w "$(jq -n '$ARGS.positional' --args -- ${DOCTOR_WARNINGS[@]+"${DOCTOR_WARNINGS[@]}"})" |
+  doctor_findings |
     curl -fsS -m 30 -o /dev/null --resolve "$host:443:$ip" -H @<(printf 'Authorization: Bearer %s\n' "$token") \
       -H 'Content-Type: application/json' --data-binary @- "https://$host/api/doctor"
 }
@@ -1251,7 +1274,7 @@ doctor() {
     doctor_disk /tmp /tmp
     doctor_tmp "$(jq -r '.resources.tmp_disk // empty' <<<"$config")"
     doctor_memory
-    doctor_services
+    doctor_services "$role"
     doctor_timers
     doctor_stale
     if [[ $role == devbox && -f $FINISHED ]]; then
