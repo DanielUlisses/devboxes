@@ -102,6 +102,7 @@ RUNNER_DISPATCH_UNIT=devbox-runner-dispatch.service
 # upgrade` daily, so a box is patched without anyone running sync or update.
 UPGRADE_UNIT=devbox-upgrade
 MAINTENANCE_UNIT=devbox-maintenance
+DOCTOR_UNIT=devbox-doctor
 # What `devbox maintenance` leaves alone: scratchpads written to more recently,
 # and unused images created more recently (docker's until filter goes by when
 # the image was built, not when it was pulled).
@@ -109,6 +110,8 @@ MAINTENANCE_TMP_DAYS=3
 MAINTENANCE_IMAGE_HOURS=168
 # The last run's report, readable by the box user.
 MAINTENANCE_REPORT=$STATE/maintenance-report.txt
+# The last `devbox doctor` run's report, likewise.
+DOCTOR_REPORT=$STATE/doctor-report.txt
 # Daemons `devbox upgrade` restarts once pacman has replaced their binary.
 UPGRADE_RESTART=(tailscaled docker)
 
@@ -207,6 +210,7 @@ Usage: devbox bootstrap
        devbox logout
        devbox upgrade
        devbox maintenance [--dry-run]
+       devbox doctor
        devbox rc [<name>]
 
 Run inside a devbox.
@@ -240,6 +244,13 @@ Run inside a devbox.
   upgrade    pacman -Syu, then restart tailscaled and docker if their binary
              was replaced; sync schedules it daily (devbox-upgrade.timer) on
              every box, whatever the role
+  maintenance
+             delete unused scratchpads and Docker images and report what else
+             could go; --dry-run deletes nothing; sync schedules it weekly
+             (devbox-maintenance.timer) on every box
+  doctor     check disks, /tmp, memory, OOM kills, services, timers and stale
+             processes; exits 1 on a failure; sync schedules it weekly
+             (devbox-doctor.timer) on every box
   rc         inside herdr, as $USER_NAME: open a pane beside this one in
              ~/work running Claude with Remote Control (claude
              --remote-control [<name>]), to pick up from the Claude app
@@ -909,41 +920,44 @@ WantedBy=timers.target"
   fi
 }
 
-# The daily maintenance, every role, as upgrade_timer does the upgrade.
-maintenance_timer() {
-  local service timer wrote=false
+# A weekly job, every role, as upgrade_timer does the upgrade: unit name $1,
+# description $2, devbox subcommand $3, OnCalendar weekday and time $4, at idle
+# priority (randomised by up to 30 minutes, and run at the next boot if the box
+# was off at the time). Not configurable.
+weekly_timer() {
+  local unit="$1" description="$2" command="$3" calendar="$4" service timer wrote=false
   if [[ ! -d /run/systemd/system ]]; then
-    say "maintenance: no systemd, no timer"
+    say "$command: no systemd, no timer"
     return
   fi
   service="[Unit]
-Description=devbox: delete unused scratchpads and images, report the rest
+Description=devbox: $description
 
 [Service]
 Type=oneshot
 Nice=19
 IOSchedulingClass=idle
-ExecStart=/usr/local/bin/devbox maintenance"
+ExecStart=/usr/local/bin/devbox $command"
   timer="[Unit]
-Description=devbox: daily maintenance
+Description=devbox: weekly $command
 
 [Timer]
-OnCalendar=*-*-* 04:30
+OnCalendar=$calendar
 RandomizedDelaySec=30min
 Persistent=true
 
 [Install]
 WantedBy=timers.target"
-  ! write_if_changed "/etc/systemd/system/$MAINTENANCE_UNIT.service" "$service" 644 || wrote=true
-  ! write_if_changed "/etc/systemd/system/$MAINTENANCE_UNIT.timer" "$timer" 644 || wrote=true
+  ! write_if_changed "/etc/systemd/system/$unit.service" "$service" 644 || wrote=true
+  ! write_if_changed "/etc/systemd/system/$unit.timer" "$timer" 644 || wrote=true
   if $wrote; then
     systemctl daemon-reload
-    say "maintenance: wrote $MAINTENANCE_UNIT.service and .timer"
+    say "$command: wrote $unit.service and .timer"
   fi
-  if [[ $(systemctl is-enabled "$MAINTENANCE_UNIT.timer" 2>/dev/null) != enabled ]] ||
-    ! systemctl is-active -q "$MAINTENANCE_UNIT.timer"; then
-    systemctl enable --now "$MAINTENANCE_UNIT.timer"
-    say "maintenance: enabled $MAINTENANCE_UNIT.timer (daily 04:30)"
+  if [[ $(systemctl is-enabled "$unit.timer" 2>/dev/null) != enabled ]] ||
+    ! systemctl is-active -q "$unit.timer"; then
+    systemctl enable --now "$unit.timer"
+    say "$command: enabled $unit.timer ($calendar)"
   fi
 }
 
@@ -1072,6 +1086,168 @@ maintenance() {
   fi
 }
 
+# One line of the doctor's report: level $1 (ok, warn or fail), message $2.
+# Counts into DOCTOR_WARNINGS and DOCTOR_FAILURES.
+doctor_line() {
+  case "$1" in
+    warn) DOCTOR_WARNINGS=$((DOCTOR_WARNINGS + 1)) ;;
+    fail) DOCTOR_FAILURES=$((DOCTOR_FAILURES + 1)) ;;
+  esac
+  printf '  %-4s %s\n' "$1" "$2"
+}
+
+# Disk $1 mounted or held at $2: warns from 80% full, fails from 90%.
+doctor_disk() {
+  local used
+  used="$(df --output=pcent "$2" | tail -n1 | tr -dc 0-9)"
+  if ((used >= 90)); then
+    doctor_line fail "$1 is $used% full"
+  elif ((used >= 80)); then
+    doctor_line warn "$1 is $used% full"
+  else
+    doctor_line ok "$1 is $used% full"
+  fi
+}
+
+# A box with resources.tmp_disk ($1) should have /tmp on that volume, and no
+# tmpfs coming back at the next boot.
+doctor_tmp() {
+  local fstype
+  [[ -n $1 ]] || return 0
+  fstype="$(findmnt -no FSTYPE /tmp || true)"
+  case "$fstype" in
+    tmpfs) doctor_line fail "/tmp is a tmpfs, in memory; run bin/devbox-tmp-disk --restart on your machine" ;;
+    "") doctor_line warn "/tmp is on the root disk, without its volume; run bin/devbox-tmp-disk --restart on your machine" ;;
+    *) doctor_line ok "/tmp is on its own volume ($fstype)" ;;
+  esac
+  [[ $(systemctl is-enabled tmp.mount 2>/dev/null || true) == masked ]] ||
+    doctor_line warn "tmp.mount isn't masked, so /tmp could be a tmpfs after a reboot; run devbox sync"
+}
+
+# Memory and swap as the box's own limits see them, and OOM kills since it
+# booted (the cgroup's counter starts again at each boot).
+doctor_memory() {
+  local total available swap_total swap_free used kills
+  total="$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)"
+  available="$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)"
+  swap_total="$(awk '/^SwapTotal:/ {print $2}' /proc/meminfo)"
+  swap_free="$(awk '/^SwapFree:/ {print $2}' /proc/meminfo)"
+  used=$((100 - available * 100 / total))
+  if ((used >= 90)); then
+    doctor_line fail "memory is $used% used"
+  elif ((used >= 80)); then
+    doctor_line warn "memory is $used% used"
+  else
+    doctor_line ok "memory is $used% used"
+  fi
+  if ((swap_total > 0)); then
+    used=$((100 - swap_free * 100 / swap_total))
+    if ((used >= 80)); then
+      doctor_line warn "swap is $used% used"
+    else
+      doctor_line ok "swap is $used% used"
+    fi
+  fi
+  kills="$(awk '$1 == "oom_kill" {print $2}' /sys/fs/cgroup/memory.events 2>/dev/null || true)"
+  if [[ ${kills:-0} != 0 ]]; then
+    doctor_line warn "$kills OOM kills since boot; dmesg on the host shows which processes"
+  else
+    doctor_line ok "no OOM kills since boot"
+  fi
+}
+
+doctor_services() {
+  local failed
+  if tailscale_up; then
+    doctor_line ok "tailscale is up"
+  else
+    doctor_line fail "tailscale isn't running, so the box can't be reached over the tailnet"
+  fi
+  if command -v docker >/dev/null; then
+    if systemctl is-active -q docker.service; then
+      doctor_line ok "docker is running"
+    else
+      doctor_line fail "docker isn't running"
+    fi
+  fi
+  # This job's own failure from last week isn't news.
+  failed="$(systemctl --failed --type=service --no-legend --plain | awk '{print $1}' |
+    grep -vxF "$DOCTOR_UNIT.service" | paste -sd' ' || true)"
+  if [[ -n $failed ]]; then
+    doctor_line warn "failed services: $failed"
+  else
+    doctor_line ok "no failed services"
+  fi
+}
+
+# Scheduled jobs are enabled and their last runs worked, and the cleanup has
+# run in the last 8 days.
+doctor_timers() {
+  local unit age
+  for unit in "$UPGRADE_UNIT" "$MAINTENANCE_UNIT" "$DOCTOR_UNIT"; do
+    if ! systemctl is-enabled -q "$unit.timer" 2>/dev/null || ! systemctl is-active -q "$unit.timer"; then
+      doctor_line warn "$unit.timer isn't enabled and running; run devbox sync"
+    elif [[ $(systemctl show "$unit.service" -p Result --value) != success && $unit != "$DOCTOR_UNIT" ]]; then
+      doctor_line warn "$unit's last run failed; journalctl -u $unit shows why"
+    else
+      doctor_line ok "$unit.timer is running"
+    fi
+  done
+  if [[ ! -f $MAINTENANCE_REPORT ]]; then
+    doctor_line warn "maintenance hasn't run yet"
+    return
+  fi
+  age=$((($(date +%s) - $(stat -c %Y "$MAINTENANCE_REPORT")) / 86400))
+  if ((age > 8)); then
+    doctor_line warn "maintenance last ran $age days ago"
+  else
+    doctor_line ok "maintenance ran $age days ago"
+  fi
+}
+
+# Terraform left running for over a day is almost always left behind by a
+# session that ended, and each provider holds hundreds of MB.
+doctor_stale() {
+  local stale
+  stale="$(ps -eo etimes=,pid=,comm= | awk '$1 > 86400 && $3 ~ /^terraform/ {print $2}' | paste -sd' ' || true)"
+  if [[ -n $stale ]]; then
+    doctor_line warn "Terraform processes over a day old: $stale"
+  else
+    doctor_line ok "no stale Terraform processes"
+  fi
+}
+
+# Reads and reports only, changing nothing but its report. Warnings want a look;
+# a failure also exits 1, so the unit shows up as failed.
+doctor() {
+  local config="$1" role
+  role="$(box_role "$config")"
+  DOCTOR_WARNINGS=0
+  DOCTOR_FAILURES=0
+  {
+    printf 'devbox doctor, %s\n' "$(date '+%F %T')"
+    doctor_disk "root disk" /
+    doctor_disk /tmp /tmp
+    doctor_tmp "$(jq -r '.resources.tmp_disk // empty' <<<"$config")"
+    doctor_memory
+    doctor_services
+    doctor_timers
+    doctor_stale
+    if [[ $role == devbox && -f $FINISHED ]]; then
+      if as_user gh auth status -h github.com &>/dev/null; then
+        doctor_line ok "gh is logged in"
+      else
+        doctor_line warn "gh isn't logged in; run devbox login"
+      fi
+    fi
+    printf '%s warnings, %s failures\n' "$DOCTOR_WARNINGS" "$DOCTOR_FAILURES"
+  } >"$DOCTOR_REPORT.new"
+  chmod 644 "$DOCTOR_REPORT.new"
+  mv "$DOCTOR_REPORT.new" "$DOCTOR_REPORT"
+  cat "$DOCTOR_REPORT"
+  ((DOCTOR_FAILURES == 0))
+}
+
 # $2: --no-pacman-upgrade, passed on to update, or empty.
 sync() {
   local config no_upgrade="${2:-}" before role
@@ -1087,7 +1263,9 @@ sync() {
   sync_timezone "$config"
   sync_packages "$config"
   upgrade_timer
-  maintenance_timer
+  weekly_timer "$MAINTENANCE_UNIT" "delete unused scratchpads and images, report the rest" maintenance "Sun 04:30"
+  # After the cleanup, so it reports what the cleanup left.
+  weekly_timer "$DOCTOR_UNIT" "check the box's health" doctor "Sun 05:30"
   tmp_on_disk "$config"
   if [[ $role == runner ]]; then
     runner_op
@@ -2398,7 +2576,7 @@ main() {
   shift
   case "$cmd" in
     -h | --help) usage; exit 0 ;;
-    bootstrap | login | finish | logout | upgrade) (($# == 0)) || die "$cmd takes no arguments" ;;
+    bootstrap | login | finish | logout | upgrade | doctor) (($# == 0)) || die "$cmd takes no arguments" ;;
     sync | update)
       while (($#)); do
         case "$1" in
@@ -2462,6 +2640,7 @@ main() {
         bootstrap) bootstrap ;;
         upgrade) upgrade ;;
         maintenance) maintenance "$@" ;;
+        doctor) doctor "$(stored_config)" ;;
         sync) sync "$config_json" "$no_upgrade" ;;
       esac
       ;;

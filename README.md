@@ -476,7 +476,7 @@ binary stays marked, so the next daily run restarts it. A restart of
 `tailscaled` briefly drops open Tailscale SSH sessions. Without systemd
 (a plain chroot) there is no timer.
 
-### `/tmp` and maintenance: `devbox maintenance`
+### `/tmp`, maintenance and health: `devbox maintenance`, `devbox doctor`
 
 Arch mounts `/tmp` as a tmpfs, whose files stay in the box's memory and swap
 where no OOM kill can free them. Agents keep Terraform providers in their
@@ -492,7 +492,7 @@ bin/devbox-tmp-disk --restart <client>
 ```
 
 Every box also gets `devbox-maintenance.timer`, written and enabled by `devbox
-sync`: daily at 04:30 (up to 30 minutes later, run at the next boot if the box
+sync`: Sundays at 04:30 (up to 30 minutes later, run at the next boot if the box
 was off), at idle priority. It is not configurable.
 
 ```
@@ -515,6 +515,22 @@ pushed. Pushed doesn't mean finished, so it never removes a worktree.
 
 systemd's own `systemd-tmpfiles-clean` still removes anything in `/tmp` untouched
 for 10 days.
+
+`devbox-doctor.timer` runs an hour later, on what the cleanup left, the same
+way. It changes nothing but its report, and it is also fine by hand:
+
+```
+devbox doctor                             # exits 1 on a failure
+cat /var/lib/devbox/doctor-report.txt     # the last run
+systemctl status devbox-doctor            # failed when the last run found a failure
+```
+
+It checks the root disk and `/tmp` (warns at 80% full, fails at 90%), that `/tmp`
+isn't a tmpfs on a box with `resources.tmp_disk`, memory and swap, OOM kills
+since boot, Tailscale, Docker, failed services, the upgrade, maintenance and
+doctor timers, Terraform processes left running for over a day, and the gh login.
+`bin/devbox-host doctor` is a different check: this machine's ssh entries for
+the boxes.
 
 ### Metrics: Telegraf to InfluxDB
 
