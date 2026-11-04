@@ -153,6 +153,7 @@ main() {
   pve "${create[@]}"
   assert_devbox "$vmid" "$hostname"
   pve pct start "$vmid"
+  [[ -z $tmp_disk ]] || remove_tmp_lost_found "$vmid" || say "could not remove /tmp/lost+found, so systemd-tmpfiles-clean will fail; on the host, rmdir it"
   say "started $hostname (VMID $vmid); bootstrapping from $REPO@${commit:0:12}"
   pve "${bootstrap[@]}" ||
     die "bootstrap failed in $hostname (VMID $vmid); fix it, then bin/devbox-destroy $client and create again"
