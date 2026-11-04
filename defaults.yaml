@@ -21,6 +21,7 @@ resources:
   swap_mb: 2048
   cores: 8
   disk: 40G
+  tmp_disk: 15G      # /tmp's own volume; runner and hub boxes keep a tmpfs
   cpuunits: 100      # CPU weight against the host's other guests
   onboot: true
 

@@ -59,6 +59,7 @@ claude_account: example
 #   swap_mb: 2048      # swap, in MB (0 disables it)
 #   cores: 8           # CPU cores
 #   disk: 40G          # root disk size, with an M, G or T suffix
+#   tmp_disk: 15G      # /tmp's own thin volume, so a full /tmp can't use up memory or the root disk
 #   cpuunits: 100      # CPU weight against the host's other guests (1-10000)
 #   onboot: true       # start the VM when the host boots
 

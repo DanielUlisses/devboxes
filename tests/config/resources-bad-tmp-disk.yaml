@@ -1,0 +1,4 @@
+# expect: resources.tmp_disk: must be a size like 15G
+claude_account: work
+resources:
+  tmp_disk: lots
