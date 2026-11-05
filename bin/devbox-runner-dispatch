@@ -230,6 +230,7 @@ ensure_mirror() {
   docker run -d --name "$MIRROR_NAME" --restart=unless-stopped --network host \
     -v "$MIRROR_NAME:/var/lib/registry" \
     -e "REGISTRY_HTTP_ADDR=$SANDBOX_GATEWAY:5000" \
+    -e REGISTRY_HTTP_DEBUG_ADDR=127.0.0.1:5001 \
     -e REGISTRY_PROXY_REMOTEURL=https://registry-1.docker.io \
     -e OTEL_TRACES_EXPORTER=none \
     "$MIRROR_IMAGE" >/dev/null ||
