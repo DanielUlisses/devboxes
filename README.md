@@ -1010,7 +1010,9 @@ starting a runner, so a prune can't break anything for long:
 Jobs reach the LAN and the tailnet by address through the box, as the box
 itself. They resolve names with the box's `/etc/resolv.conf` servers; a box
 whose resolver doesn't know tailnet names doesn't get them in a job either, so
-use the address.
+use the address. A container the job runs on its `dockerd`'s default bridge
+gets Docker's fallback, `8.8.8.8` and `8.8.4.4`, as the sandbox's own resolver
+is a loopback address; it resolves public names but not LAN ones.
 
 ## Hub box
 
