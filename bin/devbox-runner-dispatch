@@ -2,9 +2,11 @@
 # The dispatcher of a role: runner box, run by `devbox sync`'s systemd unit as
 # ghrunner. Every cycle it looks, as the org's GitHub App, for queued jobs
 # whose runs-on labels are all among the box's labels plus self-hosted, and
-# for each one (up to max_jobs at once) starts a fresh just-in-time runner:
-# its own copy of the runner, work dir and empty HOME, deleted when the runner
-# exits after its one job. It only calls out to GitHub; nothing connects in.
+# for each one (up to max_jobs at once) starts a fresh just-in-time runner in
+# its own sandbox: a container with its own dockerd, ports, /tmp and processes,
+# its own copy of the runner, work dir and empty HOME (bin/devbox-runner-job),
+# all deleted when the runner exits after its one job. It only calls out to
+# GitHub; nothing connects in.
 set -euo pipefail
 
 API=https://api.github.com
@@ -17,17 +19,27 @@ OP_TOKEN_FILE=/etc/ghrunner/op-service-account-token
 # file attached to it), in the homelab-ci vault.
 APP_ID_REF=${DISPATCH_APP_ID_REF:-op://homelab-ci/github-app/username}
 APP_KEY_REF=${DISPATCH_APP_KEY_REF:-op://homelab-ci/github-app/private-key.pem}
-# The runner devbox sync installs; each job runs a copy of it.
-RUNNER_DIST=/opt/actions-runner/current
-# One directory per running job: runner/ (the copy, with its _work) and home/.
-JOBS=${DISPATCH_JOBS:-/home/ghrunner/jobs}
 # The org's default runner group, which takes no public repos by default.
 RUNNER_GROUP=1
 CYCLE=20          # seconds between cycles
 BACKOFF_MAX=300   # longest wait after repeated errors
 IDLE_TIMEOUT=900  # a runner still without a job after this long is removed
-# What a job finds on PATH: git, ssh, curl, jq, gh, docker, op.
-JOB_PATH=/usr/local/bin:/usr/bin
+STOP_WAIT=30      # seconds a stopped sandbox gets before it is killed; the unit's TimeoutStopSec is 60
+# Every sandbox carries this label, so a restart can find those left behind.
+SANDBOX_LABEL=devbox.runner-job
+SANDBOX_IMAGE=devbox-runner-job:base
+# What a sandbox runs, which devbox sync installs.
+SANDBOX_COMMAND=/usr/local/libexec/devbox-runner-job
+# Its network: icc off, so concurrent jobs can't reach each other. They do reach
+# the gateway, the box, where the mirror listens; bin/devbox allows that address
+# in its listening check, and bin/devbox-runner-job gets it from SANDBOX_GATEWAY.
+SANDBOX_NETWORK=devbox-ci
+SANDBOX_SUBNET=172.30.0.0/24
+SANDBOX_GATEWAY=172.30.0.1
+# The pull-through cache of Docker Hub that jobs' dockerds pull through, as each
+# starts with no images. Its volume is named, so volume prunes leave it.
+MIRROR_NAME=devbox-registry-mirror
+MIRROR_IMAGE=registry:3@sha256:d4032d4cc323c1731c707931ecada07a53076eac38e3b61ae57533f170f2c6c3
 
 usage() {
   cat <<EOF
@@ -191,6 +203,71 @@ matching_jobs() {
   done <<<"$repos"
 }
 
+# --- sandboxes ----------------------------------------------------------------
+
+# The empty root a sandbox starts from; its /usr, /opt and /etc come from the box.
+# A maintenance run's image prune can delete it, and ensure_sandbox makes it again.
+build_sandbox_image() {
+  local root rc=0
+  root="$(mktemp -d)" || return 1
+  mkdir -p "$root"/{etc,tmp,run,var/tmp,var/lib,var/log,home,root,proc,sys,dev,usr,opt,host-etc,mnt,srv}
+  chmod 1777 "$root/tmp" "$root/var/tmp"
+  ln -s usr/bin "$root/bin"
+  ln -s usr/bin "$root/sbin"
+  ln -s usr/lib "$root/lib"
+  ln -s usr/lib "$root/lib64"
+  ln -s ../run "$root/var/run"
+  tar --owner=0 --group=0 --numeric-owner -C "$root" -cf - . | docker import - "$SANDBOX_IMAGE" >/dev/null || rc=$?
+  rm -rf -- "$root"
+  return "$rc"
+}
+
+# The mirror, running. Not having it only makes jobs pull from Docker Hub, so a
+# failure is logged and nothing more.
+ensure_mirror() {
+  [[ $(docker inspect -f '{{.State.Running}}' "$MIRROR_NAME" 2>/dev/null) != true ]] || return 0
+  docker rm -f "$MIRROR_NAME" >/dev/null 2>&1 || true
+  docker run -d --name "$MIRROR_NAME" --restart=unless-stopped --network host \
+    -v "$MIRROR_NAME:/var/lib/registry" \
+    -e "REGISTRY_HTTP_ADDR=$SANDBOX_GATEWAY:5000" \
+    -e REGISTRY_HTTP_DEBUG_ADDR=127.0.0.1:5001 \
+    -e REGISTRY_PROXY_REMOTEURL=https://registry-1.docker.io \
+    -e OTEL_TRACES_EXPORTER=none \
+    "$MIRROR_IMAGE" >/dev/null ||
+    log "could not start the registry mirror; jobs pull from Docker Hub"
+}
+
+# What a sandbox needs, made when missing, so nothing a prune removed stays gone.
+ensure_sandbox() {
+  if ! docker network inspect "$SANDBOX_NETWORK" >/dev/null 2>&1; then
+    docker network create --subnet "$SANDBOX_SUBNET" --gateway "$SANDBOX_GATEWAY" \
+      -o com.docker.network.bridge.enable_icc=false "$SANDBOX_NETWORK" >/dev/null ||
+      { log "could not create the $SANDBOX_NETWORK network"; return 1; }
+    log "created the $SANDBOX_NETWORK network"
+  fi
+  if ! docker image inspect "$SANDBOX_IMAGE" >/dev/null 2>&1; then
+    build_sandbox_image || { log "could not build $SANDBOX_IMAGE"; return 1; }
+    log "built $SANDBOX_IMAGE"
+  fi
+  ensure_mirror
+}
+
+# Removes the sandboxes an earlier run left (a crash doesn't stop them), and the
+# volumes they had. Logged, not fatal: the cycles report a docker that's down.
+sweep_sandboxes() {
+  local ids
+  if ids="$(docker ps -aq --filter "label=$SANDBOX_LABEL")"; then
+    if [[ -n $ids ]]; then
+      log "removing sandboxes left by an earlier run: $(paste -sd' ' <<<"$ids")"
+      # shellcheck disable=SC2086 # one id per word
+      docker rm -f -v $ids >/dev/null || log "could not remove them all"
+    fi
+    docker volume prune -f >/dev/null || log "could not prune volumes"
+  else
+    log "could not list sandboxes left by an earlier run"
+  fi
+}
+
 # --- runners ------------------------------------------------------------------
 
 # Running runners, by pid: their name, GitHub runner id and start time.
@@ -206,22 +283,16 @@ alive() {
   jobs -rp | grep -xF -- "$1" >/dev/null
 }
 
-# Deletes job dir $1. Files a job's containers left owned by root can't be,
-# so those are logged.
-remove_dir() {
-  rm -rf -- "$1" 2>/dev/null || log "could not delete all of $1 (files a container left owned by root?)"
-}
-
-# Collects runners that exited: their exit status logged, their dir deleted,
-# the runner deregistered (GitHub usually has already: then the 404 is fine).
+# Collects runners that exited: their exit status logged, their sandbox gone
+# (--rm deleted it unless docker itself failed), the runner deregistered (GitHub usually has already: then the 404 is fine).
 reap() {
   local pid status
   for pid in "${!R_NAME[@]}"; do
     alive "$pid" && continue
     status=0
     wait "$pid" || status=$?
-    log "${R_NAME[$pid]}: exited ($status), deleting its job dir"
-    remove_dir "$JOBS/${R_NAME[$pid]}"
+    log "${R_NAME[$pid]}: exited ($status)"
+    docker rm -f -v "${R_NAME[$pid]}" >/dev/null 2>&1 || true
     deregister "${R_ID[$pid]}" || true
     if ((status != 0 && $(date +%s) - R_START[$pid] < EARLY_EXIT)); then
       log "${R_NAME[$pid]}: failed within ${EARLY_EXIT}s of starting"
@@ -242,9 +313,9 @@ deregister() {
   esac
 }
 
-# Stops runner $1 (its whole session) and deregisters it.
+# Stops runner $1 (its whole sandbox) and deregisters it.
 stop_runner() {
-  kill -TERM -- "-$1" 2>/dev/null || true
+  docker stop --time "$STOP_WAIT" "${R_NAME[$1]}" >/dev/null 2>&1 || true
   deregister "${R_ID[$1]}" || true
 }
 
@@ -277,38 +348,31 @@ idle_runners() {
   IDLE=$idle
 }
 
-# Starts one runner: copies the runner into a fresh job dir, asks GitHub for
-# a just-in-time config, and runs it in its own session with an empty HOME
-# and a clean environment. The runner takes one job, then exits.
+# Starts one runner: asks GitHub for a just-in-time config and runs it in a new
+# sandbox. The runner takes one job, then exits, and --rm deletes the sandbox and
+# its anonymous /var/lib/docker volume. The secrets reach docker through its
+# environment, not its command line. The job can't reach this box's docker: it
+# gets the dockerd in its sandbox.
 start_runner() {
-  local name dir resp cfg id pid
+  local name resp cfg id pid
   name="$PREFIX-$(date +%s)-$(od -An -N3 -tx1 /dev/urandom | tr -d ' \n')"
-  dir="$JOBS/$name"
   # Called as an if condition, where set -e is off: each step checks itself.
-  install -d -m 700 "$dir" "$dir/home" || { log "$name: could not make $dir"; return 1; }
-  if ! cp -a "$RUNNER_DIST/." "$dir/runner/"; then
-    log "$name: could not copy $RUNNER_DIST (devbox sync installs it)"
-    remove_dir "$dir"
-    return 1
-  fi
   resp="$(api POST "/orgs/$ORG/actions/runners/generate-jitconfig" "$(jq -cn \
     --arg name "$name" --argjson labels "$LABELS_JSON" --argjson group "$RUNNER_GROUP" \
-    '{name: $name, runner_group_id: $group, labels: $labels, work_folder: "_work"}')")" ||
-    { remove_dir "$dir"; return 1; }
+    '{name: $name, runner_group_id: $group, labels: $labels, work_folder: "_work"}')")" || return 1
   cfg="$(jq -r '.encoded_jit_config // empty' <<<"$resp")"
   id="$(jq -r '.runner.id // empty' <<<"$resp")"
   if [[ -z $cfg || ! $id =~ ^[0-9]+$ ]]; then
     log "$name: generate-jitconfig returned no config"
-    remove_dir "$dir"
     return 1
   fi
   (
-    # Only what the job's contract names, plus what a process needs.
-    while IFS= read -r v; do unset "$v" 2>/dev/null || true; done < <(compgen -e)
-    export HOME="$dir/home" USER=ghrunner LOGNAME=ghrunner PATH="$JOB_PATH" LANG=C.UTF-8 \
-      OP_SERVICE_ACCOUNT_TOKEN="$OP_TOKEN"
-    cd "$dir/runner"
-    exec setsid ./run.sh --jitconfig "$cfg" </dev/null
+    export RUNNER_JITCONFIG="$cfg" OP_SERVICE_ACCOUNT_TOKEN="$OP_TOKEN"
+    exec docker run --rm --init --privileged --name "$name" --hostname "$name" \
+      --label "$SANDBOX_LABEL" --network "$SANDBOX_NETWORK" \
+      -v /usr:/usr:ro -v /opt:/opt:ro -v /etc:/host-etc:ro -v /var/lib/docker \
+      -e RUNNER_JITCONFIG -e OP_SERVICE_ACCOUNT_TOKEN -e "SANDBOX_GATEWAY=$SANDBOX_GATEWAY" \
+      "$SANDBOX_IMAGE" "$SANDBOX_COMMAND" </dev/null
   ) &
   pid=$!
   R_NAME[$pid]="$name"
@@ -354,6 +418,9 @@ cycle() {
   start=$((queued - IDLE))
   ((start <= MAX_JOBS - running)) || start=$((MAX_JOBS - running))
   ((queued == 0 && running == 0)) || log "queued $queued, running $running ($IDLE idle), max $MAX_JOBS: starting $((start > 0 ? start : 0))"
+  if ((start > 0)); then
+    ensure_sandbox || return 1
+  fi
   while ((start-- > 0)); do
     start_runner || return 1
   done
@@ -391,17 +458,18 @@ dry_run() {
   printf 'matching queued jobs: %s\n' "$queued"
   ((queued == 0)) || jq -r '"  \(.repo) run \(.run) job \(.id) \(.name | @json) [\(.labels | join(","))]"' <<<"$jobs"
   start=$((queued < MAX_JOBS ? queued : MAX_JOBS))
-  printf 'would start %s just-in-time runner(s) named %s-<time>-<random> in %s (dry run: none registered)\n' \
-    "$start" "$PREFIX" "$JOBS"
+  printf 'would start %s just-in-time runner(s) named %s-<time>-<random>, each in its own %s sandbox (dry run: none registered)\n' \
+    "$start" "$PREFIX" "$SANDBOX_IMAGE"
 }
 
-# Stopping: every runner's session ended and its job dir deleted.
+# Stopping: every runner's sandbox stopped, at once, and with that deleted.
 shutdown() {
   local pid
   log "stopping ${#R_NAME[@]} runner(s)"
-  for pid in "${!R_NAME[@]}"; do kill -TERM -- "-$pid" 2>/dev/null || true; done
+  if ((${#R_NAME[@]})); then
+    docker stop --time "$STOP_WAIT" "${R_NAME[@]}" >/dev/null 2>&1 || true
+  fi
   for pid in "${!R_NAME[@]}"; do wait "$pid" 2>/dev/null || true; done
-  for pid in "${!R_NAME[@]}"; do remove_dir "$JOBS/${R_NAME[$pid]}"; done
   exit 0
 }
 
@@ -424,10 +492,7 @@ main() {
     return
   fi
 
-  # Job dirs left by an earlier run that didn't stop cleanly.
-  install -d -m 700 "$JOBS"
-  find "$JOBS" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} + 2>/dev/null ||
-    log "could not delete all of the old job dirs in $JOBS"
+  sweep_sandboxes
   trap shutdown TERM INT
   log "started"
   wait=$CYCLE

@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+# One job's sandbox on a role: runner box: the command of the container
+# bin/devbox-runner-dispatch starts per job, as root inside it. The box's /usr,
+# /opt and /etc are bind-mounted in; everything else is the container's own and
+# goes with it. Gives the job a private /etc, its own dockerd and a fresh copy of
+# the runner, then runs the runner as RUNNER_USER, with only the environment
+# the job's contract names, until it exits after its one job.
+#
+# Reads RUNNER_JITCONFIG, OP_SERVICE_ACCOUNT_TOKEN and SANDBOX_GATEWAY from the
+# dispatcher, and the runner's name from the container's hostname.
+set -euo pipefail
+
+RUNNER_USER=ghrunner
+# The runner devbox sync installs; each job runs a copy of it.
+RUNNER_DIST=/opt/actions-runner/current
+# Where a job's runner/ (the copy, with its _work) and home/ live.
+JOBS=/home/$RUNNER_USER/jobs
+# What a job finds on PATH: git, ssh, curl, jq, gh, docker, op.
+JOB_PATH=/usr/local/bin:/usr/bin
+DOCKERD_LOG=/var/log/dockerd.log
+DOCKERD_WAIT=30 # seconds to wait for the job's dockerd
+
+log() {
+  printf 'runner-job: %s\n' "$*" >&2
+}
+
+# The box's /etc as this container's own, writable one, without what a job has
+# no business reading, and takes the box's away. Docker's own bind mounts stay.
+copy_etc() {
+  tar -C /host-etc -cf - --warning=no-file-ignored \
+    --exclude=./resolv.conf --exclude=./hosts --exclude=./hostname \
+    --exclude=./ghrunner --exclude='./shadow*' --exclude='./gshadow*' \
+    --exclude='./ssh/ssh_host_*' --exclude=./pacman.d/gnupg . | tar -C /etc -xf -
+  umount /host-etc
+}
+
+# Under cgroup v2 a cgroup with processes can't hand controllers to its
+# children, and dockerd's containers need them: moves this container's processes
+# into a child cgroup first. Reads the list whole, as moving a process while
+# reading it makes the read skip the next one.
+setup_cgroups() {
+  local pid pids
+  mkdir -p /sys/fs/cgroup/init
+  pids="$(</sys/fs/cgroup/cgroup.procs)"
+  for pid in $pids; do
+    echo "$pid" >/sys/fs/cgroup/init/cgroup.procs 2>/dev/null || true
+  done
+  sed -e 's/ / +/g' -e 's/^/+/' /sys/fs/cgroup/cgroup.controllers >/sys/fs/cgroup/cgroup.subtree_control
+}
+
+# The job's dockerd, its data on the container's /var/lib/docker volume, pulling
+# through the box's mirror (Docker goes to the registry itself when the mirror
+# is down). There's no systemd in here to manage cgroups for it.
+start_dockerd() {
+  local i
+  dockerd --exec-opt native.cgroupdriver=cgroupfs \
+    --registry-mirror "http://$SANDBOX_GATEWAY:5000" --insecure-registry "$SANDBOX_GATEWAY:5000" \
+    >"$DOCKERD_LOG" 2>&1 &
+  for ((i = 0; i < DOCKERD_WAIT * 2; i++)); do
+    docker info >/dev/null 2>&1 && return 0
+    sleep 0.5
+  done
+  log "dockerd not up after ${DOCKERD_WAIT}s:"
+  tail -n 30 "$DOCKERD_LOG" >&2
+  return 1
+}
+
+main() {
+  local name dir cfg="$RUNNER_JITCONFIG" pid status=0
+  name="$(uname -n)"
+  dir="$JOBS/$name"
+  copy_etc
+  setup_cgroups
+  start_dockerd
+
+  install -d -o "$RUNNER_USER" -g "$RUNNER_USER" -m 700 "/home/$RUNNER_USER" "$JOBS" "$dir" "$dir/home"
+  setpriv --reuid="$RUNNER_USER" --regid="$RUNNER_USER" --init-groups cp -a "$RUNNER_DIST/." "$dir/runner/"
+  cd "$dir/runner"
+  # In its own session, so a stop reaches the runner and all its job started.
+  # setsid keeps this pid: a background job here doesn't lead a process group.
+  setsid setpriv --reuid="$RUNNER_USER" --regid="$RUNNER_USER" --init-groups \
+    env -i HOME="$dir/home" USER="$RUNNER_USER" LOGNAME="$RUNNER_USER" PATH="$JOB_PATH" LANG=C.UTF-8 \
+    OP_SERVICE_ACCOUNT_TOKEN="$OP_SERVICE_ACCOUNT_TOKEN" \
+    ./run.sh --jitconfig "$cfg" </dev/null &
+  pid=$!
+  trap 'kill -TERM -- "-$pid" 2>/dev/null || true' TERM
+  # A trapped signal ends wait early, so wait until the runner has really gone.
+  wait "$pid" || status=$?
+  while kill -0 "$pid" 2>/dev/null; do
+    status=0
+    wait "$pid" || status=$?
+  done
+  exit "$status"
+}
+
+main "$@"

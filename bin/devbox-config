@@ -103,12 +103,13 @@ def resources($p):
   if . == null then empty
   elif type != "object" then err($p; "must be a mapping \(got)")
   else
-    unknown_keys("\($p)."; ["memory_mb", "swap_mb", "cores", "disk", "tmp_disk", "cpuunits", "onboot"]),
+    unknown_keys("\($p)."; ["memory_mb", "swap_mb", "cores", "disk", "tmp_disk", "docker_disk", "cpuunits", "onboot"]),
     (.memory_mb | int_min("\($p).memory_mb"; 1)),
     (.swap_mb | int_min("\($p).swap_mb"; 0)),
     (.cores | int_min("\($p).cores"; 1)),
     (.disk | str_match("\($p).disk"; "^[1-9][0-9]*[MGT]$"; "a size like 40G")),
     (.tmp_disk | str_match("\($p).tmp_disk"; "^[1-9][0-9]*[MGT]$"; "a size like 15G")),
+    (.docker_disk | str_match("\($p).docker_disk"; "^[1-9][0-9]*[MGT]$"; "a size like 30G")),
     (.cpuunits | int_range("\($p).cpuunits"; 1; 10000)),
     (.onboot | if . == null or type == "boolean" then empty
                else err("\($p).onboot"; "must be true or false \(got)") end)

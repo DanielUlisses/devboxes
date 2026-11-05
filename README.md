@@ -20,6 +20,7 @@ bin/devbox             runs inside a box: `devbox bootstrap`, `sync`, `login`, `
 bin/devbox-agent-instructions  prints a box's agent instructions (~/.claude/CLAUDE.md, ~/AGENTS.md) from a resolved config
 bin/devbox-browser     $BROWSER in a box: prints URLs instead of opening them
 bin/devbox-runner-dispatch  a runner box's dispatcher: one just-in-time Actions runner per queued job
+bin/devbox-runner-job  what a job's sandbox runs: its own /etc, dockerd and copy of the runner
 bin/devbox-hub-deploy  a hub box's deploy user's shell: only push /opt/ticket-board and reinstall it
 bootstrap.sh           first thing a new box runs: clones this repo, hands over to devbox
 dotfiles/              bash, git, gh and nvim config stowed into every box (no identity, no secrets)
@@ -492,8 +493,9 @@ bin/devbox-tmp-disk --restart <client>
 ```
 
 Every box also gets `devbox-maintenance.timer`, written and enabled by `devbox
-sync`: Sundays at 04:30 (up to 30 minutes later, run at the next boot if the box
-was off), at idle priority. It is not configurable.
+sync`: Sundays at 04:30, or every night at 04:30 on a runner box (up to 30
+minutes later, run at the next boot if the box was off), at idle priority. It is
+not configurable.
 
 ```
 devbox maintenance --dry-run   # what it would delete; deletes nothing
@@ -508,6 +510,9 @@ It deletes:
   cache, created over 7 days ago. That's when the image was built, not when it
   was pulled, so an old image pulled today goes at the next run if nothing uses
   it. Images come back with a pull; one built locally needs its build again.
+- On a runner box, anonymous Docker volumes no container uses, whatever their
+  age: job containers leave them behind, up to a GB a job from a service like
+  Postgres. Named volumes stay.
 
 It only reports, for a person to act on: disk use, the pacman cache, journal and
 tool caches, and worktrees that are clean, with no stash and every commit
@@ -798,10 +803,11 @@ runners:
 - **The runner user.** `devbox sync` adds `ghrunner`, a system user that
   is not in `wheel` and has no login shell, and closes every home under
   `/home` to other users (mode 700). `daniel` stays the admin login, with
-  sudo. `ghrunner` is in `docker`, so jobs run containers. That group is
-  root on the box in all but name, which is acceptable only here: a
-  dedicated, unprivileged box that holds nothing but the runner's own
-  token.
+  sudo. `ghrunner` is in `docker`, so the dispatcher can start each job's
+  sandbox. That group is root on the box in all but name, which is
+  acceptable only here: a dedicated, unprivileged box that holds nothing
+  but the runner's own token. Jobs get the `dockerd` in their sandbox, not
+  the box's.
 - **Logins.** `devbox login` asks only for Tailscale, joining as
   **`tag:runner`** (not `tag:devbox`), and the runner's 1Password
   service-account token, checked with `op whoami`. No gh, Claude or az. The
@@ -814,15 +820,21 @@ runners:
 - **Resources.** `defaults.yaml`'s `runner_resources` replaces `resources`
   for a runner: CPU weight (`cpuunits`) 50 against the default 100, so the
   HA VM and other guests win under contention; 3 GB memory plus 1 GB swap,
-  a 4 GB hard cap; 2 cores; a 16 GB disk. A runner's own `resources:` still
-  overrides it key by key. `devbox-create --dry-run` shows all of them in
-  the `pct create` line.
+  a 4 GB hard cap; 2 cores; a 16 GB disk, plus `docker_disk`, a 30 GB thin
+  volume at `/var/lib/docker` holding the sandboxes and the image mirror, so
+  a burst of jobs fills that and not the root disk. A runner's own
+  `resources:` still overrides it key by key. `devbox-create --dry-run`
+  shows all of them in the `pct create` line. A box made before
+  `docker_disk` doesn't get the volume from sync: stop Docker and empty
+  `/var/lib/docker`, shut the box down, then on the host `pct set <vmid>
+  --mp0 local-lvm:30,mp=/var/lib/docker,mountoptions=discard` and start it.
+  No `nosuid` or `nodev` on it, unlike `/tmp`'s: images need both.
 - **No LAN listeners.** `devbox sync` masks `sshd` (Tailscale SSH serves the
   tailnet; `pct enter` on the host still works) and turns off
   systemd-resolved's LLMNR and mDNS listeners. It then reports anything
-  still listening beyond loopback and the tailnet. The one expected
-  exception is tailscaled's WireGuard UDP port, which accepts only packets
-  from tailnet peers.
+  still listening beyond loopback and the tailnet. The expected exceptions
+  are tailscaled's WireGuard UDP port, which accepts only packets from
+  tailnet peers, and the image mirror on the sandbox network's gateway.
 - **No herdr machine.** You reach a runner as `daniel` over Tailscale SSH
   (`ssh <hostname>`; `bin/devbox-host` still writes its ssh config entries),
   not through herdr: `bin/devbox-host` saves no herdr machine for it and
@@ -867,17 +879,18 @@ Every 20 seconds or so it:
    runners running) runners. Each one gets a just-in-time config from
    `POST /orgs/{org}/actions/runners/generate-jitconfig` (the box's labels,
    a unique name `<hostname>-<time>-<random>`, the default runner group) and
-   runs in its own directory, `/home/ghrunner/jobs/<name>/`: a copy of the
-   runner with its `_work` folder, and an empty `HOME`. The runner takes one
-   job and exits, and the dispatcher deletes that directory and
-   deregisters the runner (GitHub usually has already).
+   runs in its own [sandbox](#job-sandboxes), in
+   `/home/ghrunner/jobs/<name>/`: a copy of the runner with its `_work`
+   folder, and an empty `HOME`. The runner takes one job and exits, the
+   sandbox goes with it, and the dispatcher deregisters the runner (GitHub
+   usually has already).
 
 A runner GitHub reports as not busy (or no longer knows) 15 minutes after it
 started (its job was cancelled) is stopped and deregistered; one whose
 status check fails is logged and left running. On an API or 1Password error, or a runner failing
 within a minute of starting, the dispatcher logs it and waits, doubling the
-wait up to 5 minutes, instead of exiting; at start it deletes job
-directories and deregisters offline runners of its own
+wait up to 5 minutes, instead of exiting; at start it removes sandboxes and
+anonymous volumes and deregisters offline runners of its own
 (`<hostname>-<time>-<6 hex digits>`) left by an earlier run.
 
 **API budget.** An installation token gets 5,000 calls an hour, shared by
@@ -889,8 +902,6 @@ calls; with nothing queued that is about 1 + the private repos. After each
 cycle the dispatcher reads `X-RateLimit-Remaining` and `X-RateLimit-Reset`:
 when the calls left, at the last cycle's pace, would run out before the
 reset, it stretches the wait so they last until then, and logs it. Its log is `journalctl -u devbox-runner-dispatch`.
-Files a job's containers leave owned by root can't be deleted by `ghrunner`;
-the log names any such directory.
 
 To see what it would do, without registering anything:
 
@@ -947,9 +958,10 @@ and can count on:
   the box's;
 - an empty `HOME` of its own, and a work directory that is deleted, with
   the `HOME`, when the job ends: nothing carries over between jobs;
-- no serialization: up to `max_jobs` jobs run at once, as the same user, on
-  the same Docker daemon. A workflow that must not overlap itself sets its
-  own `concurrency:`.
+- a [sandbox](#job-sandboxes) of its own, with its own `docker`: up to
+  `max_jobs` jobs run at once without sharing ports, `/tmp` or containers.
+  What a job does outside the box, like a deploy, isn't serialized: a
+  workflow that must not overlap itself sets its own `concurrency:`.
 
 **Safety rules.** A self-hosted runner runs whatever the workflow says, as
 a user that can drive Docker and read the box's 1Password token. That token
@@ -962,6 +974,45 @@ here. So use
 `schedule`, `workflow_dispatch` or `push` to `main`; never in public repos,
 and never on `pull_request` (or `pull_request_target`), where code from a
 branch or a fork would run with those rights.
+
+### Job sandboxes
+
+Each job runs in its own container on the box's Docker, with a `dockerd` of
+its own inside it (`bin/devbox-runner-job`, which sync installs as
+`/usr/local/libexec/devbox-runner-job`). `docker run --rm` deletes all of it
+when the runner exits: the container, its `/var/lib/docker` volume and, with
+that, anything the job's own containers left behind, whoever owns it.
+
+| | |
+|---|---|
+| Per job | ports (two jobs can both publish 5432), `/tmp`, processes, Docker containers, networks, volumes and images, the job directory, a writable `/etc` |
+| From the box, read-only | `/usr` and `/opt`, so a job has the box's tools, kept current by its upgrades; a copy of `/etc` without its shadow files, ssh host keys, `/etc/ghrunner` or pacman keyring |
+| Still shared | CPU, memory, disk and the box's kernel: a greedy job still slows the other, and can run the box out of memory or `/var/lib/docker` out of space |
+
+This isolates jobs from each other's accidents. **It is not a security
+boundary against a hostile job**: the sandbox is `--privileged`, which a nested
+`dockerd` needs. That's acceptable here only because of the safety rules above,
+which already trust every job with the box's token.
+
+The dispatcher makes what sandboxes need when it finds it missing, before
+starting a runner, so a prune can't break anything for long:
+
+- the `devbox-ci` network (`172.30.0.0/24`), with inter-container traffic off,
+  so concurrent jobs can't reach each other;
+- the image `devbox-runner-job:base`, an empty root: a maintenance run's image
+  prune can delete it, and the next job rebuilds it in about a second;
+- `devbox-registry-mirror`, a pull-through cache of Docker Hub listening on
+  the network's gateway, `172.30.0.1:5000`, with its layers in a named volume.
+  Every job's `dockerd` starts with no images, so without this each one would
+  download them again. If it can't start, the dispatcher logs that and Docker
+  pulls from Hub. Images from other registries aren't cached.
+
+Jobs reach the LAN and the tailnet by address through the box, as the box
+itself. They resolve names with the box's `/etc/resolv.conf` servers; a box
+whose resolver doesn't know tailnet names doesn't get them in a job either, so
+use the address. A container the job runs on its `dockerd`'s default bridge
+gets Docker's fallback, `8.8.8.8` and `8.8.4.4`, as the sandbox's own resolver
+is a loopback address; it resolves public names but not LAN ones.
 
 ## Hub box
 

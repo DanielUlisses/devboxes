@@ -68,7 +68,7 @@ main() {
   done
   [[ -n $client ]] || { usage >&2; exit 1; }
 
-  local config hostname role memory swap cores disk tmp_disk cpuunits onboot
+  local config hostname role memory swap cores disk tmp_disk docker_disk cpuunits onboot
   config="$("$ROOT/bin/devbox-config" --json "$client")" || exit 1
   hostname="$(jq -r .hostname <<<"$config")"
   role="$(jq -r .role <<<"$config")"
@@ -78,6 +78,8 @@ main() {
   disk="$(disk_gb "$(jq -r .resources.disk <<<"$config")")"
   tmp_disk="$(jq -r '.resources.tmp_disk // empty' <<<"$config")"
   [[ -z $tmp_disk ]] || tmp_disk="$(disk_gb "$tmp_disk")"
+  docker_disk="$(jq -r '.resources.docker_disk // empty' <<<"$config")"
+  [[ -z $docker_disk ]] || docker_disk="$(disk_gb "$docker_disk")"
   cpuunits="$(jq -r .resources.cpuunits <<<"$config")"
   onboot="$(jq -r 'if .resources.onboot then 1 else 0 end' <<<"$config")"
   use_config_host "$config"
@@ -87,6 +89,7 @@ main() {
     cores=1
     ((disk <= 8)) || disk=8
     [[ -z $tmp_disk ]] || ((tmp_disk <= 4)) || tmp_disk=4
+    [[ -z $docker_disk ]] || ((docker_disk <= 8)) || docker_disk=8
   fi
 
   # The box clones the public repo, so it can only follow what's pushed.
@@ -135,6 +138,7 @@ main() {
     --net0 "name=eth0,bridge=$BRIDGE,ip=dhcp"
     --onboot "$onboot")
   [[ -z $tmp_disk ]] || create+=(--mp0 "$(tmp_disk_spec "$tmp_disk")")
+  [[ -z $docker_disk ]] || create+=("--mp$([[ -z $tmp_disk ]] && echo 0 || echo 1)" "$(docker_disk_spec "$docker_disk")")
   local bootstrap=(pct exec "$vmid" -- bash -c "$FETCH_BOOTSTRAP" bootstrap
     "https://raw.githubusercontent.com/$REPO/$commit/bootstrap.sh"
     "$client" "https://github.com/$REPO.git" "$BRANCH" "$commit" "$(jq -c . <<<"$config")")

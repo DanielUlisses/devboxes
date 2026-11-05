@@ -60,6 +60,7 @@ claude_account: example
 #   cores: 8           # CPU cores
 #   disk: 40G          # root disk size, with an M, G or T suffix
 #   tmp_disk: 15G      # /tmp's own thin volume, so a full /tmp can't use up memory or the root disk
+#   docker_disk: 30G   # /var/lib/docker's own thin volume, so Docker can't fill the root disk; a runner's default, none on a devbox
 #   cpuunits: 100      # CPU weight against the host's other guests (1-10000)
 #   onboot: true       # start the VM when the host boots
 
