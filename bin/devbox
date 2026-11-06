@@ -2015,39 +2015,38 @@ install_tk_hub() {
   fi
 }
 
-# The box policy's remote_control: ticket-skill's launcher starts each ticket's
-# agent with claude --remote-control when it is true, so tk-hub's Sessions page
-# can link the session in the Claude app. Only that key of
-# ~/.config/tk-daemon/policy.json is written (the tk daemon and tk.sh read the
-# rest); an absent file stays absent while the value is false (absent is off).
+# The box policy's remote_control and remote_control_tickets: the tk daemon
+# starts grills and AI coworker sessions with claude --remote-control when
+# remote_control is true, and ticket-skill's launcher starts each ticket's agent
+# with it when remote_control_tickets is true, so tk-hub can link the session in
+# the Claude app. Only those keys of ~/.config/tk-daemon/policy.json are written
+# (the tk daemon and tk.sh read the rest). The file is written even when both
+# are false: the daemon reads a missing file as "allowed".
 write_box_policy() {
   local config="$1" file="$USER_HOME/.config/tk-daemon/policy.json" want have tmp
   [[ $(jq -r .role <<<"$config") == devbox ]] || return 0
-  want="$(jq '.remote_control == true' <<<"$config")"
+  want="$(jq -c '{remote_control: (.remote_control == true),
+                  remote_control_tickets: (.remote_control == true and .remote_control_tickets == true)}' <<<"$config")"
   if [[ -s $file ]]; then
-    have="$(jq '.remote_control' "$file")" || die "remote-control: $file is not valid JSON"
+    have="$(jq -c '{remote_control, remote_control_tickets}' "$file")" || die "remote-control: $file is not valid JSON"
   else
-    [[ $want == true ]] || return 0
     have=null
   fi
   [[ $have != "$want" ]] || return 0
   mkdir -p "${file%/*}"
   tmp="$(mktemp "$file.XXXXXX")"
   if [[ -s $file ]]; then
-    jq --argjson v "$want" '.remote_control = $v' "$file" >"$tmp"
+    jq --argjson v "$want" '. + $v' "$file" >"$tmp"
   else
-    jq -n --argjson v "$want" '{remote_control: $v}' >"$tmp"
+    jq -n --argjson v "$want" '$v' >"$tmp"
   fi || {
     rm -f "$tmp"
     die "remote-control: could not write $file"
   }
   chmod 644 "$tmp"
   mv "$tmp" "$file"
-  if [[ $want == true ]]; then
-    changed "remote-control: on for ticket agents"
-  else
-    changed "remote-control: off for ticket agents"
-  fi
+  changed "remote-control: $(jq -r 'if .remote_control then "on for grills and coworkers, " +
+    (if .remote_control_tickets then "on" else "off" end) + " for ticket agents" else "off" end' <<<"$want")"
 }
 
 # With skills_catalog: the catalog repo pulled and synced into CATALOG_DIR for
