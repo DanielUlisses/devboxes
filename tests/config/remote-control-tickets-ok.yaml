@@ -1,0 +1,4 @@
+# expect: ok
+claude_account: example
+remote_control: true
+remote_control_tickets: true

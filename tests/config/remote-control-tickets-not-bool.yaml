@@ -1,0 +1,4 @@
+# expect: remote_control_tickets: must be true or false
+claude_account: example
+remote_control: true
+remote_control_tickets: "yes"

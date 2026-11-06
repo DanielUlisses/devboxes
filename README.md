@@ -416,12 +416,15 @@ reported and the rest still run, then `update` (and the sync) exits 1:
 - **metrics:** with `metrics` set, moves Telegraf to the latest release
   and rewrites its config and unit (see [Metrics](#metrics-telegraf-to-influxdb));
   without it, stops a Telegraf left from before.
-- **remote-control:** writes the client file's `remote_control` into the
-  box policy (`~/.config/tk-daemon/policy.json`, that key only), which
-  ticket-skill's launcher reads to start ticket agents with
-  `claude --remote-control`; tk-hub's Sessions page then links each session
-  in the Claude app. Off where the client's plan has Remote Control turned
-  off; the session is still reached with `herdr --remote` over Tailscale SSH.
+- **remote-control:** writes the client file's `remote_control` and
+  `remote_control_tickets` into the box policy
+  (`~/.config/tk-daemon/policy.json`, those keys only). The tk daemon starts
+  grills and AI coworker sessions with `claude --remote-control` when
+  `remote_control` is on, so tk-hub links them in the Claude app;
+  ticket-skill's launcher starts ticket agents with it only when
+  `remote_control_tickets` is on too (tk-hub's Sessions page is their chat).
+  Off where the client's plan has Remote Control turned off; the session is
+  still reached with `herdr --remote` over Tailscale SSH.
 - **skills-catalog:** with `skills_catalog: true`, pulls
   DanielUlisses/skills-catalog into `~/.claude/skill-repos` and runs its
   `bin/catalog-sync --client <client> --dest /opt/skills`: the skills

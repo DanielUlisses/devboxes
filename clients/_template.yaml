@@ -132,14 +132,21 @@ skills: []
 #   bucket: devboxes
 #   token_ref: op://example-vault/example-influx/token
 
-# Whether ticket-skill starts each ticket's agent under Claude Remote Control
-# (`claude --remote-control`), so tk-hub's Sessions page can open the session
-# in the Claude app. `devbox finish` and `update` write it as `remote_control`
-# in the box policy, ~/.config/tk-daemon/policy.json, which the launcher
-# reads. Leave it false for a client whose Claude plan has Remote Control
+# Whether the client's Claude plan allows Remote Control
+# (`claude --remote-control`), so tk-hub can open a session in the Claude app.
+# With it on, the grills tk-hub's project chat starts and AI coworker sessions
+# run under Remote Control; ticket agents don't, unless remote_control_tickets
+# is on too (tk-hub's Sessions page is their chat). `devbox finish` and
+# `update` write both into the box policy, ~/.config/tk-daemon/policy.json,
+# which the tk daemon (grills, coworkers) and ticket-skill's launcher (ticket
+# agents) read. Leave it false for a client whose plan has Remote Control
 # turned off: its sessions are still reached with herdr over Tailscale SSH.
 # Devbox only. Default: false.
 # remote_control: true
+
+# Whether ticket agents start under Remote Control too. Needs remote_control.
+# Devbox only. Default: false.
+# remote_control_tickets: true
 
 # Whether the box gets the skills catalog (the private
 # DanielUlisses/skills-catalog repo): `devbox finish` and `update` clone it and
