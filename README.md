@@ -308,7 +308,8 @@ bootstrap`, which:
   to the `docker` group (below);
 - adds user `daniel` with passwordless sudo, and `devbox` on the PATH;
 - installs Claude Code (native installer) and puts herdr, shellcheck, the
-  1Password CLI (`op`) and node 26 (global, for `npx`) in mise's system config,
+  1Password CLI (`op`), node 26 (global, for `npx`) and Bun (Ovis runs on it) in
+  mise's system config,
   `/etc/mise/config.toml`;
 - stows this repo's `dotfiles/` `bash` and `git` packages into the user's
   home (files in the way are moved to `<file>.bak`), and copies gh's
@@ -423,7 +424,9 @@ reported and the rest still run, then `update` (and the sync) exits 1:
   sessions and ticket agents start without it. tk-hub is the way in.
 - **ovis:** with `ovis` on (the default), installs
   [Ovis](https://github.com/devswha/ovis), the herdr web client, as the
-  `devswha.ovis` herdr plugin (updated like the other herdr plugins), writes its
+  `devswha.ovis` herdr plugin (updated like the other herdr plugins) after
+  linking Bun's mise shim to `/usr/local/bin/bun` (Ovis's install looks for Bun
+  on the PATH herdr started with, which can predate Bun), writes its
   config (`HOST=127.0.0.1`, `PORT=7317`, `OVIS_TELEMETRY=0`,
   `OVIS_AUTO_UPDATE=0`; any other line, a token, is kept) and publishes it on
   the tailnet with `tailscale serve --bg --https=443`. tk-hub's agent pages open
