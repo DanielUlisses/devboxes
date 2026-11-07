@@ -62,7 +62,8 @@ BASE_TOOLS='# Written by devbox (bootstrap and sync): tools every devbox gets.
 herdr = "latest"
 1password = "latest"
 shellcheck = "latest"
-node = "26"'
+node = "26"
+bun = "latest"'
 
 # A runner box's only mise tool, op, installed by root into RUNNER_MISE_DATA,
 # outside any home, so ghrunner can run it too; /usr/local/bin/op links to it.
@@ -2064,6 +2065,28 @@ OVIS_ENV="HOST=127.0.0.1
 PORT=$OVIS_PORT
 OVIS_TELEMETRY=0
 OVIS_AUTO_UPDATE=0"
+# Ovis runs on Bun, which its install looks for on the PATH of the shell that
+# started herdr. That PATH (mise activate) can predate Bun, so Bun, a base tool
+# (sync installs it), gets its mise shim linked into /usr/local/bin, on every
+# PATH, with no herdr restart. The shim follows mise's upgrades of bun@latest.
+# Runs as the box user, like the rest of install_ovis.
+OVIS_BUN_LINK=/usr/local/bin/bun
+ovis_bun() {
+  local shim="$USER_HOME/.local/share/mise/shims/bun"
+  grep -q '^bun = ' /etc/mise/config.toml 2>/dev/null ||
+    die "ovis: bun isn't in /etc/mise/config.toml yet; run devbox-sync for this box"
+  if ! mise which bun >/dev/null 2>&1; then
+    MISE_YES=1 mise install bun >/dev/null || die "ovis: mise could not install bun"
+    changed "ovis: installed bun"
+  fi
+  [[ -x $shim ]] || mise reshim
+  [[ -x $shim ]] || die "ovis: no bun shim at $shim"
+  if [[ $(readlink "$OVIS_BUN_LINK" 2>/dev/null) != "$shim" ]]; then
+    sudo ln -sfn "$shim" "$OVIS_BUN_LINK"
+    changed "ovis: $OVIS_BUN_LINK -> ${shim/#$USER_HOME/\~}"
+  fi
+}
+
 install_ovis() {
   local config="$1" on installed dir file serving
   [[ $(jq -r .role <<<"$config") == devbox ]] || return 0
@@ -2083,6 +2106,7 @@ install_ovis() {
     fi
     return 0
   fi
+  ovis_bun
   herdr_plugin "$OVIS_ID" "$OVIS_SRC"
   dir="$(herdr plugin config-dir "$OVIS_ID")" || die "ovis: no config dir for $OVIS_ID"
   file="$dir/env"
