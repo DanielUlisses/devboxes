@@ -1,0 +1,3 @@
+# expect: ovis: must be true or false
+claude_account: example
+ovis: "yes"

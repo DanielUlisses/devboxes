@@ -132,21 +132,24 @@ skills: []
 #   bucket: devboxes
 #   token_ref: op://example-vault/example-influx/token
 
-# Whether the client's Claude plan allows Remote Control
-# (`claude --remote-control`), so tk-hub can open a session in the Claude app.
-# With it on, the grills tk-hub's project chat starts and AI coworker sessions
-# run under Remote Control; ticket agents don't, unless remote_control_tickets
-# is on too (tk-hub's Sessions page is their chat). `devbox finish` and
-# `update` write both into the box policy, ~/.config/tk-daemon/policy.json,
-# which the tk daemon (grills, coworkers) and ticket-skill's launcher (ticket
-# agents) read. Leave it false for a client whose plan has Remote Control
-# turned off: its sessions are still reached with herdr over Tailscale SSH.
-# Devbox only. Default: false.
-# remote_control: true
+# Retired (2026-11-07): Remote Control is off on every box, whatever these say.
+# Every session is reached through tk-hub (its chat and the box's Ovis), so
+# `devbox finish` and `update` write both as false into the box policy,
+# ~/.config/tk-daemon/policy.json. The keys still validate (true or false;
+# remote_control_tickets needs remote_control) so older client files resolve,
+# and resolve to false. Devbox only.
+# remote_control: false
+# remote_control_tickets: false
 
-# Whether ticket agents start under Remote Control too. Needs remote_control.
-# Devbox only. Default: false.
-# remote_control_tickets: true
+# Ovis (github.com/devswha/ovis), the web client for herdr: chat and live
+# terminal for every agent pane, which tk-hub's agent pages open by deep link
+# (?machine=&ws=&pane=&view=terminal). `devbox finish` and `update` install it
+# as a herdr plugin (devswha.ovis) bound to 127.0.0.1:7317, with anonymous
+# usage counts and self-updates off and its relay never turned on, and publish
+# it on the tailnet with `tailscale serve --https=443` (the user's own
+# Tailscale login gets in; anything else must pair). False uninstalls the
+# plugin and stops serving it. Devbox only. Default: true.
+# ovis: false
 
 # Whether the box gets the skills catalog (the private
 # DanielUlisses/skills-catalog repo): `devbox finish` and `update` clone it and

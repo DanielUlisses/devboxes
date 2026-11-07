@@ -416,15 +416,20 @@ reported and the rest still run, then `update` (and the sync) exits 1:
 - **metrics:** with `metrics` set, moves Telegraf to the latest release
   and rewrites its config and unit (see [Metrics](#metrics-telegraf-to-influxdb));
   without it, stops a Telegraf left from before.
-- **remote-control:** writes the client file's `remote_control` and
-  `remote_control_tickets` into the box policy
-  (`~/.config/tk-daemon/policy.json`, those keys only). The tk daemon starts
-  grills and AI coworker sessions with `claude --remote-control` when
-  `remote_control` is on, so tk-hub links them in the Claude app;
-  ticket-skill's launcher starts ticket agents with it only when
-  `remote_control_tickets` is on too (tk-hub's Sessions page is their chat).
-  Off where the client's plan has Remote Control turned off; the session is
-  still reached with `herdr --remote` over Tailscale SSH.
+- **remote-control:** writes `remote_control: false` and
+  `remote_control_tickets: false` into the box policy
+  (`~/.config/tk-daemon/policy.json`, those keys only), whatever the client
+  file says: Remote Control is retired (2026-11-07), and grills, AI coworker
+  sessions and ticket agents start without it. tk-hub is the way in.
+- **ovis:** with `ovis` on (the default), installs
+  [Ovis](https://github.com/devswha/ovis), the herdr web client, as the
+  `devswha.ovis` herdr plugin (updated like the other herdr plugins), writes its
+  config (`HOST=127.0.0.1`, `PORT=7317`, `OVIS_TELEMETRY=0`,
+  `OVIS_AUTO_UPDATE=0`; any other line, a token, is kept) and publishes it on
+  the tailnet with `tailscale serve --bg --https=443`. tk-hub's agent pages open
+  a pane in it by deep link (`?machine=&ws=&pane=&view=terminal`). Its relay
+  stays off. With `ovis: false`, the plugin is uninstalled and the serve
+  dropped.
 - **skills-catalog:** with `skills_catalog: true`, pulls
   DanielUlisses/skills-catalog into `~/.claude/skill-repos` and runs its
   `bin/catalog-sync --client <client> --dest /opt/skills`: the skills
@@ -719,19 +724,12 @@ branch first. Outside a clone, name them:
 `az repos pr create --org https://dev.azure.com/<org> --project <project>
 --repository <repo> --source-branch <branch>`.
 
-### Remote Control: `devbox rc`
+### Ovis: a box's agents in the browser
 
-```
-devbox rc [<name>]
-```
-
-Run inside herdr on the box, as `daniel`. It opens a pane to the right of the
-current one, in `~/work`, running `claude --remote-control [<name>]`. The
-session then shows up in the Claude app (desktop, mobile, claude.ai/code)
-under that name, or the box's hostname when there is none, so you can follow
-and steer it away from the laptop; it also stays a normal Claude session in
-its herdr pane. Close it with `/exit` or by closing the pane. It needs `devbox
-login` done (Claude logged in) and refuses outside herdr.
+`https://<box>` (the box's MagicDNS name) serves Ovis to your own Tailscale
+login: chat and live terminal for every herdr pane. tk-hub links each agent's
+pane there (Terminal on its pages). Remote Control is retired, and `devbox rc`
+with it: reach a session through tk-hub or Ovis.
 
 ### Tailscale ACL
 
