@@ -75,12 +75,12 @@ tk_hub:
 # in a client file only; see clients/_template.yaml.
 metrics:
 
-# Claude Remote Control (the Claude app link on tk-hub's pages): whether the
-# client's plan allows it at all (grills and AI coworker sessions use it), and
-# whether ticket agents start under it too. Both off by default; see
-# clients/_template.yaml.
+# Claude Remote Control: retired, always off (see clients/_template.yaml).
 remote_control: false
 remote_control_tickets: false
+
+# Ovis, the herdr web client tk-hub links to (see clients/_template.yaml).
+ovis: true
 
 # The skills catalog (DanielUlisses/skills-catalog) synced to /opt/skills for
 # ticket agents: off by default; see clients/_template.yaml.
