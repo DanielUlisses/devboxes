@@ -289,8 +289,8 @@ if . == null then {} else . end
      | if $required and $role != "devbox" and .ovis_owner != null
        then err("ovis_owner"; "allowed only when role is devbox (role is \($role))")
        else .ovis_owner | if . == null or . == "" then empty
-         else str_match("ovis_owner"; "^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+$";
-           "a Tailscale login (an email, or user@github), or empty") end end),
+         else str_match("ovis_owner"; "^[A-Za-z0-9._%+-]+(@[A-Za-z0-9.-]+)?$";
+           "a Tailscale login (an email, user@github, or the name tailscale shows), or empty") end end),
 
     # The skills catalog is synced for a devbox'"'"'s ticket agents.
     ((.role // $default_role) as $role

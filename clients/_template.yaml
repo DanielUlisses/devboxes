@@ -156,7 +156,8 @@ skills: []
 # file as OVIS_TAILSCALE_OWNER. Boxes join the tailnet tagged (tag:devbox), so
 # the box has no login of its own for Ovis to compare with, and without this
 # every device pairs, yours included. Your login as `tailscale status --json |
-# jq -r '.User[].LoginName'` shows it on the box (an email, or user@github).
+# jq -r '.User[(.Self.UserID|tostring)].LoginName'` shows it on your own
+# machine: an email, user@github, or a name like <id>.<tailnet>.ts.net.
 # Empty leaves the env file's OVIS_TAILSCALE_OWNER line as it is (none, or one
 # added by hand). Devbox only. Default: empty.
 # ovis_owner: <your Tailscale login>
