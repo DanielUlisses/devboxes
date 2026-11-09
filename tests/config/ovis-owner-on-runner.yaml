@@ -1,0 +1,6 @@
+# expect: ovis_owner: allowed only when role is devbox
+role: runner
+runners:
+  org: example-org
+  labels: [homelab]
+ovis_owner: someone@github

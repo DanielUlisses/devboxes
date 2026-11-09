@@ -6,7 +6,8 @@
 # Anything left out falls back to defaults.yaml.
 #
 # Client files hold no secrets, tokens, passwords or email addresses;
-# devbox-config rejects any value that looks like an email, except git_email.
+# devbox-config rejects any value that looks like an email, except git_email
+# and ovis_owner.
 
 # VM hostname. Default: dev-<client>.
 # hostname: dev-example
@@ -146,10 +147,19 @@ skills: []
 # (?machine=&ws=&pane=&view=terminal). `devbox finish` and `update` install it
 # as a herdr plugin (devswha.ovis) bound to 127.0.0.1:7317, with anonymous
 # usage counts and self-updates off and its relay never turned on, and publish
-# it on the tailnet with `tailscale serve --https=443` (the user's own
-# Tailscale login gets in; anything else must pair). False uninstalls the
+# it on the tailnet with `tailscale serve --https=443` (the login in
+# ovis_owner gets in; anything else must pair). False uninstalls the
 # plugin and stops serving it. Devbox only. Default: true.
 # ovis: false
+
+# The Tailscale login Ovis lets in without a pairing code, written to its env
+# file as OVIS_TAILSCALE_OWNER. Boxes join the tailnet tagged (tag:devbox), so
+# the box has no login of its own for Ovis to compare with, and without this
+# every device pairs, yours included. Your login as `tailscale status --json |
+# jq -r '.User[].LoginName'` shows it on the box (an email, or user@github).
+# Empty leaves the env file's OVIS_TAILSCALE_OWNER line as it is (none, or one
+# added by hand). Devbox only. Default: empty.
+# ovis_owner: <your Tailscale login>
 
 # Whether the box gets the skills catalog (the private
 # DanielUlisses/skills-catalog repo): `devbox finish` and `update` clone it and

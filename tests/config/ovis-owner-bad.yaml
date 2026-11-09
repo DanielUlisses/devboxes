@@ -1,0 +1,3 @@
+# expect: ovis_owner: must be a Tailscale login
+claude_account: example
+ovis_owner: "not a login"
