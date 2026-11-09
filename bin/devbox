@@ -2055,7 +2055,8 @@ write_box_policy() {
 # to: with ovis on (the default), the devswha.ovis herdr plugin, its config
 # (OVIS_ENV: bound to 127.0.0.1, no usage counts, no self-update; its relay
 # stays off, it is only ever turned on in its settings; with ovis_owner, the
-# login it lets in without pairing) and `tailscale serve`
+# login it lets in without pairing; with ovis_token_ref, the shared token) and
+# `tailscale serve`
 # publishing it on the tailnet over HTTPS 443. With ovis off, the plugin is
 # uninstalled and the serve dropped. Updates as the other herdr plugins: a
 # reinstall when its default branch moved (herdr_plugin), never by itself.
@@ -2114,11 +2115,22 @@ install_ovis() {
   # Keys of ours replaced, any other line (a token Daniel added) kept. With
   # ovis_owner set, OVIS_TAILSCALE_OWNER is ours too: the box joins the tailnet
   # tagged, so Ovis has no login of its own to let in without pairing.
-  local want owner keys='HOST|PORT|OVIS_TELEMETRY|OVIS_AUTO_UPDATE' env="$OVIS_ENV"
+  # With ovis_token_ref set, so is OVIS_TOKEN: the shared token, read with op
+  # as the box user, for devices that are tagged and send Ovis no login.
+  local want owner ref token keys='HOST|PORT|OVIS_TELEMETRY|OVIS_AUTO_UPDATE' env="$OVIS_ENV"
   owner="$(jq -r '.ovis_owner // ""' <<<"$config")"
   if [[ -n $owner ]]; then
     keys+='|OVIS_TAILSCALE_OWNER'
     env+=$'\n'"OVIS_TAILSCALE_OWNER=$owner"
+  fi
+  ref="$(jq -r '.ovis_token_ref // ""' <<<"$config")"
+  if [[ -n $ref ]]; then
+    # shellcheck disable=SC2016 # for the box user's shell, as doctor_notify's
+    token="$(as_user bash -c 'OP_SERVICE_ACCOUNT_TOKEN="$(<"$HOME/.config/op/service-account-token")" op read "$1"' _ "$ref")" ||
+      die "ovis: op could not read ovis_token_ref ($ref)"
+    [[ -n $token && $token != *$'\n'* ]] || die "ovis: ovis_token_ref ($ref) is empty or spans lines"
+    keys+='|OVIS_TOKEN'
+    env+=$'\n'"OVIS_TOKEN=$token"
   fi
   want="$( { [[ -f $file ]] && grep -vE "^($keys)=" "$file"; printf '%s\n' "$env"; } )"
   if [[ ! -f $file || $(<"$file") != "$want" ]]; then
@@ -2129,7 +2141,7 @@ install_ovis() {
     herdr plugin action invoke "$OVIS_ID.stop" </dev/null >/dev/null 2>&1 || true
     herdr plugin action invoke "$OVIS_ID.start" </dev/null >/dev/null ||
       die "ovis: the plugin's start action failed (herdr plugin log list)"
-    changed "ovis: configured (127.0.0.1:$OVIS_PORT, usage counts and self-update off${owner:+, your login lets in without pairing})"
+    changed "ovis: configured (127.0.0.1:$OVIS_PORT, usage counts and self-update off${owner:+, your login lets in without pairing}${ref:+, shared token set})"
   fi
   if [[ $serving != true ]]; then
     sudo tailscale serve --bg --https=443 "http://127.0.0.1:$OVIS_PORT" >/dev/null ||

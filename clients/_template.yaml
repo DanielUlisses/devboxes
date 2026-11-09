@@ -161,6 +161,18 @@ skills: []
 # added by hand). Devbox only. Default: empty.
 # ovis_owner: <your Tailscale login>
 
+# Ovis's shared access token: an op://<vault>/<item>/<field> reference that
+# `devbox finish` and `update` read with op (the box's service account) and
+# write to Ovis's env file as OVIS_TOKEN, restarting Ovis when it changed. Use
+# one item for every box: each browser enters the token once per box and stays
+# signed in for a year. The way in when your devices are tagged: a tagged
+# device sends Ovis no login, so ovis_owner can't let it in. With a token set,
+# Ovis asks for it from everything but a paired device, your own login
+# included, so ovis_owner no longer applies. Empty leaves the env file's
+# OVIS_TOKEN line as it is (none, or one added by hand). Devbox only.
+# Default: empty.
+# ovis_token_ref: op://devbox/ovis/token
+
 # Whether the box gets the skills catalog (the private
 # DanielUlisses/skills-catalog repo): `devbox finish` and `update` clone it and
 # copy the skills approved for this client, each at its pinned commit, into

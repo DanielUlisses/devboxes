@@ -84,6 +84,9 @@ ovis: true
 # The Tailscale login Ovis lets in without a pairing code: empty here, set in
 # the private client file (it is an email); see clients/_template.yaml.
 ovis_owner: ""
+# Ovis's shared access token, as an op:// reference: empty here, set in the
+# client file; see clients/_template.yaml.
+ovis_token_ref: ""
 
 # The skills catalog (DanielUlisses/skills-catalog) synced to /opt/skills for
 # ticket agents: off by default; see clients/_template.yaml.
