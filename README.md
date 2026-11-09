@@ -428,7 +428,8 @@ reported and the rest still run, then `update` (and the sync) exits 1:
   linking Bun's mise shim to `/usr/local/bin/bun` (Ovis's install looks for Bun
   on the PATH herdr started with, which can predate Bun), writes its
   config (`HOST=127.0.0.1`, `PORT=7317`, `OVIS_TELEMETRY=0`,
-  `OVIS_AUTO_UPDATE=0`; any other line, a token, is kept) and publishes it on
+  `OVIS_AUTO_UPDATE=0`, and `OVIS_TAILSCALE_OWNER` from `ovis_owner` when the
+  client file sets it; any other line, a token, is kept) and publishes it on
   the tailnet with `tailscale serve --bg --https=443`. tk-hub's agent pages open
   a pane in it by deep link (`?machine=&ws=&pane=&view=terminal`). Its relay
   stays off. With `ovis: false`, the plugin is uninstalled and the serve
@@ -730,7 +731,9 @@ branch first. Outside a clone, name them:
 ### Ovis: a box's agents in the browser
 
 `https://<box>` (the box's MagicDNS name) serves Ovis to your own Tailscale
-login: chat and live terminal for every herdr pane. tk-hub links each agent's
+login: chat and live terminal for every herdr pane. A box joins the tailnet
+tagged, so it has no login of its own: set `ovis_owner` to your login in the
+client file, or every device asks for a pairing code, yours included. tk-hub links each agent's
 pane there (Terminal on its pages). Remote Control is retired, and `devbox rc`
 with it: reach a session through tk-hub or Ovis.
 

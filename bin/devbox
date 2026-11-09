@@ -2054,7 +2054,8 @@ write_box_policy() {
 # Ovis (github.com/devswha/ovis), the herdr web client tk-hub's agent pages link
 # to: with ovis on (the default), the devswha.ovis herdr plugin, its config
 # (OVIS_ENV: bound to 127.0.0.1, no usage counts, no self-update; its relay
-# stays off, it is only ever turned on in its settings) and `tailscale serve`
+# stays off, it is only ever turned on in its settings; with ovis_owner, the
+# login it lets in without pairing) and `tailscale serve`
 # publishing it on the tailnet over HTTPS 443. With ovis off, the plugin is
 # uninstalled and the serve dropped. Updates as the other herdr plugins: a
 # reinstall when its default branch moved (herdr_plugin), never by itself.
@@ -2110,9 +2111,16 @@ install_ovis() {
   herdr_plugin "$OVIS_ID" "$OVIS_SRC"
   dir="$(herdr plugin config-dir "$OVIS_ID")" || die "ovis: no config dir for $OVIS_ID"
   file="$dir/env"
-  # Keys of ours replaced, any other line (a token Daniel added) kept.
-  local want
-  want="$( { [[ -f $file ]] && grep -vE '^(HOST|PORT|OVIS_TELEMETRY|OVIS_AUTO_UPDATE)=' "$file"; printf '%s\n' "$OVIS_ENV"; } )"
+  # Keys of ours replaced, any other line (a token Daniel added) kept. With
+  # ovis_owner set, OVIS_TAILSCALE_OWNER is ours too: the box joins the tailnet
+  # tagged, so Ovis has no login of its own to let in without pairing.
+  local want owner keys='HOST|PORT|OVIS_TELEMETRY|OVIS_AUTO_UPDATE' env="$OVIS_ENV"
+  owner="$(jq -r '.ovis_owner // ""' <<<"$config")"
+  if [[ -n $owner ]]; then
+    keys+='|OVIS_TAILSCALE_OWNER'
+    env+=$'\n'"OVIS_TAILSCALE_OWNER=$owner"
+  fi
+  want="$( { [[ -f $file ]] && grep -vE "^($keys)=" "$file"; printf '%s\n' "$env"; } )"
   if [[ ! -f $file || $(<"$file") != "$want" ]]; then
     mkdir -p "$dir"
     install -m 600 /dev/null "$file.tmp"
@@ -2121,7 +2129,7 @@ install_ovis() {
     herdr plugin action invoke "$OVIS_ID.stop" </dev/null >/dev/null 2>&1 || true
     herdr plugin action invoke "$OVIS_ID.start" </dev/null >/dev/null ||
       die "ovis: the plugin's start action failed (herdr plugin log list)"
-    changed "ovis: configured (127.0.0.1:$OVIS_PORT, usage counts and self-update off)"
+    changed "ovis: configured (127.0.0.1:$OVIS_PORT, usage counts and self-update off${owner:+, your login lets in without pairing})"
   fi
   if [[ $serving != true ]]; then
     sudo tailscale serve --bg --https=443 "http://127.0.0.1:$OVIS_PORT" >/dev/null ||
