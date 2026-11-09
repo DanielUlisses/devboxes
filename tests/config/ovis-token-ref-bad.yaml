@@ -1,0 +1,3 @@
+# expect: ovis_token_ref: must be an op://<vault>/<item>/<field> reference
+claude_account: example
+ovis_token_ref: plain-secret-value

@@ -1,0 +1,6 @@
+# expect: ovis_token_ref: allowed only when role is devbox
+role: runner
+runners:
+  org: example-org
+  labels: [homelab]
+ovis_token_ref: op://devbox/ovis/token
