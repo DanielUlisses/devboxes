@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# Keeps the agent user's Claude files readable by the box user (agent_user:
+# true; see README.md, Ticket agents as their own user). Run by devbox sync as
+# the root service tk-agent-acl.
+#
+# devbox sync gives the box user a default ACL entry (r-x) on the agent's
+# ~/.claude and ~/.claude-switch, so the tk daemon can read its transcripts.
+# Claude Code creates them mode 600, which sets their ACL mask to --- and hides
+# them anyway. This watches both trees and opens the mask of each new file to
+# r-- (directories r-x). The mask caps named entries only: the agent's own
+# rights and the file's group stay as they were, and no one but the box user
+# has a named entry.
+set -euo pipefail
+
+CONF=${TK_AGENT_CONF:-/etc/tk-agent.conf}
+conf() { sed -n "s/^$1=//p" "$CONF" | head -1; }
+[[ -r $CONF ]] || { echo "tk-agent-acl: no $CONF" >&2; exit 1; }
+agent="$(conf AGENT_USER)"
+home="$(getent passwd "$agent" | cut -d: -f6)"
+[[ -n $home && -d $home ]] || { echo "tk-agent-acl: no home for '$agent'" >&2; exit 1; }
+roots=()
+for r in "$home/.claude" "$home/.claude-switch"; do [[ -d $r ]] && roots+=("$r"); done
+((${#roots[@]})) || { echo "tk-agent-acl: neither $home/.claude nor $home/.claude-switch exists" >&2; exit 1; }
+
+# Open one path's mask, unless it already is (setfacl alone would raise another
+# attrib event, and this would never settle).
+open_mask() {
+  local p="$1" m want
+  [[ -e $p && ! -L $p ]] || return 0
+  if [[ -d $p ]]; then want='r.x'; else want='r..'; fi
+  m="$(getfacl -cp -- "$p" 2>/dev/null | sed -n 's/^mask:://p')"
+  [[ -n $m && $m =~ ^$want$ ]] && return 0
+  setfacl -m m::rX -- "$p" 2>/dev/null || true
+}
+
+# What is there already, then what comes.
+while IFS= read -r -d '' p; do open_mask "$p"; done < <(find "${roots[@]}" ! -type l -print0)
+inotifywait -m -r -q -e create,moved_to,attrib --format '%w%f' -- "${roots[@]}" |
+  while IFS= read -r p; do open_mask "$p"; done

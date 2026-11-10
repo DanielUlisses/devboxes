@@ -32,7 +32,7 @@ export LC_ALL=C # one collation for sort and comm
 # Installed by bootstrap, and by sync when missing; sync never removes them.
 # tree-sitter-cli builds nvim-treesitter's parsers (LazyVim otherwise fetches
 # it through mason on nvim's first start, racing the parser installs).
-BASE_PACKAGES=(base-devel git openssh sudo acl stow jq go-yq unzip less mise github-cli tailscale bash-completion starship zoxide neovim tree-sitter-cli ripgrep fd docker docker-buildx docker-compose)
+BASE_PACKAGES=(base-devel git openssh sudo acl inotify-tools stow jq go-yq unzip less mise github-cli tailscale bash-completion starship zoxide neovim tree-sitter-cli ripgrep fd docker docker-buildx docker-compose)
 
 # A runner box's base packages instead: no developer tooling, but what a job
 # finds on PATH (git, ssh, curl, jq, gh, docker; op comes from mise) and
@@ -217,10 +217,15 @@ AGENT_LIBEXEC=/usr/local/libexec
 AGENT_SHIM_DIR=$AGENT_LIBEXEC/tk-agent-bin
 AGENT_SUDOERS=/etc/sudoers.d/tk-agent
 AGENT_STATE=/var/lib/tk-agent/$USER_NAME
-# The agent's subordinate ids for rootless Docker: start:count in
+# The root service that keeps the agent's transcripts readable by the box user
+# (bin/devbox-agent-acl): Claude Code writes them mode 600, which hides them
+# behind the ACL mask.
+AGENT_ACL_UNIT=tk-agent-acl.service
+# The agent's subordinate ids for rootless Podman: start:count in
 # /etc/subuid and /etc/subgid. In an unprivileged LXC these must be ids the
-# container itself has mapped (see README.md).
-AGENT_SUBIDS=100000:65536
+# container itself has mapped, so it needs 131072 of them, not Proxmox's
+# default 65536 (see README.md, Ticket agents as their own user).
+AGENT_SUBIDS=65536:65536
 
 # Telegraf, on a devbox whose config sets metrics: the latest
 # influxdata/telegraf release (its linux_amd64 tarball from TELEGRAF_DOWNLOADS,
@@ -1338,7 +1343,7 @@ doctor_notify() {
 # the hub. Warnings want a look; a failure, or a hub that couldn't be told, also
 # exits 1, so the unit shows up as failed.
 # With agent_user: the wrapper, rule and conf in place, the agent user in no
-# root-like group and signed in to Claude, rootless Docker running for it.
+# root-like group and signed in to Claude, rootless Podman running for it.
 doctor_agent_user() {
   local config="$1" home uid g signed=false f lost=()
   [[ $(jq -r '.agent_user == true' <<<"$config") == true ]] || return 0
@@ -1371,10 +1376,16 @@ doctor_agent_user() {
   else
     doctor_line warn "$AGENT_USER has no Claude login to share: sign in as yourself, then devbox sync; see README.md, Ticket agents as their own user"
   fi
-  if [[ -S /run/user/$uid/docker.sock ]]; then
-    doctor_line ok "rootless Docker runs for $AGENT_USER"
+  if [[ $(cat /proc/sys/dev/tty/legacy_tiocsti 2>/dev/null) != 0 ]]; then
+    doctor_line fail "TIOCSTI is allowed (dev.tty.legacy_tiocsti isn't 0), so the wrapper refuses to start ticket agents; set it on the host (a Proxmox LXC: on pve), see README.md"
+  fi
+  if ! systemctl is-active -q "$AGENT_ACL_UNIT" 2>/dev/null; then
+    doctor_line warn "$AGENT_ACL_UNIT isn't running, so the tk daemon can't read the agent's transcripts; run devbox sync"
+  fi
+  if [[ -S /run/user/$uid/podman/podman.sock ]]; then
+    doctor_line ok "rootless Podman serves $AGENT_USER's docker"
   else
-    doctor_line warn "no rootless Docker for $AGENT_USER, so tests that start containers fail; devbox sync says why"
+    doctor_line warn "no rootless Podman for $AGENT_USER, so tests that start containers fail; devbox sync says why"
   fi
 }
 
@@ -1479,12 +1490,91 @@ agent_unshare_credentials() {
   return 0
 }
 
+# The agent's transcripts, readable by the box user: bin/devbox-agent-acl as a
+# root service, watching the agent's ~/.claude and ~/.claude-switch.
+agent_acl_service() {
+  local unit restart=false
+  ! write_if_changed "$AGENT_LIBEXEC/tk-agent-acl" "$(<"$ROOT/bin/devbox-agent-acl")" 755 || restart=true
+  chown root:root "$AGENT_LIBEXEC/tk-agent-acl"
+  unit="[Unit]
+Description=devbox: keep $AGENT_USER's Claude transcripts readable by $USER_NAME
+After=local-fs.target
+
+[Service]
+ExecStart=$AGENT_LIBEXEC/tk-agent-acl
+Restart=on-failure
+RestartSec=10
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ReadWritePaths=/home
+
+[Install]
+WantedBy=multi-user.target"
+  ! write_if_changed "/etc/systemd/system/$AGENT_ACL_UNIT" "$unit" 644 || restart=true
+  if [[ ! -d /run/systemd/system ]]; then
+    say "agent-user: no systemd, $AGENT_ACL_UNIT not started (transcripts stay hidden from $USER_NAME)"
+    return 0
+  fi
+  if $restart; then
+    systemctl daemon-reload
+    systemctl try-restart "$AGENT_ACL_UNIT"
+  fi
+  if ! systemctl is-active -q "$AGENT_ACL_UNIT"; then
+    systemctl enable --now "$AGENT_ACL_UNIT" >/dev/null
+    say "agent-user: started $AGENT_ACL_UNIT"
+  fi
+}
+
+# Whether ids start..start+count-1 exist in this (user namespace's) uid_map:
+# in an unprivileged LXC only the ids the host maps for the container do.
+ids_mapped() {
+  local start="$1" count="$2" inside n
+  while read -r inside _ n; do
+    ((start >= inside && start + count <= inside + n)) && return 0
+  done </proc/self/uid_map
+  return 1
+}
+
+# The agent's rootless Podman: subordinate ids, lingering, podman.socket.
+agent_podman() {
+  local home="$1" uid="$2" start count range bus
+  pacman -Q podman &>/dev/null || pacman -S --needed --noconfirm podman >/dev/null ||
+    { say "agent-user: installing podman failed, so no containers for $AGENT_USER"; return 0; }
+  IFS=: read -r start count <<<"$AGENT_SUBIDS"
+  if ! ids_mapped "$start" "$count"; then
+    say "agent-user: no containers for $AGENT_USER: ids $start-$((start + count - 1)) aren't mapped in this container ($(tr -s ' ' </proc/self/uid_map | paste -sd';')); widen its id map on the host, see README.md"
+    return 0
+  fi
+  range="$start-$((start + count - 1))"
+  if [[ $(grep "^$AGENT_USER:" /etc/subuid 2>/dev/null) != "$AGENT_USER:$start:$count" || $(grep "^$AGENT_USER:" /etc/subgid 2>/dev/null) != "$AGENT_USER:$start:$count" ]]; then
+    sed -i "/^$AGENT_USER:/d" /etc/subuid /etc/subgid
+    usermod --add-subuids "$range" --add-subgids "$range" "$AGENT_USER"
+    say "agent-user: $AGENT_USER has subordinate ids $range"
+    runuser -u "$AGENT_USER" -- env -C "$home" HOME="$home" XDG_RUNTIME_DIR="/run/user/$uid" podman system migrate >/dev/null 2>&1 || true
+  fi
+  [[ -d /run/systemd/system ]] || { say "agent-user: no systemd, podman.socket not started for $AGENT_USER"; return 0; }
+  loginctl enable-linger "$AGENT_USER"
+  systemctl start "user@$uid.service"
+  bus="unix:path=/run/user/$uid/bus"
+  if [[ ! -S /run/user/$uid/podman/podman.sock ]]; then
+    runuser -u "$AGENT_USER" -- env -C "$home" HOME="$home" XDG_RUNTIME_DIR="/run/user/$uid" DBUS_SESSION_BUS_ADDRESS="$bus" \
+      systemctl --user enable --now podman.socket >/dev/null 2>&1 ||
+      { say "agent-user: podman.socket didn't start for $AGENT_USER (systemctl --user status podman.socket as $AGENT_USER)"; return 0; }
+    say "agent-user: rootless Podman on /run/user/$uid/podman/podman.sock for $AGENT_USER"
+  fi
+}
+
 sync_agent_user() {
-  local config="$1" home uid rules conf start count e
+  local config="$1" home uid rules conf e
   [[ $(box_role "$config") == devbox ]] || return 0
   if [[ $(jq -r '.agent_user == true' <<<"$config") != true ]]; then
     if [[ -e $AGENT_CONF || -e $AGENT_SUDOERS ]]; then
-      rm -f "$AGENT_CONF" "$AGENT_SUDOERS" "$AGENT_LIBEXEC/tk-agent-claude" "$AGENT_LIBEXEC/tk-agent-run" "$AGENT_SHIM_DIR/claude"
+      if [[ -d /run/systemd/system && -f /etc/systemd/system/$AGENT_ACL_UNIT ]]; then
+        systemctl disable --now "$AGENT_ACL_UNIT" >/dev/null 2>&1 || true
+      fi
+      rm -f "$AGENT_CONF" "$AGENT_SUDOERS" "$AGENT_LIBEXEC/tk-agent-claude" "$AGENT_LIBEXEC/tk-agent-run" "$AGENT_SHIM_DIR/claude" \
+        "$AGENT_LIBEXEC/tk-agent-acl" "/etc/systemd/system/$AGENT_ACL_UNIT"
       agent_unshare_credentials
       say "agent-user: off (wrapper, shim, sudoers rule, $AGENT_CONF and its share of your Claude login removed; $AGENT_USER and its home kept)"
     fi
@@ -1517,7 +1607,12 @@ sync_agent_user() {
   ! write_if_changed "$AGENT_SHIM_DIR/claude" "$(<"$ROOT/bin/devbox-agent-shim")" 755 ||
     say "agent-user: installed the claude shim in $AGENT_SHIM_DIR"
   chown root:root "$AGENT_LIBEXEC/tk-agent-claude" "$AGENT_LIBEXEC/tk-agent-run" "$AGENT_SHIM_DIR/claude"
+  # !use_pty for claude only: with a pty of its own, sudo would put claude in
+  # another session, outside the pane's foreground process group, and Herdr
+  # finds an agent there only (it then sees sudo, never claude). Sharing the
+  # pane's tty is safe only without TIOCSTI, which the wrapper checks.
   rules="Defaults!$AGENT_LIBEXEC/tk-agent-claude, $AGENT_LIBEXEC/tk-agent-run env_reset
+Defaults!$AGENT_LIBEXEC/tk-agent-claude !use_pty
 $USER_NAME ALL=($AGENT_USER) NOPASSWD: $AGENT_LIBEXEC/tk-agent-claude, $AGENT_LIBEXEC/tk-agent-run"
   if write_if_changed "$AGENT_SUDOERS" "$rules" 440; then
     visudo -cqf "$AGENT_SUDOERS" || { rm -f "$AGENT_SUDOERS"; die "agent-user: invalid sudoers entry"; }
@@ -1555,6 +1650,7 @@ STATE=$AGENT_STATE"
   setfacl -R -m "u:$USER_NAME:rX" "$home/.claude" "$home/.claude-switch"
   setfacl -R -d -m "u:$USER_NAME:rX" "$home/.claude" "$home/.claude-switch"
   agent_share_credentials "$home"
+  agent_acl_service
 
   # The agent's git: it trusts the box user's repos (git refuses another
   # user's otherwise). The box user never trusts the agent's.
@@ -1575,21 +1671,9 @@ STATE=$AGENT_STATE"
   runuser -u "$AGENT_USER" -- env -C "$home" HOME="$home" PATH="/usr/local/bin:/usr/bin" MISE_YES=1 mise install >/dev/null ||
     say "agent-user: mise install for $AGENT_USER failed (run it as $AGENT_USER to see why)"
 
-  # Rootless Docker: the agent never joins the docker group.
-  if ! command -v dockerd-rootless-setuptool.sh >/dev/null; then
-    say "agent-user: rootless Docker not set up: no dockerd-rootless-setuptool.sh (Arch: the docker-rootless-extras AUR package)"
-    return 0
-  fi
-  IFS=: read -r start count <<<"$AGENT_SUBIDS"
-  grep -q "^$AGENT_USER:" /etc/subuid 2>/dev/null || usermod --add-subuids "$start-$((start + count - 1))" "$AGENT_USER"
-  grep -q "^$AGENT_USER:" /etc/subgid 2>/dev/null || usermod --add-subgids "$start-$((start + count - 1))" "$AGENT_USER"
-  loginctl enable-linger "$AGENT_USER"
-  if [[ ! -S /run/user/$uid/docker.sock ]]; then
-    runuser -u "$AGENT_USER" -- env -C "$home" HOME="$home" XDG_RUNTIME_DIR="/run/user/$uid" PATH="/usr/local/bin:/usr/bin" \
-      dockerd-rootless-setuptool.sh install --skip-iptables >/dev/null ||
-      die "agent-user: rootless Docker setup failed for $AGENT_USER (run dockerd-rootless-setuptool.sh check as $AGENT_USER)"
-    say "agent-user: rootless Docker running for $AGENT_USER"
-  fi
+  # Rootless Podman, served on a Docker-compatible socket the wrapper points
+  # DOCKER_HOST at: the agent never joins the docker group.
+  agent_podman "$home" "$uid"
 }
 
 sync() {
