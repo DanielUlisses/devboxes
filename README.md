@@ -714,6 +714,56 @@ worktree, reviews it, and leaves the change unstaged for you to review,
 commit and push. `herdr worktree create` makes the worktree and opens it as
 a herdr workspace in one step.
 
+### Ticket agents as their own user
+
+With `agent_user: true` (off by default), ticket agents run as
+`<user>-agent` (`daniel-agent`) instead of as you, so an agent that is
+talked into something has none of your credentials: no sudo, no `docker`
+group, no 1Password token, no gh, az, SSH keys or Ovis config. `devbox
+sync` sets up:
+
+| What | Where |
+| --- | --- |
+| the agent user and the `tkwork` group (you and it) | `useradd`, home mode 700 |
+| the wrapper, root-owned: a clean environment, then `claude` (or a command) as the agent, only in a ticket worktree | `/usr/local/libexec/tk-agent-claude`, `tk-agent-run` (`bin/devbox-agent-exec`) |
+| the rule letting you run only those two as the agent | `/etc/sudoers.d/tk-agent` |
+| a `claude` shim, first on your PATH only inside a `tkwork` worktree (the prompt hook in `.bashrc`), so Herdr's `claude` in an agent's pane runs as the agent | `/usr/local/libexec/tk-agent-bin/claude` (`bin/devbox-agent-shim`) |
+| who is who, for the wrapper and ticket-skill | `/etc/tk-agent.conf` |
+| the files an agent writes outside its worktree (report, phase, questions), made one by one by ticket-skill's launcher | `/var/lib/tk-agent/<user>/` |
+| `agent_user` in the box policy, which ticket-skill's launcher and the tk daemon read | `~/.config/tk-daemon/policy.json` |
+| ACLs: the agent may pass through your home to `~/work`, nothing else; you may read its `~/.claude` and `~/.claude-switch` (the daemon reads its transcripts) | `setfacl` |
+| its own Claude Code, your mise tools (installed again in its home), git that trusts your repos | the agent's home |
+| rootless Docker, never the `docker` group | `dockerd-rootless-setuptool.sh`, a user unit with lingering |
+
+ticket-skill's launcher makes each ticket's worktree group `tkwork`, its
+files group-writable and its git metadata not: the agent edits files and runs
+`git status`/`diff` (with `GIT_OPTIONAL_LOCKS=0`), but cannot write
+`.git/config`, hooks or the index, so nothing it writes there runs as you.
+If it replaces the worktree's `.git` file, your git refuses the worktree
+("dubious ownership"): never set `safe.directory` for `~/work` paths.
+
+**Signing the agent in.** The agent has its own config root per claude-acc
+account (`~/.claude` for the default, `~/.claude-switch/accounts/<name>`),
+never yours: yours holds settings and hooks your own sessions load. Sign each
+in once as the agent, either way:
+
+```
+sudo -u daniel-agent -i claude login                       # default account
+sudo -u daniel-agent -i env CLAUDE_CONFIG_DIR=~daniel-agent/.claude-switch/accounts/<name> claude login
+# or a long-lived token: run `claude setup-token` as yourself on that account,
+# then, as the agent, save it (mode 600) as ~/.config/tk-agent/oauth-token-<name>
+```
+
+**Rollout.** Turn it on only on a box with no ticket running: the
+transcripts of running agents stay in your home, so their resume starts from
+the full brief. Restart Herdr (and log in again) after the first sync, so its
+panes have the `tkwork` group. Not yet on a box whose agents need `az`: they
+lose it until per-project read-only MCPs exist. In an unprivileged LXC,
+rootless Docker needs subordinate ids (`AGENT_SUBIDS` in `bin/devbox`) that
+the container itself has mapped; sync says so when it can't set it up. Off
+again: the wrapper, shim, sudoers rule and `/etc/tk-agent.conf` go; the user
+and its home stay.
+
 ### Azure DevOps pull requests
 
 In a clone (or worktree) of an Azure DevOps repo, after `devbox login`:

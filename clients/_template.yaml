@@ -199,6 +199,20 @@ skills: []
 # Default: false.
 # skills_catalog: true
 
+# Whether ticket agents run as their own user, <user>-agent (daniel-agent),
+# instead of as you. `devbox sync` creates it with group tkwork, installs the
+# root-owned wrapper /usr/local/libexec/tk-agent-claude and the sudoers rule
+# that lets you run only that wrapper (and tk-agent-run) as it, keeps it out of
+# your home but for ~/work, gives it its own Claude Code, mise tools and
+# rootless Docker, and writes agent_user into the box policy, which
+# ticket-skill's launcher and the tk daemon read. The agent has no sudo,
+# docker group, 1Password, gh, az, SSH keys or Ovis. Turn it on only on a box
+# with no ticket running, and not yet on a box whose agents need az (they lose
+# it). Turning it off removes the wrapper, rule and /etc/tk-agent.conf; the
+# user and its home stay. Devbox only. See README.md, Ticket agents as their
+# own user. Default: false.
+# agent_user: true
+
 # Repos to clone into ~/work/<repo>: GitHub ones as <owner>/<repo>, Azure
 # DevOps ones as their SSH URL, git@ssh.dev.azure.com:v3/<org>/<project>/<repo>.
 # `devbox finish` and `devbox sync` clone newly listed ones; removed ones are

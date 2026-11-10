@@ -1,0 +1,3 @@
+# expect: ok
+claude_account: example
+agent_user: true

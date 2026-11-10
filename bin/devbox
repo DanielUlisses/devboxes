@@ -32,7 +32,7 @@ export LC_ALL=C # one collation for sort and comm
 # Installed by bootstrap, and by sync when missing; sync never removes them.
 # tree-sitter-cli builds nvim-treesitter's parsers (LazyVim otherwise fetches
 # it through mason on nvim's first start, racing the parser installs).
-BASE_PACKAGES=(base-devel git openssh sudo stow jq go-yq unzip less mise github-cli tailscale bash-completion starship zoxide neovim tree-sitter-cli ripgrep fd docker docker-buildx docker-compose)
+BASE_PACKAGES=(base-devel git openssh sudo acl stow jq go-yq unzip less mise github-cli tailscale bash-completion starship zoxide neovim tree-sitter-cli ripgrep fd docker docker-buildx docker-compose)
 
 # A runner box's base packages instead: no developer tooling, but what a job
 # finds on PATH (git, ssh, curl, jq, gh, docker; op comes from mise) and
@@ -200,6 +200,27 @@ CATALOG_REPO=DanielUlisses/skills-catalog
 CATALOG_DIR=/opt/skills
 # Written by `devbox finish`; sync runs `devbox update` only once it exists.
 FINISHED=$USER_HOME/.local/state/devbox/finished
+
+# With agent_user: ticket agents run as AGENT_USER, a user with nothing of the
+# box user's (no sudo, docker group, 1Password, gh, az, SSH keys or Ovis),
+# through the root-owned wrapper in AGENT_LIBEXEC that the box user may run as
+# it (AGENT_SUDOERS). AGENT_GROUP holds both users: ticket worktrees are its
+# group, writable by it, git metadata never. AGENT_STATE holds the files a
+# ticket's agent writes outside its worktree (report, phase, questions), which
+# ticket-skill's launcher creates there one by one. AGENT_CONF tells the
+# wrapper, the shim and ticket-skill who is who. See README.md, Ticket agents
+# as their own user.
+AGENT_USER=$USER_NAME-agent
+AGENT_GROUP=tkwork
+AGENT_CONF=/etc/tk-agent.conf
+AGENT_LIBEXEC=/usr/local/libexec
+AGENT_SHIM_DIR=$AGENT_LIBEXEC/tk-agent-bin
+AGENT_SUDOERS=/etc/sudoers.d/tk-agent
+AGENT_STATE=/var/lib/tk-agent/$USER_NAME
+# The agent's subordinate ids for rootless Docker: start:count in
+# /etc/subuid and /etc/subgid. In an unprivileged LXC these must be ids the
+# container itself has mapped (see README.md).
+AGENT_SUBIDS=100000:65536
 
 # Telegraf, on a devbox whose config sets metrics: the latest
 # influxdata/telegraf release (its linux_amd64 tarball from TELEGRAF_DOWNLOADS,
@@ -1316,6 +1337,37 @@ doctor_notify() {
 # Reads and reports only, changing nothing on the box but its report, and tells
 # the hub. Warnings want a look; a failure, or a hub that couldn't be told, also
 # exits 1, so the unit shows up as failed.
+# With agent_user: the wrapper, rule and conf in place, the agent user in no
+# root-like group and signed in to Claude, rootless Docker running for it.
+doctor_agent_user() {
+  local config="$1" home uid g signed=false f
+  [[ $(jq -r '.agent_user == true' <<<"$config") == true ]] || return 0
+  if [[ ! -r $AGENT_CONF || ! -x $AGENT_LIBEXEC/tk-agent-claude || ! -f $AGENT_SUDOERS ]] || ! id "$AGENT_USER" &>/dev/null; then
+    doctor_line fail "agent_user is on, but $AGENT_USER, its wrapper, sudoers rule or $AGENT_CONF is missing; ticket launches refuse until devbox sync sets them up"
+    return 0
+  fi
+  for g in docker wheel sudo; do
+    if id -nG "$AGENT_USER" | tr ' ' '\n' | grep -qx "$g"; then
+      doctor_line fail "$AGENT_USER is in the $g group, which is root by another name; run devbox sync"
+    fi
+  done
+  home="$(getent passwd "$AGENT_USER" | cut -d: -f6)"
+  uid="$(id -u "$AGENT_USER")"
+  for f in "$home"/.claude/.credentials.json "$home"/.claude-switch/accounts/*/.credentials.json "$home"/.config/tk-agent/oauth-token-*; do
+    [[ -s $f ]] && signed=true
+  done
+  if $signed; then
+    doctor_line ok "ticket agents run as $AGENT_USER, signed in to Claude"
+  else
+    doctor_line warn "$AGENT_USER isn't signed in to Claude, so ticket agents can't start; see README.md, Ticket agents as their own user"
+  fi
+  if [[ -S /run/user/$uid/docker.sock ]]; then
+    doctor_line ok "rootless Docker runs for $AGENT_USER"
+  else
+    doctor_line warn "no rootless Docker for $AGENT_USER, so tests that start containers fail; devbox sync says why"
+  fi
+}
+
 doctor() {
   local config="$1" role notified=true
   role="$(box_role "$config")"
@@ -1336,6 +1388,7 @@ doctor() {
       else
         doctor_line warn "gh isn't logged in; run devbox login"
       fi
+      doctor_agent_user "$config"
     fi
     printf '%s warnings, %s failures\n' "${#DOCTOR_WARNINGS[@]}" "${#DOCTOR_FAILURES[@]}"
     doctor_notify "$config" || {
@@ -1350,6 +1403,124 @@ doctor() {
 }
 
 # $2: --no-pacman-upgrade, passed on to update, or empty.
+# agent_user, as root, from sync: AGENT_USER and AGENT_GROUP, the wrapper and
+# the claude shim, the sudoers rule (visudo-checked), AGENT_CONF and
+# AGENT_STATE, the ACLs that keep the agent out of the box user's home but for
+# ~/work, the agent's own Claude Code, mise tools and git config, and rootless
+# Docker where the box can run it. Off: the conf, sudoers rule, wrapper and
+# shim are removed (so nothing starts as the agent and the shell hook is
+# inert); the user, its home and its transcripts stay.
+sync_agent_user() {
+  local config="$1" home uid rules conf start count e
+  [[ $(box_role "$config") == devbox ]] || return 0
+  if [[ $(jq -r '.agent_user == true' <<<"$config") != true ]]; then
+    if [[ -e $AGENT_CONF || -e $AGENT_SUDOERS ]]; then
+      rm -f "$AGENT_CONF" "$AGENT_SUDOERS" "$AGENT_LIBEXEC/tk-agent-claude" "$AGENT_LIBEXEC/tk-agent-run" "$AGENT_SHIM_DIR/claude"
+      say "agent-user: off (wrapper, shim, sudoers rule and $AGENT_CONF removed; $AGENT_USER and its home kept)"
+    fi
+    return 0
+  fi
+
+  getent group "$AGENT_GROUP" >/dev/null || { groupadd --system "$AGENT_GROUP"; say "agent-user: added group $AGENT_GROUP"; }
+  if ! id "$AGENT_USER" &>/dev/null; then
+    useradd --create-home --home-dir "/home/$AGENT_USER" --shell /bin/bash --user-group "$AGENT_USER"
+    say "agent-user: added $AGENT_USER"
+  fi
+  id -nG "$USER_NAME" | tr ' ' '\n' | grep -qx "$AGENT_GROUP" || { usermod -aG "$AGENT_GROUP" "$USER_NAME"; say "agent-user: $USER_NAME joined $AGENT_GROUP (new shells pick it up)"; }
+  id -nG "$AGENT_USER" | tr ' ' '\n' | grep -qx "$AGENT_GROUP" || usermod -aG "$AGENT_GROUP" "$AGENT_USER"
+  # Never in a group that is root by another name.
+  for e in docker wheel sudo; do
+    if id -nG "$AGENT_USER" | tr ' ' '\n' | grep -qx "$e"; then
+      gpasswd -d "$AGENT_USER" "$e" >/dev/null
+      say "agent-user: removed $AGENT_USER from $e"
+    fi
+  done
+  home="$(getent passwd "$AGENT_USER" | cut -d: -f6)"
+  uid="$(id -u "$AGENT_USER")"
+  chmod 700 "$home"
+
+  # The wrapper (two names, one script), the shim, and who may run them.
+  if write_if_changed "$AGENT_LIBEXEC/tk-agent-claude" "$(<"$ROOT/bin/devbox-agent-exec")" 755; then
+    install -m 755 "$AGENT_LIBEXEC/tk-agent-claude" "$AGENT_LIBEXEC/tk-agent-run"
+    say "agent-user: installed $AGENT_LIBEXEC/tk-agent-claude and tk-agent-run"
+  fi
+  ! write_if_changed "$AGENT_SHIM_DIR/claude" "$(<"$ROOT/bin/devbox-agent-shim")" 755 ||
+    say "agent-user: installed the claude shim in $AGENT_SHIM_DIR"
+  chown root:root "$AGENT_LIBEXEC/tk-agent-claude" "$AGENT_LIBEXEC/tk-agent-run" "$AGENT_SHIM_DIR/claude"
+  rules="Defaults!$AGENT_LIBEXEC/tk-agent-claude, $AGENT_LIBEXEC/tk-agent-run env_reset
+$USER_NAME ALL=($AGENT_USER) NOPASSWD: $AGENT_LIBEXEC/tk-agent-claude, $AGENT_LIBEXEC/tk-agent-run"
+  if write_if_changed "$AGENT_SUDOERS" "$rules" 440; then
+    visudo -cqf "$AGENT_SUDOERS" || { rm -f "$AGENT_SUDOERS"; die "agent-user: invalid sudoers entry"; }
+    say "agent-user: wrote $AGENT_SUDOERS"
+  fi
+
+  # Where the agent writes outside its worktree: the box user's, group-readable,
+  # never group-writable (files in it are, one by one).
+  install -d -o "$USER_NAME" -g "$AGENT_GROUP" -m 750 "${AGENT_STATE%/*}" "$AGENT_STATE"
+  chown root:root "${AGENT_STATE%/*}"
+  chmod 755 "${AGENT_STATE%/*}"
+  conf="BOX_USER=$USER_NAME
+AGENT_USER=$AGENT_USER
+GROUP=$AGENT_GROUP
+WORK=$WORK
+STATE=$AGENT_STATE"
+  ! write_if_changed "$AGENT_CONF" "$conf" 644 || say "agent-user: wrote $AGENT_CONF"
+
+  # The box user's home: the agent may pass through it to ~/work and nothing
+  # else. Each entry but work is denied to it by name, and the default ACL
+  # denies it what is made later.
+  setfacl -m "u:$AGENT_USER:--x" "$USER_HOME"
+  setfacl -d -m "u:$AGENT_USER:---" "$USER_HOME"
+  shopt -s nullglob dotglob
+  for e in "$USER_HOME"/*; do
+    [[ $e == "$WORK" || -L $e ]] && continue
+    setfacl -m "u:$AGENT_USER:---" "$e"
+  done
+  shopt -u nullglob dotglob
+  install -d -o "$USER_NAME" -g "$USER_NAME" -m 755 "$WORK"
+  setfacl -m "u:$AGENT_USER:r-x" "$WORK"
+  # And the box user (the tk daemon) reads the agent's transcripts.
+  install -d -o "$AGENT_USER" -g "$AGENT_USER" -m 700 "$home/.claude" "$home/.claude-switch" "$home/.claude-switch/accounts"
+  setfacl -m "u:$USER_NAME:--x" "$home"
+  setfacl -R -m "u:$USER_NAME:rX" "$home/.claude" "$home/.claude-switch"
+  setfacl -R -d -m "u:$USER_NAME:rX" "$home/.claude" "$home/.claude-switch"
+
+  # The agent's git: it trusts the box user's repos (git refuses another
+  # user's otherwise). The box user never trusts the agent's.
+  runuser -u "$AGENT_USER" -- env HOME="$home" git config --global --replace-all safe.directory '*'
+  runuser -u "$AGENT_USER" -- env HOME="$home" git config --global core.hooksPath /dev/null
+
+  # Its own Claude Code and mise tools (the box user's, by config).
+  if [[ ! -x $home/.local/bin/claude ]]; then
+    runuser -u "$AGENT_USER" -- env -C "$home" HOME="$home" bash -c 'set -o pipefail; curl -fsSL https://claude.ai/install.sh | bash' >/dev/null ||
+      die "agent-user: installing Claude Code for $AGENT_USER failed"
+    say "agent-user: installed Claude Code for $AGENT_USER (sign in: see README.md, Ticket agents as their own user)"
+  else
+    runuser -u "$AGENT_USER" -- env -C "$home" HOME="$home" PATH="$home/.local/bin:/usr/bin" claude update >/dev/null 2>&1 || true
+  fi
+  if [[ -f $USER_HOME/.config/mise/config.toml ]]; then
+    install -D -o "$AGENT_USER" -g "$AGENT_USER" -m 644 "$USER_HOME/.config/mise/config.toml" "$home/.config/mise/config.toml"
+  fi
+  runuser -u "$AGENT_USER" -- env -C "$home" HOME="$home" PATH="/usr/local/bin:/usr/bin" MISE_YES=1 mise install >/dev/null ||
+    say "agent-user: mise install for $AGENT_USER failed (run it as $AGENT_USER to see why)"
+
+  # Rootless Docker: the agent never joins the docker group.
+  if ! command -v dockerd-rootless-setuptool.sh >/dev/null; then
+    say "agent-user: rootless Docker not set up: no dockerd-rootless-setuptool.sh (Arch: the docker-rootless-extras AUR package)"
+    return 0
+  fi
+  IFS=: read -r start count <<<"$AGENT_SUBIDS"
+  grep -q "^$AGENT_USER:" /etc/subuid 2>/dev/null || usermod --add-subuids "$start-$((start + count - 1))" "$AGENT_USER"
+  grep -q "^$AGENT_USER:" /etc/subgid 2>/dev/null || usermod --add-subgids "$start-$((start + count - 1))" "$AGENT_USER"
+  loginctl enable-linger "$AGENT_USER"
+  if [[ ! -S /run/user/$uid/docker.sock ]]; then
+    runuser -u "$AGENT_USER" -- env -C "$home" HOME="$home" XDG_RUNTIME_DIR="/run/user/$uid" PATH="/usr/local/bin:/usr/bin" \
+      dockerd-rootless-setuptool.sh install --skip-iptables >/dev/null ||
+      die "agent-user: rootless Docker setup failed for $AGENT_USER (run dockerd-rootless-setuptool.sh check as $AGENT_USER)"
+    say "agent-user: rootless Docker running for $AGENT_USER"
+  fi
+}
+
 sync() {
   local config no_upgrade="${2:-}" before role
   before="$(git -C "$ROOT" rev-parse HEAD)"
@@ -1397,6 +1568,7 @@ sync() {
     agent_instructions "$config"
   fi
   sync_repos "$config"
+  sync_agent_user "$config"
   # Runs the checkout's devbox, which the pull above may have just changed.
   if [[ ! -f $FINISHED ]]; then
     say "update: skipped until devbox finish has run"
@@ -2086,13 +2258,16 @@ install_tk_hub() {
 # ticket-skill's launcher starts ticket agents without it, whatever the client
 # file says. Only those keys of ~/.config/tk-daemon/policy.json are written (the
 # tk daemon and tk.sh read the rest). The file is written even so: the daemon
-# reads a missing file as "allowed".
+# reads a missing file as "allowed". Its agent_user is the agent user's name
+# with agent_user on (see sync_agent_user), "" with it off: ticket-skill's
+# launcher and the tk daemon read it from this box layer only.
 write_box_policy() {
-  local config="$1" file="$USER_HOME/.config/tk-daemon/policy.json" want have tmp
+  local config="$1" file="$USER_HOME/.config/tk-daemon/policy.json" want have tmp agent=""
   [[ $(jq -r .role <<<"$config") == devbox ]] || return 0
-  want='{"remote_control":false,"remote_control_tickets":false}'
+  [[ $(jq -r '.agent_user == true' <<<"$config") != true ]] || agent="$AGENT_USER"
+  want="$(jq -cn --arg a "$agent" '{remote_control: false, remote_control_tickets: false, agent_user: $a}')"
   if [[ -s $file ]]; then
-    have="$(jq -c '{remote_control, remote_control_tickets}' "$file")" || die "remote-control: $file is not valid JSON"
+    have="$(jq -c '{remote_control, remote_control_tickets, agent_user}' "$file")" || die "remote-control: $file is not valid JSON"
   else
     have=null
   fi
@@ -2109,7 +2284,7 @@ write_box_policy() {
   }
   chmod 644 "$tmp"
   mv "$tmp" "$file"
-  changed "remote-control: off (tk-hub is the way in)"
+  changed "remote-control: off (tk-hub is the way in); agent_user: ${agent:-off}"
 }
 
 # Ovis (github.com/devswha/ovis), the herdr web client tk-hub's agent pages link
