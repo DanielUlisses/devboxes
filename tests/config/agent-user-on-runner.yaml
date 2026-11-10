@@ -1,0 +1,6 @@
+# expect: agent_user: allowed only when role is devbox
+role: runner
+runners:
+  org: example-org
+  labels: [homelab]
+agent_user: true

@@ -34,6 +34,26 @@ fi
 # zoxide's own hook goes last.
 command -v zoxide >/dev/null && eval "$(zoxide init bash)"
 
+# agent_user on (devbox sync wrote /etc/tk-agent.conf): inside a ticket
+# worktree (~/work/<repo>--<branch>, group tkwork), `claude` is the shim that
+# runs it as the agent user. Last in PROMPT_COMMAND, so mise's hook can't
+# put its own PATH entries ahead of it.
+if [[ -r /etc/tk-agent.conf ]]; then
+  __tk_agent_path() {
+    local shim=/usr/local/libexec/tk-agent-bin top
+    PATH=":$PATH:"
+    PATH="${PATH//:$shim:/:}"
+    PATH="${PATH#:}"
+    PATH="${PATH%:}"
+    [[ $PWD == "$HOME/work/"*--* ]] || return 0
+    top="${PWD#"$HOME/work/"}"
+    top="${top%%/*}"
+    [[ $(stat -c %G "$HOME/work/$top" 2>/dev/null) == tkwork ]] && PATH="$shim:$PATH"
+    return 0
+  }
+  PROMPT_COMMAND="${PROMPT_COMMAND:+$PROMPT_COMMAND;}__tk_agent_path"
+fi
+
 # shellcheck source=/dev/null
 source ~/.aliases
 # shellcheck source=/dev/null

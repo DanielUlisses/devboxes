@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# `claude` inside a ticket worktree, with agent_user on: installed by devbox
+# sync as /usr/local/libexec/tk-agent-bin/claude, which the box user's shell
+# puts first on PATH only while its directory is a tkwork worktree (the
+# prompt hook in dotfiles/bash/.bashrc). So the `claude` Herdr starts in an
+# agent's pane, and one typed in its shell pane, run as the agent user
+# through the root-owned wrapper; everywhere else `claude` is the box user's.
+#
+# The claude-acc account the pane resolved (CLAUDE_CONFIG_DIR) is passed on
+# by name: the agent has its own config root per account.
+set -euo pipefail
+
+CONF=/etc/tk-agent.conf
+die() {
+  printf 'tk-agent: %s\n' "$*" >&2
+  exit 1
+}
+[[ -r $CONF ]] || die "no $CONF: agent_user is not set up on this box"
+agent="$(sed -n 's/^AGENT_USER=//p' "$CONF" | head -1)"
+[[ -n $agent ]] || die "$CONF names no AGENT_USER"
+
+account=default
+case ${CLAUDE_CONFIG_DIR:-} in
+  "" | "$HOME/.claude") ;;
+  "$HOME"/.claude-switch/accounts/*) account="${CLAUDE_CONFIG_DIR##*/}" ;;
+  *) die "CLAUDE_CONFIG_DIR=$CLAUDE_CONFIG_DIR is not a claude-acc account under $HOME/.claude-switch/accounts; not starting the agent on an account it can't name" ;;
+esac
+
+# The ticket's TICKET_* variables travel as --setenv; the wrapper checks each.
+setenv=()
+while IFS= read -r name; do
+  setenv+=(--setenv "$name=${!name}")
+done < <(compgen -e | grep -E '^TICKET_[A-Z0-9_]+$' || true)
+
+exec sudo -n -u "$agent" /usr/local/libexec/tk-agent-claude \
+  --account "$account" --cwd "$PWD" ${setenv[@]+"${setenv[@]}"} -- "$@"

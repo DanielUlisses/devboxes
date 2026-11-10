@@ -1,0 +1,3 @@
+# expect: agent_user: must be true or false
+claude_account: example
+agent_user: "yes"

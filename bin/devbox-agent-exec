@@ -1,0 +1,132 @@
+#!/usr/bin/env bash
+# The agent user's way in (agent_user: true; see README.md, Ticket agents as
+# their own user). Installed root-owned twice by devbox sync:
+#
+#   /usr/local/libexec/tk-agent-claude  runs claude
+#   /usr/local/libexec/tk-agent-run     runs any command (the merger's checks)
+#
+# The box user may run exactly these two as the agent user, through sudo
+# (/etc/sudoers.d/tk-agent). sudo resets the environment, and this script
+# builds the one the agent gets from scratch: nothing the box user had
+# (1Password, gh, ssh-agent, Ovis) reaches it.
+#
+#   tk-agent-claude [--account <name>] --cwd <worktree> [--setenv TICKET_X=v]... -- <claude args>
+#   tk-agent-run --cwd <worktree> [--setenv TICKET_X=v]... -- <command> [args]
+#
+# --cwd must be a ticket worktree: a directory <work>/<repo>--<branch> whose
+# group is tkwork (what ticket-skill's launcher makes). --account picks the
+# agent's own config root for that claude-acc account: ~/.claude for default,
+# else ~/.claude-switch/accounts/<name> under the agent's home, never the box
+# user's (a config root holds settings and hooks the box user's sessions
+# load). A long-lived token from `claude setup-token`, saved by the agent user
+# as ~/.config/tk-agent/oauth-token-<account> (mode 600), is used when present;
+# otherwise the config root's own login (`claude login` as the agent user).
+set -euo pipefail
+
+CONF=/etc/tk-agent.conf
+die() {
+  printf 'tk-agent: %s\n' "$*" >&2
+  exit 1
+}
+
+conf() { sed -n "s/^$1=//p" "$CONF" | head -1; }
+[[ -r $CONF ]] || die "no $CONF: agent_user is not set up on this box (devbox sync)"
+BOX_USER="$(conf BOX_USER)"
+AGENT_USER="$(conf AGENT_USER)"
+WORK="$(conf WORK)"
+[[ -n $BOX_USER && -n $AGENT_USER && -n $WORK ]] || die "$CONF lacks BOX_USER, AGENT_USER or WORK"
+[[ $(id -un) == "$AGENT_USER" ]] || die "runs as $AGENT_USER only (sudo -u $AGENT_USER), not as $(id -un)"
+
+mode=claude
+[[ ${0##*/} != tk-agent-run ]] || mode=run
+
+account=default cwd=""
+setenv=()
+while (($#)); do
+  case $1 in
+    --account)
+      [[ $mode == claude ]] || die "--account is for tk-agent-claude"
+      account="${2:-}"
+      shift 2
+      ;;
+    --cwd)
+      cwd="${2:-}"
+      shift 2
+      ;;
+    --setenv)
+      [[ ${2:-} =~ ^TICKET_[A-Z0-9_]+=.*$ ]] || die "--setenv takes TICKET_<NAME>=<value>, got '${2:-}'"
+      setenv+=("$2")
+      shift 2
+      ;;
+    --)
+      shift
+      break
+      ;;
+    *) die "unknown argument '$1' (arguments for the program go after --)" ;;
+  esac
+done
+[[ $mode == claude || $# -gt 0 ]] || die "no command after --"
+
+# The account: a name as claude-acc prints it.
+[[ $account =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die "invalid account '$account'"
+
+# The worktree: resolved, inside WORK, one level down, named <repo>--<branch>,
+# group tkwork. Anything else (the main checkout, another user's directory)
+# is refused, so the agent never starts where it could write git metadata.
+[[ -n $cwd ]] || die "--cwd is required"
+real="$(realpath -e -- "$cwd" 2>/dev/null)" || die "no directory $cwd"
+[[ -d $real ]] || die "$cwd is not a directory"
+rel="${real#"$WORK"/}"
+[[ $rel != "$real" ]] || die "$cwd is not under $WORK"
+top="${rel%%/*}"
+[[ $top == *--* ]] || die "$cwd is not in a ticket worktree ($WORK/<repo>--<branch>)"
+[[ $(stat -c %G "$WORK/$top") == tkwork ]] || die "$WORK/$top is not a tkwork worktree (made by ticket-skill's launcher with the agent user on)"
+
+home="$(getent passwd "$AGENT_USER" | cut -d: -f6)"
+[[ -d $home ]] || die "no home for $AGENT_USER"
+uid="$(id -u)"
+runtime="/run/user/$uid"
+
+env=(
+  HOME="$home" USER="$AGENT_USER" LOGNAME="$AGENT_USER"
+  PATH="$home/.local/bin:$home/.local/share/mise/shims:/usr/local/bin:/usr/bin"
+  LANG="${LANG:-C.UTF-8}" TERM="${TERM:-xterm-256color}"
+  # git metadata belongs to the box user and is read-only here: status and
+  # diff must not try to refresh the index.
+  GIT_OPTIONAL_LOCKS=0
+  TK_AGENT=1
+)
+# Rootless Docker, when the agent's user unit runs it.
+if [[ -S $runtime/docker.sock ]]; then
+  env+=(XDG_RUNTIME_DIR="$runtime" DOCKER_HOST="unix://$runtime/docker.sock")
+elif [[ -d $runtime ]]; then
+  env+=(XDG_RUNTIME_DIR="$runtime")
+fi
+
+if [[ $mode == claude ]]; then
+  if [[ $account == default ]]; then
+    config="$home/.claude"
+  else
+    config="$home/.claude-switch/accounts/$account"
+  fi
+  mkdir -p "$config"
+  chmod 700 "$config"
+  env+=(CLAUDE_CONFIG_DIR="$config")
+  token="$home/.config/tk-agent/oauth-token-$account"
+  if [[ -f $token ]]; then
+    [[ $(stat -c %a "$token") == 600 ]] || die "$token must be mode 600"
+    env+=(CLAUDE_CODE_OAUTH_TOKEN="$(<"$token")")
+  fi
+fi
+env+=(${setenv[@]+"${setenv[@]}"})
+
+cd "$real"
+# The worktree's mise config, trusted in the agent's own trust store: what the
+# box user's launcher no longer does with the agent user on.
+if command -v mise >/dev/null 2>&1; then
+  env -i "${env[@]}" mise trust --yes --quiet -C "$real" </dev/null >/dev/null 2>&1 || true
+fi
+if [[ $mode == claude ]]; then
+  exec env -i "${env[@]}" claude "$@"
+fi
+exec env -i "${env[@]}" "$@"
