@@ -10,11 +10,10 @@ set -euo pipefail
 DIR=/opt/devboxes
 STATE=/var/lib/devbox
 # The mirrors, in order (pacman falls back to the next when one fails); the
-# same list as PACMAN_MIRRORS in bin/devbox, which adds the fallbacks to boxes
-# made before them.
+# same list as PACMAN_MIRRORS in bin/devbox, whose sync moves boxes made
+# before it onto it.
 # shellcheck disable=SC2016 # pacman expands these, not the shell
 MIRRORS=(
-  'https://geo.mirror.pkgbuild.com/$repo/os/$arch'
   'https://fastly.mirror.pkgbuild.com/$repo/os/$arch'
   'https://mirror.rackspace.com/archlinux/$repo/os/$arch'
 )

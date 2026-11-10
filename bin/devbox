@@ -401,31 +401,39 @@ resolve_config() {
 
 # The base packages of role $1 missing from the box installed, all of them
 # marked explicit, so removing a client package never takes a base one along.
-# pacman's mirrors, in order: bootstrap.sh writes the first; the rest are
-# fallbacks for when one mirror is broken (geo.mirror.pkgbuild.com once served
-# a 404 for extra.db and every sync failed). pacman tries them in order.
+# pacman's mirrors, in order (pacman tries the next when one fails). Not
+# geo.mirror.pkgbuild.com: it served a 404 for extra.db for hours, and every
+# sync printed it. Boxes made with it are moved off it by pacman_mirrors.
 # shellcheck disable=SC2016 # pacman expands these, not the shell
 PACMAN_MIRRORS=(
-  'https://geo.mirror.pkgbuild.com/$repo/os/$arch'
   'https://fastly.mirror.pkgbuild.com/$repo/os/$arch'
   'https://mirror.rackspace.com/archlinux/$repo/os/$arch'
 )
+# shellcheck disable=SC2016
+PACMAN_MIRRORS_DROPPED=('https://geo.mirror.pkgbuild.com/$repo/os/$arch')
 
-# Adds the fallback mirrors after the first, on a box whose mirrorlist
-# devboxes wrote (its first Server is PACMAN_MIRRORS[0]); a list someone chose
-# is left alone. Mirrors already listed stay where they are.
+# Takes PACMAN_MIRRORS_DROPPED out of the mirrorlist wherever it is, and puts
+# PACMAN_MIRRORS in, in order, when every other Server line is one of them (a
+# list devboxes wrote). Any other list someone chose keeps its own mirrors.
 pacman_mirrors() {
-  local list=/etc/pacman.d/mirrorlist first m add=()
+  local list=/etc/pacman.d/mirrorlist have m ours=true
   [[ -f $list ]] || return 0
-  first="$(sed -n 's/^Server *= *//p' "$list" | head -1)"
-  [[ $first == "${PACMAN_MIRRORS[0]}" ]] || return 0
-  for m in "${PACMAN_MIRRORS[@]:1}"; do
-    grep -qxF "Server = $m" "$list" || add+=("Server = $m")
-  done
-  ((${#add[@]})) || return 0
-  cp -p "$list" "$list.bak-devbox"
-  printf '%s\n' "${add[@]}" >>"$list"
-  say "pacman: added fallback mirrors (${#add[@]}) to $list"
+  have="$(sed -n 's/^Server *= *//p' "$list" | grep -vxF -f <(printf '%s\n' "${PACMAN_MIRRORS_DROPPED[@]}") || true)"
+  while IFS= read -r m; do
+    [[ -z $m ]] || printf '%s\n' "${PACMAN_MIRRORS[@]}" | grep -qxF -- "$m" || ours=false
+  done <<<"$have"
+  if $ours; then
+    [[ $have == "$(printf '%s\n' "${PACMAN_MIRRORS[@]}")" ]] &&
+      ! grep -qxF -f <(printf 'Server = %s\n' "${PACMAN_MIRRORS_DROPPED[@]}") "$list" && return 0
+    cp -p "$list" "$list.bak-devbox"
+    { grep -v '^Server' "$list"; printf 'Server = %s\n' "${PACMAN_MIRRORS[@]}"; } >"$list.new"
+  else
+    grep -qxF -f <(printf 'Server = %s\n' "${PACMAN_MIRRORS_DROPPED[@]}") "$list" || return 0
+    cp -p "$list" "$list.bak-devbox"
+    grep -vxF -f <(printf 'Server = %s\n' "${PACMAN_MIRRORS_DROPPED[@]}") "$list" >"$list.new"
+  fi
+  mv -f "$list.new" "$list"
+  say "pacman: mirrorlist updated, ${PACMAN_MIRRORS_DROPPED[*]%%/\$repo*} dropped (the old one kept as $list.bak-devbox)"
 }
 
 base_packages() {
