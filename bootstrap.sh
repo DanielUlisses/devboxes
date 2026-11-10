@@ -9,8 +9,15 @@ set -euo pipefail
 
 DIR=/opt/devboxes
 STATE=/var/lib/devbox
+# The mirrors, in order (pacman falls back to the next when one fails); the
+# same list as PACMAN_MIRRORS in bin/devbox, which adds the fallbacks to boxes
+# made before them.
 # shellcheck disable=SC2016 # pacman expands these, not the shell
-MIRROR='https://geo.mirror.pkgbuild.com/$repo/os/$arch'
+MIRRORS=(
+  'https://geo.mirror.pkgbuild.com/$repo/os/$arch'
+  'https://fastly.mirror.pkgbuild.com/$repo/os/$arch'
+  'https://mirror.rackspace.com/archlinux/$repo/os/$arch'
+)
 
 die() {
   printf 'bootstrap.sh: %s\n' "$*" >&2
@@ -24,7 +31,7 @@ client="$1" url="$2" branch="$3" commit="$4" config="$5"
 # Fresh containers can ship with an empty keyring and no mirror enabled.
 pacman-key --init
 pacman-key --populate archlinux >/dev/null
-grep -q '^Server' /etc/pacman.d/mirrorlist || printf 'Server = %s\n' "$MIRROR" >>/etc/pacman.d/mirrorlist
+grep -q '^Server' /etc/pacman.d/mirrorlist || printf 'Server = %s\n' "${MIRRORS[@]}" >>/etc/pacman.d/mirrorlist
 
 # pacman 7 downloads as user alpm inside a Landlock sandbox. A kernel without
 # Landlock (stock Proxmox) makes every download fail; only then is the
