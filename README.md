@@ -793,10 +793,13 @@ pct reboot <id>
 The container's own files keep their ids (the map starts at the same
 place). Sync says when the range isn't mapped and leaves containers out.
 
-Sync also writes the agent's `~/.config/containers/containers.conf` with
-`pids_limit = 0`: in an LXC, Podman's default per-container pids limit left a
-container unable to fork at all (PostgreSQL's entrypoint failed until
-`--pids-limit=-1`). The agent's user slice (`TasksMax`) still caps it.
+Sync also installs `crun` and makes it the agent's runtime
+(`~/.config/containers/containers.conf`: `[engine] runtime = "crun"`). The
+docker CLI sends a pids limit of 0 ("none") on every run, Podman before 6.2
+passes it on, and runc 1.4 and later write it as `pids.max=1`, so a container
+could start but never fork (Podman issue 29826). crun reads 0 as no limit, as
+Docker does; the agent's user slice (`TasksMax`) still caps its containers.
+`devbox doctor` fails when the runtime isn't crun.
 
 **Rollout.** Turn it on only on a box with no ticket running: the
 transcripts of running agents stay in your home, so their resume starts from

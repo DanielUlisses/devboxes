@@ -227,8 +227,8 @@ AGENT_ACL_UNIT=tk-agent-acl.service
 # default 65536 (see README.md, Ticket agents as their own user).
 AGENT_SUBIDS=65536:65536
 # The agent's ~/.config/containers/containers.conf (see agent_podman).
-AGENT_CONTAINERS_CONF='[containers]
-pids_limit = 0'
+AGENT_CONTAINERS_CONF='[engine]
+runtime = "crun"'
 
 # Telegraf, on a devbox whose config sets metrics: the latest
 # influxdata/telegraf release (its linux_amd64 tarball from TELEGRAF_DOWNLOADS,
@@ -1394,7 +1394,7 @@ doctor_notify() {
 # With agent_user: the wrapper, rule and conf in place, the agent user in no
 # root-like group and signed in to Claude, rootless Podman running for it.
 doctor_agent_user() {
-  local config="$1" home uid g signed=() bad=() f
+  local config="$1" home uid g signed=() bad=() f rt
   [[ $(jq -r '.agent_user == true' <<<"$config") == true ]] || return 0
   if [[ ! -r $AGENT_CONF || ! -x $AGENT_LIBEXEC/tk-agent-claude || ! -f $AGENT_SUDOERS ]] || ! id "$AGENT_USER" &>/dev/null; then
     doctor_line fail "agent_user is on, but $AGENT_USER, its wrapper, sudoers rule or $AGENT_CONF is missing; ticket launches refuse until devbox sync sets them up"
@@ -1428,7 +1428,12 @@ doctor_agent_user() {
     doctor_line warn "$AGENT_ACL_UNIT isn't running, so the tk daemon can't read the agent's transcripts; run devbox sync"
   fi
   if [[ -S /run/user/$uid/podman/podman.sock ]]; then
-    doctor_line ok "rootless Podman serves $AGENT_USER's docker"
+    rt="$(runuser -u "$AGENT_USER" -- env -C "$home" HOME="$home" XDG_RUNTIME_DIR="/run/user/$uid" podman info --format '{{.Host.OCIRuntime.Name}}' 2>/dev/null)"
+    if [[ $rt == crun ]]; then
+      doctor_line ok "rootless Podman (crun) serves $AGENT_USER's docker"
+    else
+      doctor_line fail "rootless Podman for $AGENT_USER runs on ${rt:-an unknown runtime}, not crun: containers the docker CLI starts can't fork (pids.max=1 with runc); run devbox sync"
+    fi
   else
     doctor_line warn "no rootless Podman for $AGENT_USER, so tests that start containers fail; devbox sync says why"
   fi
@@ -1549,7 +1554,7 @@ ids_mapped() {
 # The agent's rootless Podman: subordinate ids, lingering, podman.socket.
 agent_podman() {
   local home="$1" uid="$2" start count range bus restart=false
-  pacman -Q podman &>/dev/null || pacman -S --needed --noconfirm podman >/dev/null ||
+  pacman -Q podman crun &>/dev/null || pacman -S --needed --noconfirm podman crun >/dev/null ||
     { say "agent-user: installing podman failed, so no containers for $AGENT_USER"; return 0; }
   IFS=: read -r start count <<<"$AGENT_SUBIDS"
   if ! ids_mapped "$start" "$count"; then
@@ -1563,16 +1568,18 @@ agent_podman() {
     say "agent-user: $AGENT_USER has subordinate ids $range"
     runuser -u "$AGENT_USER" -- env -C "$home" HOME="$home" XDG_RUNTIME_DIR="/run/user/$uid" podman system migrate >/dev/null 2>&1 || true
   fi
-  # No per-container pids limit: in this LXC, Podman's default one leaves a
-  # container unable to fork at all (PostgreSQL's entrypoint failed with
-  # "fork: Resource temporarily unavailable" until --pids-limit=-1; the
-  # by-hand trial, 2026-11-10). The agent's user slice (TasksMax) still caps
-  # it. Made before the socket, so the API service reads it when it starts.
+  # crun, not runc: the docker CLI sends PidsLimit 0 ("no limit") on every
+  # run, Podman before 6.2 passes the 0 on, and runc >= 1.4 writes it as
+  # pids.max=1, so a container could never fork (PostgreSQL's entrypoint, the
+  # by-hand trial, 2026-11-10; Podman issue 29826, fixed for 6.2 by PR 29827).
+  # crun reads 0 as unlimited, as Docker does; the agent's user slice
+  # (TasksMax) still caps it. Made before the socket starts, so the API
+  # service reads it.
   install -d -o "$AGENT_USER" -g "$AGENT_USER" -m 755 "$home/.config/containers"
   if write_if_changed "$home/.config/containers/containers.conf" "$AGENT_CONTAINERS_CONF" 644; then
     chown "$AGENT_USER:$AGENT_USER" "$home/.config/containers/containers.conf"
     restart=true
-    say "agent-user: $AGENT_USER's containers have no pids limit of their own (~/.config/containers/containers.conf)"
+    say "agent-user: $AGENT_USER's containers run on crun (~/.config/containers/containers.conf)"
   fi
   [[ -d /run/systemd/system ]] || { say "agent-user: no systemd, podman.socket not started for $AGENT_USER"; return 0; }
   loginctl enable-linger "$AGENT_USER"
