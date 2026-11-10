@@ -1,0 +1,6 @@
+# expect: runners.trusted_workflows: must be a list
+role: runner
+runners:
+  org: some-org
+  labels: [homelab-deploy]
+  trusted_workflows: some-org/some-repo/.github/workflows/deploy.yml@refs/heads/main

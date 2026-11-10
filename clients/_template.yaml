@@ -13,9 +13,9 @@
 # hostname: dev-example
 
 # What the box is for: devbox, a developer's box; runner, a locked-down
-# box for CI runners: base packages, Docker, Tailscale (as tag:runner) and
-# op only, no Claude, skills, nvim, mise tools, repos or git identity, and
-# the smaller resources in defaults.yaml's runner_resources; or hub, the
+# box for CI runners: base packages, Docker, Tailscale (as
+# runners.tailscale_tag) and op only (none with runners.op_token: false),
+# no Claude, skills, nvim, mise tools, repos or git identity, and the smaller resources in defaults.yaml's runner_resources; or hub, the
 # tk-hub LXC: base packages, uv and Tailscale (as tag:tk-hub), and
 # UlissesTech/ticket-board's `install.sh hub`, with defaults.yaml's
 # hub_resources. A hub may not set claude_account, git_name, git_email,
@@ -38,6 +38,22 @@
 #   org: example-org     # the GitHub org the runners register in
 #   labels: [homelab]    # the box's labels (letters, digits, . _ -)
 #   max_jobs: 2          # jobs run at once (>= 1); default 2
+#   # Empty (the default): the box takes any queued job with its labels (a PR
+#   # box). Set: a deploy box, which takes only these workflows, run by a push
+#   # or workflow_dispatch on the repo's default branch, each entry exactly as
+#   # GITHUB_WORKFLOW_REF reads: <owner>/<repo>/.github/workflows/<file>@refs/heads/<branch>.
+#   # Its jobs also pass a job-started hook that checks the same.
+#   trusted_workflows:
+#     - example-org/example-repo/.github/workflows/deploy.yml@refs/heads/main
+#   # false: the box has no 1Password at all. devbox login asks for the GitHub
+#   # App's id and private key and stores them for ghrunner; jobs get no
+#   # OP_SERVICE_ACCOUNT_TOKEN. Default true.
+#   op_token: true
+#   # The tag devbox login joins the tailnet with. Default tag:runner (the one
+#   # the hub's deploy grant names); a PR box uses one nothing grants, tag:ci.
+#   tailscale_tag: tag:runner
+#   # The id of the org runner group runners join. Default 1 (Default).
+#   runner_group: 1
 
 # Which Claude account the devbox signs in with: a label, never an email.
 # Required when role is devbox; a runner box has no Claude, and a hub box

@@ -79,9 +79,13 @@ RUNNER_MISE_DATA=/opt/mise
 RUNNER_USER=ghrunner
 RUNNER_OP_DIR=/etc/ghrunner
 RUNNER_OP_TOKEN_FILE=$RUNNER_OP_DIR/op-service-account-token
+# A runner without 1Password (runners.op_token: false): the GitHub App's id and
+# private key, stored by devbox login the same way as the token, at the paths
+# bin/devbox-runner-dispatch reads.
+RUNNER_APP_ID_FILE=$RUNNER_OP_DIR/github-app-id
+RUNNER_APP_KEY_FILE=$RUNNER_OP_DIR/github-app-key.pem
 # Turns off systemd-resolved's LLMNR and mDNS listeners on a runner box.
 RUNNER_RESOLVED_CONF=/etc/systemd/resolved.conf.d/devbox-runner.conf
-RUNNER_TAILSCALE_TAG=tag:runner
 # The GitHub Actions runner a runner box installs: this pinned release unless
 # the box's own pin (RUNNER_PIN, "<version> <sha256>", written by `devbox
 # update`) is newer. Each version unpacks into RUNNER_DIST/<version>, with
@@ -100,6 +104,9 @@ RUNNER_DISPATCH_UNIT=devbox-runner-dispatch.service
 # What each job's sandbox runs: under /usr, so it reaches the sandbox with the
 # box's /usr, at the path bin/devbox-runner-dispatch names.
 RUNNER_JOB_BIN=/usr/local/libexec/devbox-runner-job
+# A deploy box's job-started hook, also under /usr for the same reason, at the
+# path bin/devbox-runner-job names.
+RUNNER_HOOK_BIN=/usr/local/libexec/devbox-runner-hook
 
 # The unattended OS upgrade every box gets: a systemd timer running `devbox
 # upgrade` daily, so a box is patched without anyone running sync or update.
@@ -260,12 +267,15 @@ Run inside a devbox.
              (devbox-doctor.timer) on every box
 
 On a role: runner box, bootstrap installs only base packages, docker,
-tailscale and op; sync adds the $RUNNER_USER system user (in docker), masks
-sshd, turns off LLMNR and mDNS, installs the pinned actions/runner and runs
-the dispatcher (bin/devbox-runner-dispatch, which starts each job in its own
-sandbox, bin/devbox-runner-job) as a systemd unit; login asks
-only for tailscale ($RUNNER_TAILSCALE_TAG) and $RUNNER_USER's 1Password
-service-account token; update pins and installs the latest actions/runner.
+tailscale and op (no op with runners.op_token: false); sync adds the
+$RUNNER_USER system user (in docker), masks sshd, turns off LLMNR and mDNS,
+installs the pinned actions/runner and runs the dispatcher
+(bin/devbox-runner-dispatch, which starts each job in its own sandbox,
+bin/devbox-runner-job, and on a deploy box checks each job with
+bin/devbox-runner-hook) as a systemd unit; login asks only for tailscale (as
+runners.tailscale_tag) and $RUNNER_USER's 1Password service-account token,
+or, with op_token: false, the GitHub App's id and private key; update pins
+and installs the latest actions/runner.
 finish doesn't apply.
 
 On a role: hub box, bootstrap installs only base packages (with uv) and
@@ -716,9 +726,11 @@ runner_dispatcher() {
   settings="$(jq '.runners + {hostname}' <<<"$config")"
   install -d -o root -g "$RUNNER_USER" -m 750 "$RUNNER_OP_DIR"
   ! write_if_changed "$RUNNER_DISPATCH_CONF" "$settings" 644 ||
-    say "dispatcher: wrote $RUNNER_DISPATCH_CONF ($(jq -c '{org, labels, max_jobs}' <<<"$settings"))"
+    say "dispatcher: wrote $RUNNER_DISPATCH_CONF ($(jq -c '{org, labels, max_jobs, runner_group, op_token, trusted_workflows}' <<<"$settings"))"
   ! write_if_changed "$RUNNER_JOB_BIN" "$(<"$ROOT/bin/devbox-runner-job")" 755 ||
     say "dispatcher: installed $RUNNER_JOB_BIN"
+  ! write_if_changed "$RUNNER_HOOK_BIN" "$(<"$ROOT/bin/devbox-runner-hook")" 755 ||
+    say "dispatcher: installed $RUNNER_HOOK_BIN"
   if write_if_changed "$RUNNER_DISPATCH_BIN" "$(<"$ROOT/bin/devbox-runner-dispatch")" 755; then
     say "dispatcher: installed $RUNNER_DISPATCH_BIN"
     restart=true
@@ -757,8 +769,13 @@ WantedBy=multi-user.target"
   else
     say "dispatcher: $RUNNER_DISPATCH_UNIT running"
   fi
-  [[ -s $RUNNER_OP_TOKEN_FILE ]] ||
-    say "dispatcher: no 1Password token yet; it waits for devbox login"
+  if [[ $(jq -r .op_token <<<"$settings") == false ]]; then
+    [[ -s $RUNNER_APP_KEY_FILE ]] ||
+      say "dispatcher: no GitHub App key yet; it waits for devbox login"
+  else
+    [[ -s $RUNNER_OP_TOKEN_FILE ]] ||
+      say "dispatcher: no 1Password token yet; it waits for devbox login"
+  fi
 }
 
 # A runner box's update, as root: pins the latest actions/runner release (its
@@ -1351,7 +1368,11 @@ sync() {
   calendar_timer "$DOCTOR_UNIT" "check the box's health" doctor "Sun 05:30"
   tmp_on_disk "$config"
   if [[ $role == runner ]]; then
-    runner_op
+    if [[ $(jq -r '.runners.op_token' <<<"$config") != false ]]; then
+      runner_op
+    else
+      say "op: not installed (runners.op_token: false)"
+    fi
     runner_setup
     runner_release
     runner_dispatcher "$config"
@@ -1489,14 +1510,17 @@ read_op_token() {
   LC_ALL=C tr -cd 'A-Za-z0-9_=+/.-' <<<"$token"
 }
 
-# A runner box's logins: tailscale as RUNNER_TAILSCALE_TAG, then the runner's
-# 1Password token, checked with op whoami and stored for RUNNER_USER only
-# (see RUNNER_OP_TOKEN_FILE). No gh, Claude or az.
+# A runner box's logins, from config $1: tailscale as runners.tailscale_tag,
+# then the runner's 1Password token, checked with op whoami and stored for
+# RUNNER_USER only (see RUNNER_OP_TOKEN_FILE), or, with runners.op_token:
+# false, the GitHub App's id and key (runner_app_login). No gh, Claude or az.
 runner_login() {
-  local token
+  local config="$1" token
   id "$RUNNER_USER" &>/dev/null || die "no $RUNNER_USER user yet: run devbox sync, then devbox login"
-  tailscale_join "$RUNNER_TAILSCALE_TAG"
-  if sudo test -s "$RUNNER_OP_TOKEN_FILE"; then
+  tailscale_join "$(jq -r '.runners.tailscale_tag // "tag:runner"' <<<"$config")"
+  if [[ $(jq -r '.runners.op_token' <<<"$config") == false ]]; then
+    runner_app_login
+  elif sudo test -s "$RUNNER_OP_TOKEN_FILE"; then
     say "1password: $RUNNER_USER's service-account token already stored"
   else
     token="$(read_op_token)"
@@ -1513,6 +1537,37 @@ runner_login() {
   say "logged in (runner box: no finish)"
 }
 
+# A runner box without 1Password: asks for the GitHub App's id and its private
+# key (PEM, pasted, ending with an empty line), checks the key with openssl
+# and stores both for RUNNER_USER only, like the token (root:RUNNER_USER, 640,
+# through stdin so neither shows in a process list). Skips what is stored.
+runner_app_login() {
+  local app_id line key=""
+  if sudo test -s "$RUNNER_APP_ID_FILE" && sudo test -s "$RUNNER_APP_KEY_FILE"; then
+    say "github app: id and key already stored"
+    return
+  fi
+  say "github app: the PR runner's App id (a number; empty skips)"
+  IFS= read -r app_id
+  app_id="$(tr -d '[:space:]' <<<"$app_id")"
+  if [[ -z $app_id ]]; then
+    say "github app: skipped"
+    return
+  fi
+  [[ $app_id =~ ^[0-9]+$ ]] || die "github app: the id must be a number"
+  say "github app: paste its private key (-----BEGIN ... END-----), then an empty line"
+  while IFS= read -rs line; do
+    [[ -n ${line//[[:space:]]/} ]] || break
+    key+="${line%$'\r'}"$'\n'
+  done
+  printf '\n' >&2
+  openssl pkey -noout <<<"$key" 2>/dev/null || die "github app: that is not a PEM private key; nothing stored"
+  sudo install -d -o root -g "$RUNNER_USER" -m 750 "$RUNNER_OP_DIR"
+  sudo install -o root -g "$RUNNER_USER" -m 640 /dev/stdin "$RUNNER_APP_ID_FILE" <<<"$app_id"
+  sudo install -o root -g "$RUNNER_USER" -m 640 /dev/stdin "$RUNNER_APP_KEY_FILE" <<<"$key"
+  say "github app: id and key stored in $RUNNER_OP_DIR (root:$RUNNER_USER, mode 640)"
+}
+
 # A hub box's login: tailscale only, as HUB_TAILSCALE_TAG. No gh, 1Password,
 # Claude or az. Its tk-hub install waits for the tailnet, so sync comes next.
 hub_login() {
@@ -1527,7 +1582,7 @@ login() {
   local config account token scopes
   config="$(stored_config)" || exit 1
   case $(box_role "$config") in
-    runner) runner_login; return ;;
+    runner) runner_login "$config"; return ;;
     hub) hub_login; return ;;
   esac
   account="$(jq -r .claude_account <<<"$config")"

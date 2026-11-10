@@ -1,0 +1,6 @@
+# expect: runners.op_token: must be true or false
+role: runner
+runners:
+  org: some-org
+  labels: [homelab]
+  op_token: "no"

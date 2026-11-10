@@ -52,6 +52,10 @@ hub_resources:
 # file sets runners.org and runners.labels; allowed only on a runner.
 runners:
   max_jobs: 2        # jobs run at once, one just-in-time runner each
+  trusted_workflows: []    # empty: any job with the box's labels; else only these deploys
+  op_token: true           # false: no 1Password; the App's id and key are stored on the box
+  tailscale_tag: tag:runner
+  runner_group: 1          # the org's Default runner group
 
 # IANA time zone the box runs in.
 timezone: America/Sao_Paulo

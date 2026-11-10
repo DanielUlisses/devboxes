@@ -6,7 +6,9 @@
 # the runner, then runs the runner as RUNNER_USER, with only the environment
 # the job's contract names, until it exits after its one job.
 #
-# Reads RUNNER_JITCONFIG, OP_SERVICE_ACCOUNT_TOKEN and SANDBOX_GATEWAY from the
+# Reads RUNNER_JITCONFIG, SANDBOX_GATEWAY, OP_SERVICE_ACCOUNT_TOKEN (unset on
+# a box without 1Password) and DEVBOX_TRUSTED_WORKFLOWS (a deploy box's
+# runners.trusted_workflows, one per line; empty elsewhere) from the
 # dispatcher, and the runner's name from the container's hostname.
 set -euo pipefail
 
@@ -19,6 +21,12 @@ JOBS=/home/$RUNNER_USER/jobs
 JOB_PATH=/usr/local/bin:/usr/bin
 DOCKERD_LOG=/var/log/dockerd.log
 DOCKERD_WAIT=30 # seconds to wait for the job's dockerd
+# On a deploy box: the job-started hook the runner runs before any step
+# (bin/devbox-runner-hook, from the box's read-only /usr), and the trusted
+# workflows it reads, written here by root before the runner starts, so
+# nothing the job sets can change them.
+HOOK=/usr/local/libexec/devbox-runner-hook
+TRUSTED_FILE=/etc/devbox-runner/trusted-workflows
 
 log() {
   printf 'runner-job: %s\n' "$*" >&2
@@ -76,11 +84,21 @@ main() {
   install -d -o "$RUNNER_USER" -g "$RUNNER_USER" -m 700 "/home/$RUNNER_USER" "$JOBS" "$dir" "$dir/home"
   setpriv --reuid="$RUNNER_USER" --regid="$RUNNER_USER" --init-groups cp -a "$RUNNER_DIST/." "$dir/runner/"
   cd "$dir/runner"
+  # What the box hands the job: the 1Password token when the box has one,
+  # the job-started hook when the box is a deploy box.
+  local extra=()
+  [[ -z ${OP_SERVICE_ACCOUNT_TOKEN:-} ]] || extra+=("OP_SERVICE_ACCOUNT_TOKEN=$OP_SERVICE_ACCOUNT_TOKEN")
+  if [[ -n ${DEVBOX_TRUSTED_WORKFLOWS:-} ]]; then
+    [[ -x $HOOK ]] || { log "deploy box without $HOOK: refusing to start the runner"; exit 1; }
+    install -d -m 755 "$(dirname "$TRUSTED_FILE")"
+    printf '%s\n' "$DEVBOX_TRUSTED_WORKFLOWS" | install -m 644 /dev/stdin "$TRUSTED_FILE"
+    extra+=("ACTIONS_RUNNER_HOOK_JOB_STARTED=$HOOK")
+  fi
   # In its own session, so a stop reaches the runner and all its job started.
   # setsid keeps this pid: a background job here doesn't lead a process group.
   setsid setpriv --reuid="$RUNNER_USER" --regid="$RUNNER_USER" --init-groups \
     env -i HOME="$dir/home" USER="$RUNNER_USER" LOGNAME="$RUNNER_USER" PATH="$JOB_PATH" LANG=C.UTF-8 \
-    OP_SERVICE_ACCOUNT_TOKEN="$OP_SERVICE_ACCOUNT_TOKEN" \
+    "${extra[@]}" \
     ./run.sh --jitconfig "$cfg" </dev/null &
   pid=$!
   trap 'kill -TERM -- "-$pid" 2>/dev/null || true' TERM

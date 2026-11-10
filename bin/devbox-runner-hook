@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# The job-started hook of a deploy box's runners (runners.trusted_workflows
+# set): bin/devbox-runner-job points ACTIONS_RUNNER_HOOK_JOB_STARTED here, and
+# the runner runs it before the job's first step. A just-in-time runner takes
+# any queued job whose labels match, so a pull request asking for the deploy
+# label could race a real deploy to it; this fails such a job before it runs
+# anything. It passes a job only when all of these hold:
+#   - GITHUB_EVENT_NAME is push or workflow_dispatch;
+#   - GITHUB_REF is refs/heads/<the repo's default branch>, read from the
+#     event GitHub sent (GITHUB_EVENT_PATH);
+#   - GITHUB_WORKFLOW_REF is in TRUSTED_FILE, which root wrote from the box's
+#     settings before the runner started (case-insensitively, as owner and
+#     repo names are).
+# GitHub doesn't let a workflow override GITHUB_* variables. Sync installs it
+# as /usr/local/libexec/devbox-runner-hook, root-owned, on the box's /usr,
+# which a sandbox mounts read-only.
+set -euo pipefail
+
+TRUSTED_FILE=/etc/devbox-runner/trusted-workflows
+
+refuse() {
+  printf '::error::devbox-runner-hook: %s; this runner takes only trusted deploys (devboxes README, Runner boxes)\n' "$*"
+  exit 1
+}
+
+event="${GITHUB_EVENT_NAME:-}"
+ref="${GITHUB_REF:-}"
+workflow="${GITHUB_WORKFLOW_REF:-}"
+
+[[ $event == push || $event == workflow_dispatch ]] ||
+  refuse "event '$event' is not push or workflow_dispatch"
+
+default="$(jq -r '.repository.default_branch // empty' "${GITHUB_EVENT_PATH:-/dev/null}" 2>/dev/null)" || default=""
+[[ -n $default ]] || refuse "no default branch in the event payload"
+[[ $ref == "refs/heads/$default" ]] ||
+  refuse "ref '$ref' is not the default branch (refs/heads/$default)"
+
+[[ -n $workflow ]] || refuse "no GITHUB_WORKFLOW_REF"
+[[ -r $TRUSTED_FILE ]] || refuse "no list of trusted workflows ($TRUSTED_FILE)"
+grep -qixF -- "$workflow" "$TRUSTED_FILE" ||
+  refuse "workflow '$workflow' is not in runners.trusted_workflows"
+
+printf 'devbox-runner-hook: %s on %s by %s: trusted\n' "$workflow" "$ref" "$event"
