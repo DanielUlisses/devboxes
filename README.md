@@ -21,6 +21,7 @@ bin/devbox-agent-instructions  prints a box's agent instructions (~/.claude/CLAU
 bin/devbox-browser     $BROWSER in a box: prints URLs instead of opening them
 bin/devbox-runner-dispatch  a runner box's dispatcher: one just-in-time Actions runner per queued job
 bin/devbox-runner-job  what a job's sandbox runs: its own /etc, dockerd and copy of the runner
+bin/devbox-runner-hook  a deploy box's job-started hook: fails any job but a trusted deploy
 bin/devbox-hub-deploy  a hub box's deploy user's shell: only push /opt/ticket-board and reinstall it
 bootstrap.sh           first thing a new box runs: clones this repo, hands over to devbox
 dotfiles/              bash, git, gh and nvim config stowed into every box (no identity, no secrets)
@@ -797,6 +798,50 @@ runners:
   max_jobs: 2           # jobs at once (default 2)
 ```
 
+**Two boxes: PR jobs and deploys apart.** A job's sandbox is not a security
+boundary (see [Job sandboxes](#job-sandboxes)), so a job that breaks out
+holds whatever its box holds. The org therefore runs two runner boxes, and
+what tells them apart is what each box has, not a rule inside one box:
+
+| | PR box | Deploy box |
+| --- | --- | --- |
+| `labels` | `[homelab]` | `[homelab-deploy]` |
+| Takes | any queued job asking for its label: pull requests, nightly and weekly runs, compat | only `trusted_workflows`, run by a `push` or `workflow_dispatch` on the repo's default branch, checked twice (see [The dispatcher](#the-dispatcher)) |
+| 1Password | none (`op_token: false`); the GitHub App's id and key are stored on the box | the `homelab-ci` service account, as before; deploy jobs get the token |
+| GitHub App | its own App (`homelab-ci-pr`), which can register runners and read Actions, nothing else | the `homelab-ci` App, from 1Password |
+| Tailnet | `tailscale_tag: tag:ci`, which no grant or ssh rule names as a source | `tag:runner`, which the hub's deploy grant names |
+| LAN | dropped by the Proxmox firewall on the host, outside the box: DNS and the internet only (see [The PR box's firewall](#the-pr-boxs-firewall)) | as any guest |
+| Size | `max_jobs: 2`, `runner_resources` | `max_jobs: 1` |
+
+```yaml
+# devbox-clients/clients/homelab-ci.yaml: the PR box
+role: runner
+hostname: homelab-ci
+runners:
+  org: UlissesTech
+  labels: [homelab]
+  op_token: false
+  tailscale_tag: tag:ci
+
+# devbox-clients/clients/homelab-runner.yaml: the deploy box
+role: runner
+hostname: homelab-runner
+runners:
+  org: UlissesTech
+  labels: [homelab-deploy]
+  max_jobs: 1
+  runner_group: <id of the deploy group, or leave out for Default>
+  trusted_workflows:
+    - UlissesTech/ticket-board/.github/workflows/deploy.yml@refs/heads/main
+    - UlissesTech/home-assistant/.github/workflows/<its deploy file>@refs/heads/main
+```
+
+A workflow that deploys asks for `runs-on: [self-hosted, homelab-deploy]`;
+everything else keeps `[self-hosted, homelab]`. A pull request that asks for
+`homelab-deploy` finds no runner that will run it: the deploy box's
+dispatcher doesn't start one for it, and if it gets a runner started for a
+real deploy, the job-started hook fails it before its first step.
+
 
 - **What it skips.** `devbox bootstrap` installs only the base packages a
   runner needs (`git openssh curl sudo jq go-yq unzip less mise github-cli
@@ -820,9 +865,13 @@ runners:
   but the runner's own token. Jobs get the `dockerd` in their sandbox, not
   the box's.
 - **Logins.** `devbox login` asks only for Tailscale, joining as
-  **`tag:runner`** (not `tag:devbox`), and the runner's 1Password
-  service-account token, checked with `op whoami`. No gh, Claude or az. The
-  token goes in `/etc/ghrunner/op-service-account-token`: the directory is
+  `runners.tailscale_tag` (**`tag:runner`** by default, never `tag:devbox`),
+  and the runner's 1Password service-account token, checked with `op
+  whoami`. No gh, Claude or az. With `op_token: false` it asks instead for
+  the GitHub App's id and private key (pasted, ending with an empty line,
+  checked with `openssl pkey`), stored as `/etc/ghrunner/github-app-id` and
+  `/etc/ghrunner/github-app-key.pem` the same way as the token, and sync
+  installs no `op`. The token goes in `/etc/ghrunner/op-service-account-token`: the directory is
   `root:ghrunner`, mode 750, so only root and `ghrunner` enter it and
   `ghrunner` can't add or swap files there; the file is `root:ghrunner`,
   mode 640, so root owns it and `ghrunner` (alone in its own group) can
@@ -856,11 +905,19 @@ runners:
   is in `devbox-clients`, its token in 1Password, and a broken box is
   destroyed and created again.
 
-In the tailnet policy, `tag:runner` needs its own `tagOwners` entry and the
-same kind of grant and ssh rule as `tag:devbox` (see [Tailscale
-ACL](#tailscale-acl)), with nothing granting `tag:runner` as a source but
+In the tailnet policy, `tag:runner` (the deploy box) and `tag:ci` (the PR
+box) each need their own `tagOwners` entry and the same kind of grant and
+ssh rule as `tag:devbox`, from your devices to them (see [Tailscale
+ACL](#tailscale-acl)). Nothing grants `tag:ci` as a source, so the PR box
+reaches nothing on the tailnet; nothing grants `tag:runner` as a source but
 the hub's Tailscale SSH, as its deploy user (see [Deploys from
-ticket-board](#deploys-from-ticket-board)).
+ticket-board](#deploys-from-ticket-board)):
+
+```jsonc
+"tagOwners": { "tag:runner": ["<you>"], "tag:ci": ["<you>"] },
+"grants": [ { "src": ["<you>"], "dst": ["tag:runner", "tag:ci"], "ip": ["*"] } ],
+"ssh": [ { "action": "accept", "src": ["<you>"], "dst": ["tag:runner", "tag:ci"], "users": ["daniel"] } ]
+```
 
 ### The dispatcher
 
@@ -878,18 +935,25 @@ running then, so sync a runner box when it is idle.
 Every 20 seconds or so it:
 
 1. signs a JWT as the GitHub App (its id and private key read with `op read`
-   from the `homelab-ci` vault) and swaps it for an installation token for
-   `runners.org`, kept until five minutes before it expires;
+   from the `homelab-ci` vault, or, with `op_token: false`, from
+   `/etc/ghrunner/github-app-id` and `github-app-key.pem`) and swaps it for an
+   installation token for `runners.org`, kept until five minutes before it
+   expires;
 2. lists the private, unarchived repos the App is installed on (public ones
    are skipped) and, in each, its latest 100 workflow runs in one call
    (only those: a queued run older than a repo's 100 latest is missed);
    for the runs queued or in progress, it lists their jobs and keeps the
    queued ones whose `runs-on` labels are all among the box's `labels` plus
-   `self-hosted` (case-insensitively);
+   `self-hosted` (case-insensitively). On a deploy box (`trusted_workflows`
+   set) it looks only at repos a listed workflow belongs to, and keeps a run
+   only when its `event` is `push` or `workflow_dispatch`, its `head_branch`
+   is the repo's default branch, and `<repo>/<run's path>@refs/heads/<branch>`
+   is in the list (case-insensitively);
 3. starts min(matching jobs − runners still waiting for one, `max_jobs` −
    runners running) runners. Each one gets a just-in-time config from
    `POST /orgs/{org}/actions/runners/generate-jitconfig` (the box's labels,
-   a unique name `<hostname>-<time>-<random>`, the default runner group) and
+   a unique name `<hostname>-<time>-<random>`, the runner group
+   `runners.runner_group`, 1 (Default) unless set) and
    runs in its own [sandbox](#job-sandboxes), in
    `/home/ghrunner/jobs/<name>/`: a copy of the runner with its `_work`
    folder, and an empty `HOME`. The runner takes one job and exits, the
@@ -940,6 +1004,30 @@ many runners it would start.
 - the org's **Default** runner group (id 1), which runners join, left
   closed to public repositories (GitHub's default).
 
+The PR box (`op_token: false`) needs **a second App**, `homelab-ci-pr`, with
+the same two permissions plus **Metadata: read**, installed on the org. Its
+id and key never go in 1Password: `devbox login` on that box asks for them.
+Two Apps, so the key the PR box holds is not the one the deploy box uses:
+revoking one leaves the other working.
+
+**The deploy runner group.** If the org's plan lets you add runner groups
+(Settings, Actions, Runner groups, New runner group), make one named
+`deploy`, limited to the repositories that deploy (ticket-board and
+home-assistant), and set its id as the deploy box's `runner_group` (`gh api
+orgs/<org>/actions/runner-groups` lists the ids). Where the plan also offers
+"Selected workflows" on the group, list the same workflows as
+`trusted_workflows`. Neither is required: the dispatcher's filter and the
+job-started hook hold the line without them, and the group only narrows
+which repos can queue a job onto those runners at all.
+
+**What's left.** Both Apps can register runners in the org. A stolen PR-box
+key could register a rogue runner labelled `homelab-deploy` and take a
+queued deploy job. That job carries no secret (deploy jobs read nothing
+from the PR box) and the rogue runner has no tailnet identity, so the harm
+is a deploy that doesn't happen: the next push to `main`, or a rerun,
+deploys. Revoke the key in the App's settings and run `devbox login` on the
+PR box with a new one.
+
 **The pinned runner.** `bin/devbox` pins an `actions/runner` release
 (`RUNNER_VERSION` and the sha256 of its linux-x64 tarball). Sync installs
 the box's own pin in `/var/lib/devbox/runner-version` when that is newer,
@@ -954,19 +1042,22 @@ box (as `daniel` or root) reads the latest release from
 use it. Bumping `RUNNER_VERSION` in the repo brings every box at least that
 far on its next sync.
 
-**The job contract.** A workflow gets a runner box with:
+**The job contract.** A workflow gets the PR box with:
 
 ```yaml
 runs-on: [self-hosted, homelab]
 ```
 
-and can count on:
+and the deploy box, from a trusted workflow only, with `[self-hosted,
+homelab-deploy]`. Either can count on:
 
-- `git`, `ssh`, `curl`, `jq`, `gh`, `op` and `docker` on `PATH`
-  (`/usr/local/bin:/usr/bin`); nothing else is promised;
-- `OP_SERVICE_ACCOUNT_TOKEN` set to the box's service-account token, so
-  `op read op://...` works; the job's environment holds nothing else of
-  the box's;
+- `git`, `ssh`, `curl`, `jq`, `gh` and `docker` on `PATH`
+  (`/usr/local/bin:/usr/bin`), and `op` on the deploy box; nothing else is
+  promised;
+- on the deploy box only, `OP_SERVICE_ACCOUNT_TOKEN` set to the box's
+  service-account token, so `op read op://...` works; on the PR box no
+  token at all, and no route to the LAN or the tailnet's grants. The job's
+  environment holds nothing else of the box's;
 - an empty `HOME` of its own, and a work directory that is deleted, with
   the `HOME`, when the job ends: nothing carries over between jobs;
 - a [sandbox](#job-sandboxes) of its own, with its own `docker`: up to
@@ -975,16 +1066,27 @@ and can count on:
   workflow that must not overlap itself sets its own `concurrency:`.
 
 **Safety rules.** A self-hosted runner runs whatever the workflow says, as
-a user that can drive Docker and read the box's 1Password token. That token
-is the dispatcher's too, so **every job can read the GitHub App's private
-key** (`op read op://homelab-ci/github-app/private-key.pem`) and act as the App
-on every repo it is installed on, including registering runners. The
-service account can't be scoped per job; only trusted workflows may run
-here. So use
-`runs-on: [self-hosted, homelab]` only in workflows triggered by
-`schedule`, `workflow_dispatch` or `push` to `main`; never in public repos,
-and never on `pull_request` (or `pull_request_target`), where code from a
-branch or a fork would run with those rights.
+a user that can drive Docker, and a job that leaves its sandbox has the
+box. So the boxes are split by what a job may reach:
+
+- **The PR box** (`homelab`) takes untrusted code: pull requests from
+  branches of the org's private repos. It holds only its own App key, which
+  can register runners and read Actions, and nothing else worth taking: no
+  1Password, no tailnet grant, no LAN. Never use a self-hosted label in a
+  public repo, where a fork's pull request would run on it, and keep
+  `pull_request_target` off it.
+- **The deploy box** (`homelab-deploy`) holds the `homelab-ci` service
+  account (and with it the `homelab-ci` App's key) and the tailnet
+  identity that may deploy. It runs only `trusted_workflows`, and only for
+  a push or `workflow_dispatch` on the default branch: the dispatcher starts
+  a runner only for such a run, and `bin/devbox-runner-hook`, installed as
+  `/usr/local/libexec/devbox-runner-hook` and set as the runner's
+  `ACTIONS_RUNNER_HOOK_JOB_STARTED`, fails any other job that reaches one of
+  its runners before its first step (it reads `GITHUB_EVENT_NAME`,
+  `GITHUB_REF` against the event's default branch, and
+  `GITHUB_WORKFLOW_REF` against the list root wrote into the sandbox, not
+  one the job could set). A trusted workflow runs code from `main` only,
+  so whoever can merge to `main` can run code there, as before.
 
 ### Job sandboxes
 
@@ -1002,8 +1104,9 @@ that, anything the job's own containers left behind, whoever owns it.
 
 This isolates jobs from each other's accidents. **It is not a security
 boundary against a hostile job**: the sandbox is `--privileged`, which a nested
-`dockerd` needs. That's acceptable here only because of the safety rules above,
-which already trust every job with the box's token.
+`dockerd` needs. That's acceptable only because of the safety rules above: the
+box that takes untrusted jobs holds nothing a job could steal but its own
+App key, and is fenced off the LAN and the tailnet from outside the box.
 
 The dispatcher makes what sandboxes need when it finds it missing, before
 starting a runner, so a prune can't break anything for long:
@@ -1019,11 +1122,55 @@ starting a runner, so a prune can't break anything for long:
   pulls from Hub. Images from other registries aren't cached.
 
 Jobs reach the LAN and the tailnet by address through the box, as the box
-itself. They resolve names with the box's `/etc/resolv.conf` servers; a box
+itself: on the PR box that is the internet and DNS only (its firewall and
+`tag:ci`), on the deploy box what `tag:runner` and the LAN allow. They
+resolve names with the box's `/etc/resolv.conf` servers; a box
 whose resolver doesn't know tailnet names doesn't get them in a job either, so
 use the address. A container the job runs on its `dockerd`'s default bridge
 gets Docker's fallback, `8.8.8.8` and `8.8.4.4`, as the sandbox's own resolver
 is a loopback address; it resolves public names but not LAN ones.
+
+### The PR box's firewall
+
+The PR box must not reach the LAN: the hub's PostgreSQL, Home Assistant, the
+Proxmox host. The rule has to sit outside the box, since a job that leaves
+its sandbox is root on the box. `lib/pve.sh` refuses host-level changes on a
+shared host, so this is done by hand on the host, once, after
+`devbox-create`. With `<vmid>` the PR box's id (`pct list`):
+
+1. Turn the firewall on for the datacenter if it is off (Datacenter,
+   Firewall, Options, Firewall: Yes). Its input policy is yours to keep;
+   only the guest's own rules below matter here.
+2. Mark the box's network device as firewalled: `pct set <vmid> -net0
+   <its current net0 line>,firewall=1` (`pct config <vmid> | grep ^net0`
+   shows the line).
+3. Write `/etc/pve/firewall/<vmid>.fw`:
+
+```
+[OPTIONS]
+enable: 1
+policy_in: DROP
+policy_out: ACCEPT
+
+[RULES]
+# DNS to the LAN resolver only: put its address here (the box's resolv.conf).
+OUT ACCEPT -dest <resolver ip> -p udp -dport 53
+OUT ACCEPT -dest <resolver ip> -p tcp -dport 53
+# Nothing else private: the LAN, the hub's database, other guests.
+OUT DROP -dest 10.0.0.0/8
+OUT DROP -dest 172.16.0.0/12
+OUT DROP -dest 192.168.0.0/16
+OUT DROP -dest 169.254.0.0/16
+```
+
+Rules apply top to bottom, so DNS is allowed before the private ranges are
+dropped; the internet (GitHub, Docker Hub, package mirrors) stays open. The
+sandbox network (`172.30.0.0/24`) lives inside the box and never crosses
+this firewall. Tailscale's own traffic goes to the internet (DERP and
+WireGuard endpoints), so it keeps working; what `tag:ci` may reach over the
+tailnet is the policy's call (see [Tailscale ACL](#tailscale-acl)). Check
+from the box, as `daniel`: `nc -zw3 <database ip> 5432` and `nc -zw3 <host
+ip> 8006` fail, `curl -sI https://github.com` answers.
 
 ## Hub box
 
@@ -1145,7 +1292,7 @@ its next connect. Minting again for the same devbox needs a revoke first.
 ### Deploys from ticket-board
 
 ticket-board's `.github/workflows/deploy.yml` runs on every push to `main` on
-`[self-hosted, homelab]`, like UlissesTech/home-assistant's deploy: it waits for
+`[self-hosted, homelab-deploy]`, the deploy box, like UlissesTech/home-assistant's deploy: it waits for
 that commit's other checks (CI, compat, security) to pass, then pushes it into
 the hub and reinstalls. Where home-assistant uses an SSH key from 1Password,
 this one uses the runner box's tailnet identity: it connects with Tailscale SSH,
@@ -1166,10 +1313,11 @@ so there is no key or host key to keep. Its side is in ticket-board's
   an SSH host key.
 - **Safety.** The push is refused when the hub's `main` isn't an ancestor of
   the pushed commit, or when files in `/opt/ticket-board` were edited by hand
-  (`updateInstead`). Any job on a runner box can deploy, and a deploy runs
+  (`updateInstead`). Any job on the deploy box can deploy, and a deploy runs
   ticket-board's code on the hub as `daniel` (who has sudo): that is what
-  deploying is, and why runner boxes take only trusted workflows (see [The
-  dispatcher](#the-dispatcher)).
+  deploying is, and why the deploy box takes only trusted workflows, and
+  pull requests run on the PR box, whose `tag:ci` the hub's grant doesn't
+  name (see [The dispatcher](#the-dispatcher)).
 
 One time, to set it up: merge these rules into the tailnet policy, run
 `bin/devbox-sync tk-hub`, then in ticket-board set the repository variable

@@ -1,0 +1,6 @@
+# expect: runners.tailscale_tag: must be a Tailscale tag
+role: runner
+runners:
+  org: some-org
+  labels: [homelab]
+  tailscale_tag: ci

@@ -1,0 +1,10 @@
+# expect: ok
+role: runner
+runners:
+  org: some-org
+  labels: [homelab-deploy]
+  max_jobs: 1
+  runner_group: 3
+  trusted_workflows:
+    - some-org/some-repo/.github/workflows/deploy.yml@refs/heads/main
+    - some-org/other.repo/.github/workflows/release.yaml@refs/heads/release/v2

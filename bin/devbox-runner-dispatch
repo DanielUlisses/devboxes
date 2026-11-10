@@ -10,7 +10,8 @@
 set -euo pipefail
 
 API=https://api.github.com
-# The box's settings, written by devbox sync: {org, labels, max_jobs, hostname}.
+# The box's settings, written by devbox sync: {org, labels, max_jobs,
+# trusted_workflows, op_token, runner_group, hostname}.
 CONF=${DISPATCH_CONF:-/etc/ghrunner/dispatcher.json}
 # The 1Password service-account token devbox login stores; an
 # OP_SERVICE_ACCOUNT_TOKEN already set wins (a dry run from your own shell).
@@ -19,8 +20,10 @@ OP_TOKEN_FILE=/etc/ghrunner/op-service-account-token
 # file attached to it), in the homelab-ci vault.
 APP_ID_REF=${DISPATCH_APP_ID_REF:-op://homelab-ci/github-app/username}
 APP_KEY_REF=${DISPATCH_APP_KEY_REF:-op://homelab-ci/github-app/private-key.pem}
-# The org's default runner group, which takes no public repos by default.
-RUNNER_GROUP=1
+# On a box with op_token: false (no 1Password), the App's id and key as devbox
+# login stores them: root:ghrunner, mode 640.
+APP_ID_FILE=/etc/ghrunner/github-app-id
+APP_KEY_FILE=/etc/ghrunner/github-app-key.pem
 CYCLE=20          # seconds between cycles
 BACKOFF_MAX=300   # longest wait after repeated errors
 IDLE_TIMEOUT=900  # a runner still without a job after this long is removed
@@ -65,7 +68,7 @@ die() {
 
 # Settings, re-read every cycle so a sync's new labels or max_jobs apply
 # without a restart.
-ORG="" LABELS_JSON="" MAX_JOBS="" PREFIX=""
+ORG="" LABELS_JSON="" MAX_JOBS="" PREFIX="" TRUSTED_JSON="[]" USE_OP=true RUNNER_GROUP=1
 load_settings() {
   local s
   s="$(jq -ce '
@@ -78,14 +81,40 @@ load_settings() {
   LABELS_JSON="$(jq -c '["self-hosted"] + .labels | map(ascii_downcase) | unique' <<<"$s")"
   MAX_JOBS="$(jq -r '.max_jobs | floor' <<<"$s")"
   PREFIX="$(jq -r --arg h "$(uname -n)" '.hostname // $h' <<<"$s")"
+  # A deploy box: only these workflows, lowercased (owner and repo names
+  # match case-insensitively). Empty: any job with the box's labels.
+  TRUSTED_JSON="$(jq -c '.trusted_workflows // [] | map(ascii_downcase)' <<<"$s")"
+  # No 1Password on the box: the App comes from APP_ID_FILE and APP_KEY_FILE,
+  # and jobs get no token. A change of mode drops the App read before it.
+  if [[ $(jq -r '.op_token != false' <<<"$s") != "$USE_OP" ]]; then
+    USE_OP="$(jq -r '.op_token != false' <<<"$s")"
+    APP_ID="" APP_KEY="" OP_TOKEN=""
+  fi
+  # The org runner group runners join; 1 is the org's Default group.
+  RUNNER_GROUP="$(jq -r '.runner_group // 1 | floor' <<<"$s")"
+}
+
+# Whether this box takes only trusted workflows (a deploy box).
+trusted_only() {
+  [[ $TRUSTED_JSON != "[]" ]]
 }
 
 # --- GitHub -----------------------------------------------------------------
 
 OP_TOKEN="" APP_ID="" APP_KEY=""
-# The service-account token, and with it the App's id and key, read once.
+# The service-account token, and with it the App's id and key, read once; on
+# a box without 1Password, the App's id and key from their files.
 load_secrets() {
   [[ -z $APP_KEY ]] || return 0
+  if ! $USE_OP; then
+    if [[ ! -r $APP_ID_FILE || ! -s $APP_ID_FILE || ! -r $APP_KEY_FILE || ! -s $APP_KEY_FILE ]]; then
+      log "no GitHub App id and key in $APP_ID_FILE and $APP_KEY_FILE (devbox login stores them)"
+      return 1
+    fi
+    APP_ID="$(tr -d '[:space:]' <"$APP_ID_FILE")"
+    APP_KEY="$(<"$APP_KEY_FILE")"
+    return 0
+  fi
   if [[ -n ${OP_SERVICE_ACCOUNT_TOKEN:-} ]]; then
     OP_TOKEN="$OP_SERVICE_ACCOUNT_TOKEN"
   elif [[ -r $OP_TOKEN_FILE && -s $OP_TOKEN_FILE ]]; then
@@ -180,17 +209,25 @@ api() {
 # runner), one call for its latest 100 runs, then, for those not completed
 # (an in-progress matrix run still has queued jobs, and a run that waited on
 # its concurrency group stays "pending" after its job is queued), their jobs
-# that are queued and whose labels are all among the runner's.
+# that are queued and whose labels are all among the runner's. On a deploy box
+# (trusted_workflows set) only runs of a listed workflow, started by a push or
+# workflow_dispatch on the repo's default branch, count; the job-started hook
+# (bin/devbox-runner-hook) checks the same inside the job, since a
+# just-in-time runner takes any queued job with its labels.
 matching_jobs() {
-  local page=1 repos="" chunk repo runs run jobs
+  local page=1 repos="" chunk repo default runs run jobs
   while :; do
     chunk="$(api GET "/installation/repositories?per_page=100&page=$page")" || return 1
-    repos+="$(jq -r '.repositories[] | select(.private and (.archived | not)) | .full_name' <<<"$chunk")"$'\n'
+    repos+="$(jq -r '.repositories[] | select(.private and (.archived | not)) | "\(.full_name) \(.default_branch)"' <<<"$chunk")"$'\n'
     (($(jq '.repositories | length' <<<"$chunk") == 100)) || break
     page=$((page + 1))
   done
-  while IFS= read -r repo; do
+  while read -r repo default; do
     [[ -n $repo ]] || continue
+    # A deploy box skips a repo none of whose workflows it trusts: no call.
+    if trusted_only && ! jq -e --arg r "${repo,,}/" 'any(.[]; startswith($r))' <<<"$TRUSTED_JSON" >/dev/null; then
+      continue
+    fi
     runs="$(api GET "/repos/$repo/actions/runs?per_page=100")" || return 1
     while IFS= read -r run; do
       [[ -n $run ]] || continue
@@ -199,7 +236,12 @@ matching_jobs() {
         .jobs[] | select(.status == "queued" and (.labels | length) > 0
                          and all(.labels[]; ascii_downcase | IN($labels[])))
         | {repo: $repo, run: .run_id, id, name, labels}' <<<"$jobs"
-    done < <(jq -r '.workflow_runs[] | select(.status != "completed") | .id' <<<"$runs")
+    done < <(jq -r --arg repo "$repo" --arg default "$default" --argjson trusted "$TRUSTED_JSON" '
+      .workflow_runs[] | select(.status != "completed")
+      | select(($trusted | length) == 0
+               or ((.event == "push" or .event == "workflow_dispatch") and .head_branch == $default
+                   and ("\($repo)/\(.path)@refs/heads/\(.head_branch)" | ascii_downcase | IN($trusted[]))))
+      | .id' <<<"$runs")
   done <<<"$repos"
 }
 
@@ -367,11 +409,16 @@ start_runner() {
     return 1
   fi
   (
+    # A box without 1Password passes no token; a deploy box passes its
+    # trusted workflows, which the job's hook checks the job against.
     export RUNNER_JITCONFIG="$cfg" OP_SERVICE_ACCOUNT_TOKEN="$OP_TOKEN"
+    export DEVBOX_TRUSTED_WORKFLOWS
+    DEVBOX_TRUSTED_WORKFLOWS="$(jq -r '.[]' <<<"$TRUSTED_JSON")"
     exec docker run --rm --init --privileged --name "$name" --hostname "$name" \
       --label "$SANDBOX_LABEL" --network "$SANDBOX_NETWORK" \
       -v /usr:/usr:ro -v /opt:/opt:ro -v /etc:/host-etc:ro -v /var/lib/docker \
-      -e RUNNER_JITCONFIG -e OP_SERVICE_ACCOUNT_TOKEN -e "SANDBOX_GATEWAY=$SANDBOX_GATEWAY" \
+      -e RUNNER_JITCONFIG ${OP_TOKEN:+-e OP_SERVICE_ACCOUNT_TOKEN} -e DEVBOX_TRUSTED_WORKFLOWS \
+      -e "SANDBOX_GATEWAY=$SANDBOX_GATEWAY" \
       "$SANDBOX_IMAGE" "$SANDBOX_COMMAND" </dev/null
   ) &
   pid=$!
@@ -454,7 +501,12 @@ dry_run() {
   installation_token || exit 1
   jobs="$(matching_jobs)" || exit 1
   queued="$(grep -c . <<<"$jobs" || true)"
-  printf 'org %s, runner labels %s, max_jobs %s\n' "$ORG" "$(jq -r 'join(",")' <<<"$LABELS_JSON")" "$MAX_JOBS"
+  printf 'org %s, runner labels %s, max_jobs %s, runner group %s\n' "$ORG" "$(jq -r 'join(",")' <<<"$LABELS_JSON")" "$MAX_JOBS" "$RUNNER_GROUP"
+  if trusted_only; then
+    printf 'deploy box: only push or workflow_dispatch runs on the default branch of\n'
+    jq -r '"  \(.[])"' <<<"$TRUSTED_JSON"
+  fi
+  $USE_OP || printf 'no 1Password: the App from %s, jobs get no OP_SERVICE_ACCOUNT_TOKEN\n' "$APP_ID_FILE"
   printf 'matching queued jobs: %s\n' "$queued"
   ((queued == 0)) || jq -r '"  \(.repo) run \(.run) job \(.id) \(.name | @json) [\(.labels | join(","))]"' <<<"$jobs"
   start=$((queued < MAX_JOBS ? queued : MAX_JOBS))

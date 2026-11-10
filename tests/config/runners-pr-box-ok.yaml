@@ -1,0 +1,7 @@
+# expect: ok
+role: runner
+runners:
+  org: some-org
+  labels: [homelab]
+  op_token: false
+  tailscale_tag: tag:ci

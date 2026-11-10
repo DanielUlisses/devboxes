@@ -138,13 +138,21 @@ def runners($p; $required):
   if . == null then needed("org"), needed("labels")
   elif type != "object" then err($p; "must be a mapping \(got)")
   else
-    unknown_keys("\($p)."; ["org", "labels", "max_jobs"]),
+    unknown_keys("\($p)."; ["org", "labels", "max_jobs", "trusted_workflows", "op_token", "tailscale_tag", "runner_group"]),
     (.org | if . == null then needed("org")
       else str_match("\($p).org"; "^[A-Za-z0-9]([A-Za-z0-9-]{0,38})$"; "a GitHub org name (letters, digits, dashes)") end),
     (.labels | if . == null then needed("labels")
       elif . == [] then err("\($p).labels"; "must be a non-empty list of labels \(got)")
       else str_list("\($p).labels"; "^[A-Za-z0-9._-]+$"; "a runner label (letters, digits, . _ -)") end),
-    (.max_jobs | int_min("\($p).max_jobs"; 1))
+    (.max_jobs | int_min("\($p).max_jobs"; 1)),
+    # Exactly as GITHUB_WORKFLOW_REF reads for a run on a branch.
+    (.trusted_workflows | str_list("\($p).trusted_workflows";
+      "^[A-Za-z0-9-]+/[A-Za-z0-9._-]+/\\.github/workflows/[A-Za-z0-9._-]+\\.ya?ml@refs/heads/[A-Za-z0-9._/-]+$";
+      "<owner>/<repo>/.github/workflows/<file>.yml@refs/heads/<branch>")),
+    (.op_token | if . == null or type == "boolean" then empty
+                 else err("\($p).op_token"; "must be true or false \(got)") end),
+    (.tailscale_tag | str_match("\($p).tailscale_tag"; "^tag:[a-z0-9]([a-z0-9-]*[a-z0-9])?$"; "a Tailscale tag like tag:ci")),
+    (.runner_group | int_min("\($p).runner_group"; 1))
   end;
 
 # A devbox'"'"'s ticket-board hub: https URL, the hub'"'"'s tailnet IP (CGNAT
