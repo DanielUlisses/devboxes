@@ -25,7 +25,8 @@ DOCKERD_WAIT=30 # seconds to wait for the job's dockerd
 # (bin/devbox-runner-hook, from the box's read-only /usr), and the trusted
 # workflows it reads, written here by root before the runner starts, so
 # nothing the job sets can change them.
-HOOK=/usr/local/libexec/devbox-runner-hook
+# The runner accepts a hook only with a .sh, .ps1 or .js name.
+HOOK=/usr/local/libexec/devbox-runner-hook.sh
 TRUSTED_FILE=/etc/devbox-runner/trusted-workflows
 
 log() {

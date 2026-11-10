@@ -12,7 +12,8 @@
 #     settings before the runner started (case-insensitively, as owner and
 #     repo names are).
 # GitHub doesn't let a workflow override GITHUB_* variables. Sync installs it
-# as /usr/local/libexec/devbox-runner-hook, root-owned, on the box's /usr,
+# as /usr/local/libexec/devbox-runner-hook.sh (the runner refuses a hook
+# without .sh, .ps1 or .js), root-owned, on the box's /usr,
 # which a sandbox mounts read-only.
 set -euo pipefail
 

@@ -1080,7 +1080,8 @@ box. So the boxes are split by what a job may reach:
   identity that may deploy. It runs only `trusted_workflows`, and only for
   a push or `workflow_dispatch` on the default branch: the dispatcher starts
   a runner only for such a run, and `bin/devbox-runner-hook`, installed as
-  `/usr/local/libexec/devbox-runner-hook` and set as the runner's
+  `/usr/local/libexec/devbox-runner-hook.sh` (the runner takes a hook only
+  with a `.sh`, `.ps1` or `.js` name) and set as the runner's
   `ACTIONS_RUNNER_HOOK_JOB_STARTED`, fails any other job that reaches one of
   its runners before its first step (it reads `GITHUB_EVENT_NAME`,
   `GITHUB_REF` against the event's default branch, and
