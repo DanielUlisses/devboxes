@@ -1337,6 +1337,37 @@ doctor_notify() {
 # Reads and reports only, changing nothing on the box but its report, and tells
 # the hub. Warnings want a look; a failure, or a hub that couldn't be told, also
 # exits 1, so the unit shows up as failed.
+# With agent_user: the wrapper, rule and conf in place, the agent user in no
+# root-like group and signed in to Claude, rootless Docker running for it.
+doctor_agent_user() {
+  local config="$1" home uid g signed=false f
+  [[ $(jq -r '.agent_user == true' <<<"$config") == true ]] || return 0
+  if [[ ! -r $AGENT_CONF || ! -x $AGENT_LIBEXEC/tk-agent-claude || ! -f $AGENT_SUDOERS ]] || ! id "$AGENT_USER" &>/dev/null; then
+    doctor_line fail "agent_user is on, but $AGENT_USER, its wrapper, sudoers rule or $AGENT_CONF is missing; ticket launches refuse until devbox sync sets them up"
+    return 0
+  fi
+  for g in docker wheel sudo; do
+    if id -nG "$AGENT_USER" | tr ' ' '\n' | grep -qx "$g"; then
+      doctor_line fail "$AGENT_USER is in the $g group, which is root by another name; run devbox sync"
+    fi
+  done
+  home="$(getent passwd "$AGENT_USER" | cut -d: -f6)"
+  uid="$(id -u "$AGENT_USER")"
+  for f in "$home"/.claude/.credentials.json "$home"/.claude-switch/accounts/*/.credentials.json "$home"/.config/tk-agent/oauth-token-*; do
+    [[ -s $f ]] && signed=true
+  done
+  if $signed; then
+    doctor_line ok "ticket agents run as $AGENT_USER, signed in to Claude"
+  else
+    doctor_line warn "$AGENT_USER isn't signed in to Claude, so ticket agents can't start; see README.md, Ticket agents as their own user"
+  fi
+  if [[ -S /run/user/$uid/docker.sock ]]; then
+    doctor_line ok "rootless Docker runs for $AGENT_USER"
+  else
+    doctor_line warn "no rootless Docker for $AGENT_USER, so tests that start containers fail; devbox sync says why"
+  fi
+}
+
 doctor() {
   local config="$1" role notified=true
   role="$(box_role "$config")"
@@ -1357,6 +1388,7 @@ doctor() {
       else
         doctor_line warn "gh isn't logged in; run devbox login"
       fi
+      doctor_agent_user "$config"
     fi
     printf '%s warnings, %s failures\n' "${#DOCTOR_WARNINGS[@]}" "${#DOCTOR_FAILURES[@]}"
     doctor_notify "$config" || {
