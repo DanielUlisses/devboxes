@@ -226,6 +226,9 @@ AGENT_ACL_UNIT=tk-agent-acl.service
 # container itself has mapped, so it needs 131072 of them, not Proxmox's
 # default 65536 (see README.md, Ticket agents as their own user).
 AGENT_SUBIDS=65536:65536
+# The agent's ~/.config/containers/containers.conf (see agent_podman).
+AGENT_CONTAINERS_CONF='[containers]
+pids_limit = 0'
 
 # Telegraf, on a devbox whose config sets metrics: the latest
 # influxdata/telegraf release (its linux_amd64 tarball from TELEGRAF_DOWNLOADS,
@@ -1545,7 +1548,7 @@ ids_mapped() {
 
 # The agent's rootless Podman: subordinate ids, lingering, podman.socket.
 agent_podman() {
-  local home="$1" uid="$2" start count range bus
+  local home="$1" uid="$2" start count range bus restart=false
   pacman -Q podman &>/dev/null || pacman -S --needed --noconfirm podman >/dev/null ||
     { say "agent-user: installing podman failed, so no containers for $AGENT_USER"; return 0; }
   IFS=: read -r start count <<<"$AGENT_SUBIDS"
@@ -1560,10 +1563,25 @@ agent_podman() {
     say "agent-user: $AGENT_USER has subordinate ids $range"
     runuser -u "$AGENT_USER" -- env -C "$home" HOME="$home" XDG_RUNTIME_DIR="/run/user/$uid" podman system migrate >/dev/null 2>&1 || true
   fi
+  # No per-container pids limit: in this LXC, Podman's default one leaves a
+  # container unable to fork at all (PostgreSQL's entrypoint failed with
+  # "fork: Resource temporarily unavailable" until --pids-limit=-1; the
+  # by-hand trial, 2026-11-10). The agent's user slice (TasksMax) still caps
+  # it. Made before the socket, so the API service reads it when it starts.
+  install -d -o "$AGENT_USER" -g "$AGENT_USER" -m 755 "$home/.config/containers"
+  if write_if_changed "$home/.config/containers/containers.conf" "$AGENT_CONTAINERS_CONF" 644; then
+    chown "$AGENT_USER:$AGENT_USER" "$home/.config/containers/containers.conf"
+    restart=true
+    say "agent-user: $AGENT_USER's containers have no pids limit of their own (~/.config/containers/containers.conf)"
+  fi
   [[ -d /run/systemd/system ]] || { say "agent-user: no systemd, podman.socket not started for $AGENT_USER"; return 0; }
   loginctl enable-linger "$AGENT_USER"
   systemctl start "user@$uid.service"
   bus="unix:path=/run/user/$uid/bus"
+  if $restart; then
+    runuser -u "$AGENT_USER" -- env -C "$home" HOME="$home" XDG_RUNTIME_DIR="/run/user/$uid" DBUS_SESSION_BUS_ADDRESS="$bus" \
+      systemctl --user stop podman.service >/dev/null 2>&1 || true
+  fi
   if [[ ! -S /run/user/$uid/podman/podman.sock ]]; then
     runuser -u "$AGENT_USER" -- env -C "$home" HOME="$home" XDG_RUNTIME_DIR="/run/user/$uid" DBUS_SESSION_BUS_ADDRESS="$bus" \
       systemctl --user enable --now podman.socket >/dev/null 2>&1 ||
