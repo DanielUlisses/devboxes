@@ -793,6 +793,11 @@ pct reboot <id>
 The container's own files keep their ids (the map starts at the same
 place). Sync says when the range isn't mapped and leaves containers out.
 
+Sync also writes the agent's `~/.config/containers/containers.conf` with
+`pids_limit = 0`: in an LXC, Podman's default per-container pids limit left a
+container unable to fork at all (PostgreSQL's entrypoint failed until
+`--pids-limit=-1`). The agent's user slice (`TasksMax`) still caps it.
+
 **Rollout.** Turn it on only on a box with no ticket running: the
 transcripts of running agents stay in your home, so their resume starts from
 the full brief. Restart Herdr (and log in again) after the first sync, so its
