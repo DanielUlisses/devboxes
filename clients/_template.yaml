@@ -221,8 +221,8 @@ skills: []
 # serves every box signed in to the same Claude account, so boxes on one
 # account share one item; a client on another account names its own. Empty
 # leaves the saved token as it is (none, or one from `devbox agent-login`).
-# Devbox only. Default: empty.
-# agent_token_ref: op://devbox/claude-agent/token
+# Devbox only. Default: op://work/claude-daniel-token/credential.
+# agent_token_ref: op://work/claude-pythian-token/credential
 
 # Repos to clone into ~/work/<repo>: GitHub ones as <owner>/<repo>, Azure
 # DevOps ones as their SSH URL, git@ssh.dev.azure.com:v3/<org>/<project>/<repo>.

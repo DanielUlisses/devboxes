@@ -100,9 +100,10 @@ skills_catalog: false
 # credentials: on by default on a devbox (trial passed 2026-11-10); see
 # clients/_template.yaml.
 agent_user: true
-# The agent's Claude token, as an op:// reference: empty here, set in the
-# client file; see clients/_template.yaml.
-agent_token_ref: ""
+# The agent's Claude token, as an op:// reference: the shared item for
+# Daniel's Claude account; a client on another account names its own (see
+# clients/_template.yaml).
+agent_token_ref: op://work/claude-daniel-token/credential
 
 repos: []
 
