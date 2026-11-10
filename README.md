@@ -293,9 +293,9 @@ suffix comes from `tailscale status` (`tailscale` or `tailscale.exe`), or
 
 ## Inside a box
 
-`bootstrap.sh` gets pacman working (keyring, three mirrors in order so a
-broken one falls through to the next, which `devbox sync` also adds to older
-boxes, and pacman's download
+`bootstrap.sh` gets pacman working (keyring, two mirrors in order so a
+broken one falls through to the next, Fastly first; `devbox sync` moves older
+boxes onto them and off geo.mirror.pkgbuild.com, and pacman's download
 sandbox turned off when the kernel has no Landlock, as the stock Proxmox one
 doesn't), clones this repo to
 `/opt/devboxes` at the pinned commit, records the client, branch and the
