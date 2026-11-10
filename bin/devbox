@@ -257,6 +257,7 @@ Usage: devbox bootstrap
        devbox upgrade
        devbox maintenance [--dry-run]
        devbox doctor
+       devbox agent-login [<account>]
 
 Run inside a devbox.
 
@@ -297,6 +298,10 @@ Run inside a devbox.
   doctor     check disks, /tmp, memory, OOM kills, services, timers and stale
              processes; exits 1 on a failure; sync schedules it weekly
              (devbox-doctor.timer) on every box
+  agent-login
+             with agent_user: save a token from claude setup-token (run it
+             first, signed in to that account) for the agent user's claude-acc
+             account (default: default), pasted, never shown
 
 On a role: runner box, bootstrap installs only base packages, docker,
 tailscale and op (no op with runners.op_token: false); sync adds the
@@ -1386,7 +1391,7 @@ doctor_notify() {
 # With agent_user: the wrapper, rule and conf in place, the agent user in no
 # root-like group and signed in to Claude, rootless Podman running for it.
 doctor_agent_user() {
-  local config="$1" home uid g signed=false f lost=()
+  local config="$1" home uid g signed=() bad=() f
   [[ $(jq -r '.agent_user == true' <<<"$config") == true ]] || return 0
   if [[ ! -r $AGENT_CONF || ! -x $AGENT_LIBEXEC/tk-agent-claude || ! -f $AGENT_SUDOERS ]] || ! id "$AGENT_USER" &>/dev/null; then
     doctor_line fail "agent_user is on, but $AGENT_USER, its wrapper, sudoers rule or $AGENT_CONF is missing; ticket launches refuse until devbox sync sets them up"
@@ -1399,23 +1404,19 @@ doctor_agent_user() {
   done
   home="$(getent passwd "$AGENT_USER" | cut -d: -f6)"
   uid="$(id -u "$AGENT_USER")"
-  for f in "$home"/.claude/.credentials.json "$home"/.claude-switch/accounts/*/.credentials.json "$home"/.config/tk-agent/oauth-token-*; do
-    if [[ -L $f ]]; then
-      if runuser -u "$AGENT_USER" -- test -r "$f" -a -w "$f"; then
-        signed=true
-      else
-        lost+=("$(readlink "$f")")
-      fi
-    elif [[ -s $f ]]; then
-      signed=true
+  for f in "$home"/.config/tk-agent/oauth-token-*; do
+    if [[ -s $f && $(stat -c %a "$f") == 600 ]]; then
+      signed+=("${f##*/oauth-token-}")
+    elif [[ -e $f ]]; then
+      bad+=("$f")
     fi
   done
-  if ((${#lost[@]})); then
-    doctor_line fail "$AGENT_USER can't read and write ${lost[*]} (replaced, so its ACL is gone); ticket agents on that account can't start until devbox sync"
-  elif $signed; then
-    doctor_line ok "ticket agents run as $AGENT_USER, signed in to Claude with your login"
+  if ((${#bad[@]})); then
+    doctor_line fail "${bad[*]}: empty or not mode 600, so ticket agents on that account can't start; run devbox agent-login again"
+  elif ((${#signed[@]})); then
+    doctor_line ok "ticket agents run as $AGENT_USER, signed in by token for: ${signed[*]}"
   else
-    doctor_line warn "$AGENT_USER has no Claude login to share: sign in as yourself, then devbox sync; see README.md, Ticket agents as their own user"
+    doctor_line warn "$AGENT_USER has no Claude token, so ticket agents can't start: run claude setup-token, then devbox agent-login; see README.md, Ticket agents as their own user"
   fi
   if [[ $(cat /proc/sys/dev/tty/legacy_tiocsti 2>/dev/null) != 0 ]]; then
     doctor_line fail "TIOCSTI is allowed (dev.tty.legacy_tiocsti isn't 0), so the wrapper refuses to start ticket agents; set it on the host (a Proxmox LXC: on pve), see README.md"
@@ -1472,61 +1473,26 @@ doctor() {
 # Docker where the box can run it. Off: the conf, sudoers rule, wrapper and
 # shim are removed (so nothing starts as the agent and the shell hook is
 # inert); the user, its home and its transcripts stay.
-# Your Claude login, shared with the agent: for each of your config roots
-# that is signed in (~/.claude, ~/.claude-switch/accounts/<name>), the agent's
-# matching root links .credentials.json to yours, and an ACL lets it read and
-# write that one file (a token refresh rewrites it). It may pass through your
-# root to reach it, and nothing else there: each other entry is denied to it by
-# name, and the default ACL denies it what is made later. Your settings, hooks
-# and plugins stay yours. A credentials file replaced rather than rewritten
-# drops its ACL, and the agent then can't start until the next sync.
-agent_share_credentials() {
-  local home="$1" root name mine theirs e
-  for root in "$USER_HOME/.claude" "$USER_HOME"/.claude-switch/accounts/*; do
-    [[ -d $root && ! -L $root ]] || continue
-    mine="$root/.credentials.json"
-    if [[ ! -f $mine || -L $mine ]]; then
-      say "agent-user: $root isn't signed in, nothing to share with $AGENT_USER"
-      [[ $root == "$USER_HOME/.claude" ]] || setfacl -m "u:$AGENT_USER:---" "$root"
-      continue
-    fi
-    if [[ $root == "$USER_HOME/.claude" ]]; then
-      theirs="$home/.claude"
-    else
-      name="${root##*/}"
-      theirs="$home/.claude-switch/accounts/$name"
-      setfacl -m "u:$AGENT_USER:--x" "$USER_HOME/.claude-switch" "$USER_HOME/.claude-switch/accounts"
-      for e in "$USER_HOME/.claude-switch"/{,.}[!.]* "$USER_HOME/.claude-switch/accounts"/{,.}[!.]*; do
-        [[ -e $e && ! -L $e && $e != "$USER_HOME/.claude-switch/accounts" && $e != "$USER_HOME/.claude-switch/accounts/"* ]] || continue
-        setfacl -m "u:$AGENT_USER:---" "$e"
-      done
-    fi
-    setfacl -m "u:$AGENT_USER:--x" "$root"
-    setfacl -d -m "u:$AGENT_USER:---" "$root"
-    for e in "$root"/{,.}[!.]*; do
-      [[ -e $e && ! -L $e && $e != "$mine" ]] || continue
-      setfacl -m "u:$AGENT_USER:---" "$e"
-    done
-    setfacl -m "u:$AGENT_USER:rw-" "$mine"
-    install -d -o "$AGENT_USER" -g "$AGENT_USER" -m 700 "$theirs"
-    if [[ -f $theirs/.credentials.json && ! -L $theirs/.credentials.json ]]; then
-      mv -f "$theirs/.credentials.json" "$theirs/.credentials.json.own-login"
-      say "agent-user: $theirs had its own login, kept as .credentials.json.own-login"
-    fi
-    if [[ $(readlink "$theirs/.credentials.json" 2>/dev/null) != "$mine" ]]; then
-      ln -sfn "$mine" "$theirs/.credentials.json"
-      chown -h "$AGENT_USER:$AGENT_USER" "$theirs/.credentials.json"
-      say "agent-user: $AGENT_USER signs in with $mine"
-    fi
-  done
-}
-
-# Off: the agent's access to your Claude login goes with the rest.
+# The agent signs in with a token of its own per account (`claude setup-token`,
+# saved by `devbox agent-login`), never with your .credentials.json: Claude Code
+# replaces that file on a refresh and the refresh token is single use, so a
+# shared file signed one of you out (the by-hand trial, 2026-11-10). This takes
+# back what an earlier sync shared: the agent's ACL entries on your config
+# roots and credentials files, and its links to them.
 agent_unshare_credentials() {
-  local root
+  local home root e
   id "$AGENT_USER" &>/dev/null || return 0
+  home="$(getent passwd "$AGENT_USER" | cut -d: -f6)"
   for root in "$USER_HOME/.claude" "$USER_HOME"/.claude-switch/accounts/*; do
-    [[ -f $root/.credentials.json ]] && setfacl -x "u:$AGENT_USER" "$root/.credentials.json" 2>/dev/null
+    [[ -d $root ]] || continue
+    [[ -f $root/.credentials.json ]] && setfacl -x "u:$AGENT_USER" "$root/.credentials.json" 2>/dev/null || true
+    [[ $root == "$USER_HOME/.claude" ]] || setfacl -m "u:$AGENT_USER:---" "$root"
+  done
+  for e in "$home/.claude/.credentials.json" "$home"/.claude-switch/accounts/*/.credentials.json; do
+    if [[ -L $e ]]; then
+      rm -f "$e"
+      say "agent-user: removed $e, a link to your login (the agent signs in with its own token now)"
+    fi
   done
   return 0
 }
@@ -1606,6 +1572,28 @@ agent_podman() {
   fi
 }
 
+# The agent's Claude login for one account: a token from `claude setup-token`,
+# pasted (the terminal wraps it, so line breaks and spaces are dropped), saved
+# in the agent's home mode 600. The wrapper passes it as CLAUDE_CODE_OAUTH_TOKEN.
+agent_login() {
+  local account="${1:-default}" home dir tok="" line
+  [[ $account =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die "invalid account '$account'"
+  id "$AGENT_USER" &>/dev/null || die "no $AGENT_USER: turn agent_user on and run devbox sync first"
+  home="$(getent passwd "$AGENT_USER" | cut -d: -f6)"
+  dir="$home/.config/tk-agent"
+  say "agent-login: paste the token claude setup-token printed for account '$account', then Enter on an empty line (not shown)"
+  while IFS= read -r -s line && [[ -n $line ]]; do tok+="$line"; done
+  tok="${tok//[[:space:]]/}"
+  [[ -n $tok ]] || die "no token pasted"
+  [[ $tok == sk-ant-oat01-* ]] || die "that isn't a claude setup-token token (they start sk-ant-oat01-); nothing saved"
+  install -d -o "$AGENT_USER" -g "$AGENT_USER" -m 700 "$home/.config" "$dir"
+  (umask 077 && printf '%s' "$tok" >"$dir/oauth-token-$account")
+  chown "$AGENT_USER:$AGENT_USER" "$dir/oauth-token-$account"
+  chmod 600 "$dir/oauth-token-$account"
+  say "agent-login: saved a ${#tok}-character token for $AGENT_USER, account '$account'; test it with a ticket launch, or devbox doctor"
+  unset tok
+}
+
 sync_agent_user() {
   local config="$1" home uid rules conf e
   [[ $(box_role "$config") == devbox ]] || return 0
@@ -1617,7 +1605,7 @@ sync_agent_user() {
       rm -f "$AGENT_CONF" "$AGENT_SUDOERS" "$AGENT_LIBEXEC/tk-agent-claude" "$AGENT_LIBEXEC/tk-agent-run" "$AGENT_SHIM_DIR/claude" \
         "$AGENT_LIBEXEC/tk-agent-acl" "/etc/systemd/system/$AGENT_ACL_UNIT"
       agent_unshare_credentials
-      say "agent-user: off (wrapper, shim, sudoers rule, $AGENT_CONF and its share of your Claude login removed; $AGENT_USER and its home kept)"
+      say "agent-user: off (wrapper, shim, sudoers rule and $AGENT_CONF removed; $AGENT_USER, its home and its Claude tokens kept)"
     fi
     return 0
   fi
@@ -1690,7 +1678,8 @@ STATE=$AGENT_STATE"
   setfacl -m "u:$USER_NAME:--x" "$home"
   setfacl -R -m "u:$USER_NAME:rX" "$home/.claude" "$home/.claude-switch"
   setfacl -R -d -m "u:$USER_NAME:rX" "$home/.claude" "$home/.claude-switch"
-  agent_share_credentials "$home"
+  install -d -o "$AGENT_USER" -g "$AGENT_USER" -m 700 "$home/.config" "$home/.config/tk-agent"
+  agent_unshare_credentials
   agent_acl_service
 
   # The agent's git: it trusts the box user's repos (git refuses another
@@ -1707,8 +1696,17 @@ STATE=$AGENT_STATE"
     runuser -u "$AGENT_USER" -- env -C "$home" HOME="$home" PATH="$home/.local/bin:/usr/bin" claude update >/dev/null 2>&1 || true
   fi
   if [[ -f $USER_HOME/.config/mise/config.toml ]]; then
-    install -D -o "$AGENT_USER" -g "$AGENT_USER" -m 644 "$USER_HOME/.config/mise/config.toml" "$home/.config/mise/config.toml"
+    # Not install -D: the parents it makes are root's, and then nothing of the
+    # agent's (podman, systemd --user) can write under ~/.config.
+    install -d -o "$AGENT_USER" -g "$AGENT_USER" -m 755 "$home/.config/mise"
+    install -o "$AGENT_USER" -g "$AGENT_USER" -m 644 "$USER_HOME/.config/mise/config.toml" "$home/.config/mise/config.toml"
   fi
+  # And put right what an earlier sync's install -D left root's.
+  for e in "$home/.config" "$home/.config/mise" "$home/.local" "$home/.local/share" "$home/.local/bin"; do
+    [[ -d $e && $(stat -c %U "$e") != "$AGENT_USER" ]] || continue
+    chown "$AGENT_USER:$AGENT_USER" "$e"
+    say "agent-user: $e was root's, now $AGENT_USER's"
+  done
   runuser -u "$AGENT_USER" -- env -C "$home" HOME="$home" PATH="/usr/local/bin:/usr/bin" MISE_YES=1 mise install >/dev/null ||
     say "agent-user: mise install for $AGENT_USER failed (run it as $AGENT_USER to see why)"
 
@@ -3235,6 +3233,7 @@ main() {
       done
       ;;
     maintenance) [[ $# == 0 || ($# == 1 && $1 == --dry-run) ]] || die "maintenance takes only --dry-run" ;;
+    agent-login) (($# <= 1)) || die "agent-login takes one account name at most" ;;
     *) usage >&2; die "unknown command: $cmd" ;;
   esac
   [[ -f $STATE/client ]] || die "no client recorded in $STATE/client: is this a devbox? (bootstrap.sh records it)"
@@ -3282,6 +3281,7 @@ main() {
         upgrade) upgrade ;;
         maintenance) maintenance "$(stored_config)" "$@" ;;
         doctor) doctor "$(stored_config)" ;;
+        agent-login) agent_login "$@" ;;
         sync) sync "$config_json" "$no_upgrade" ;;
       esac
       ;;
