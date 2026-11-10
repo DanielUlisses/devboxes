@@ -104,6 +104,9 @@ agent_user: true
 # Daniel's Claude account; a client on another account names its own (see
 # clients/_template.yaml).
 agent_token_ref: op://work/claude-daniel-token/credential
+# A read-only GitHub token for the agent, so it can read its PRs, checks and
+# CI logs: none by default (see clients/_template.yaml).
+agent_gh_token_ref: ""
 
 repos: []
 

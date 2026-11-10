@@ -721,8 +721,9 @@ a herdr workspace in one step.
 With `agent_user: true` (the default on a devbox), ticket agents run as
 `<user>-agent` (`daniel-agent`) instead of as you, so an agent that is
 talked into something has none of your credentials: no sudo, no `docker`
-group, no 1Password token, no gh, az, SSH keys or Ovis config. `devbox
-sync` sets up:
+group, no 1Password token, no gh login of yours, az, SSH keys or Ovis
+config (only a read-only GitHub token of its own, below). `devbox sync` sets
+up:
 
 | What | Where |
 | --- | --- |
@@ -769,6 +770,17 @@ without one; `devbox doctor` lists the accounts that have one. Not your
 refresh token is single use, so a file shared with the agent signed one of
 you out (the by-hand trial, 2026-11-10). A sync takes back what an earlier one
 shared: the agent's ACL on your credentials files and its links to them.
+
+**Reading GitHub.** A ticket agent reads its PR's checks and CI logs to fix
+them, so it gets a GitHub token of its own that can only read: a
+fine-grained personal access token with read-only Actions, Checks, Contents,
+Metadata and Pull requests, on the client's repos only (an org may need to
+approve it). Keep it in 1Password and name it as `agent_gh_token_ref:
+op://<vault>/<item>/<field>`; sync saves it as `~/.config/tk-agent/gh-token`
+(mode 600) and the wrapper passes it as `GH_TOKEN`. It can't push, comment,
+approve or merge: the board does those as you. `devbox doctor` warns while
+there is none. A GitHub token with write scopes defeats the agent user: never
+name one here.
 
 The wrapper also answers, in the agent's config root, what a new one would
 ask before Herdr's prompt gets through: onboarding, the bypass-permissions

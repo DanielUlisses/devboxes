@@ -206,7 +206,8 @@ skills: []
 # your home but for ~/work, gives it its own Claude Code, mise tools and
 # rootless Docker, and writes agent_user into the box policy, which
 # ticket-skill's launcher and the tk daemon read. The agent has no sudo,
-# docker group, 1Password, gh, az, SSH keys or Ovis. It reaches a box with no
+# docker group, 1Password, your gh login, az, SSH keys or Ovis (only a
+# read-only GitHub token of its own: agent_gh_token_ref). It reaches a box with no
 # ticket running only (agents running when it turns on keep running as you);
 # a box whose agents need az sets it false (they lose az). Turning it off
 # removes the wrapper, rule and /etc/tk-agent.conf; the user and its home
@@ -223,6 +224,17 @@ skills: []
 # leaves the saved token as it is (none, or one from `devbox agent-login`).
 # Devbox only. Default: op://work/claude-daniel-token/credential.
 # agent_token_ref: op://work/claude-pythian-token/credential
+
+# A read-only GitHub token for the agent user, so ticket agents can read their
+# PRs, checks and CI logs with gh (it can't push, comment or merge: the board
+# does that as you). An op://<vault>/<item>/<field> reference to a
+# fine-grained personal access token with read-only Actions, Checks, Contents,
+# Metadata and Pull requests on the client's repos, nothing else. `devbox
+# sync` reads it with op and saves it for the agent as
+# ~/.config/tk-agent/gh-token, mode 600, when it changed; the wrapper passes it
+# as GH_TOKEN. Empty leaves the saved token as it is (none: no gh for agents).
+# Devbox only. Default: "".
+# agent_gh_token_ref: op://work/github-agent-read-token/credential
 
 # Repos to clone into ~/work/<repo>: GitHub ones as <owner>/<repo>, Azure
 # DevOps ones as their SSH URL, git@ssh.dev.azure.com:v3/<org>/<project>/<repo>.

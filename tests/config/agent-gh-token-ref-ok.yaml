@@ -1,0 +1,3 @@
+# expect: ok
+claude_account: example
+agent_gh_token_ref: op://work/github-agent-read-token/credential
