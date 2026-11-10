@@ -239,6 +239,11 @@ TELEGRAF_DIR=$USER_HOME/.local/share/devbox/telegraf
 TELEGRAF_CONF=$USER_HOME/.config/devbox-telegraf/telegraf.conf
 TELEGRAF_UNIT=devbox-telegraf.service
 TELEGRAF_UNIT_FILE=$USER_HOME/.config/systemd/user/$TELEGRAF_UNIT
+# The box user's Herdr server as a user unit, so it is up after a reboot (the
+# panes come back from Herdr's saved session, Ovis with them) instead of
+# waiting for the first herdr command: before, that was the next devbox sync.
+HERDR_UNIT=devbox-herdr.service
+HERDR_UNIT_FILE=$USER_HOME/.config/systemd/user/$HERDR_UNIT
 TELEGRAF_PORT=8094
 
 usage() {
@@ -2375,6 +2380,8 @@ finish() {
     install_listed_plugin "$repo" "$id" </dev/null
   done < <(jq -r '(.plugins // [])[] | "\(.marketplace) \(.plugin)"' <<<"$config")
   say "plugins: all installed"
+  isolated herdr_server "$config"
+  ((STATUS == 0)) || say "herdr-server: failed; rerun devbox update"
   herdr_plugins
   say "herdr: plugins installed"
   isolated install_ovis "$config"
@@ -2603,6 +2610,46 @@ install_skills_catalog() {
   while IFS= read -r line; do
     [[ -z $line ]] || changed "skills-catalog: $line"
   done <<<"$out"
+}
+
+# Starts the box user's Herdr server at boot: HERDR_UNIT, `herdr server` (its
+# supervised mode), with linger so it runs without a login. Enabled, not
+# started: a server started by hand may be running now, and two would clash;
+# when none is, it is started too. Runs as the box user.
+herdr_server() {
+  local config="$1" unit
+  [[ $(jq -r .role <<<"$config") == devbox ]] || return 0
+  if [[ ! -d /run/systemd/system ]]; then
+    say "herdr-server: no systemd, Herdr won't start at boot"
+    return 0
+  fi
+  unit="[Unit]
+Description=Herdr: this devbox's terminal server (panes, agents, Ovis)
+After=network-online.target
+
+[Service]
+Environment=PATH=%h/.local/bin:%h/.local/share/mise/shims:/usr/local/bin:/usr/bin
+WorkingDirectory=%h
+ExecStart=%h/.local/share/mise/shims/herdr server
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=60
+
+[Install]
+WantedBy=default.target"
+  ! write_if_changed "$HERDR_UNIT_FILE" "$unit" 644 || changed "herdr-server: wrote ${HERDR_UNIT_FILE/#$USER_HOME/\~}"
+  [[ $(loginctl show-user "$USER_NAME" -p Linger --value 2>/dev/null) == yes ]] ||
+    sudo loginctl enable-linger "$USER_NAME"
+  user_systemctl daemon-reload
+  if ! user_systemctl is-enabled -q "$HERDR_UNIT" 2>/dev/null; then
+    user_systemctl enable -q "$HERDR_UNIT"
+    changed "herdr-server: Herdr starts at boot"
+  fi
+  # No server running (herdr status fails to reach one): start ours now.
+  if ! user_systemctl is-active -q "$HERDR_UNIT" && ! herdr workspace list >/dev/null 2>&1; then
+    user_systemctl start "$HERDR_UNIT"
+    changed "herdr-server: started"
+  fi
 }
 
 # systemctl --user for the box user, from finish or update (as that user).
@@ -2951,6 +2998,7 @@ update() {
   run_step skills-catalog install_skills_catalog "$config"
   run_step plugins install_new_plugins "$config"
   run_step plugin-versions update_plugins
+  run_step herdr-server herdr_server "$config"
   run_step herdr herdr_plugins
   run_step ovis install_ovis "$config"
   if [[ -n $no_upgrade ]]; then
