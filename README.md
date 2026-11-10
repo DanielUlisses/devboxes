@@ -811,8 +811,10 @@ Docker does; the agent's user slice (`TasksMax`) still caps its containers.
 **Rollout.** On by default since 2026-11-10, after the by-hand trial passed
 on dev-daniel. Let the first sync with it on reach a box with no ticket
 running: the transcripts of running agents stay in your home, so their resume
-starts from the full brief. Then restart Herdr (and log in again), so its
-panes have the `tkwork` group. With `agent_token_ref` set the sync saved the
+starts from the full brief. Then reboot the box, so tk-daemon and Herdr
+have the `tkwork` group: they run under your systemd user manager, which
+lingers, so restarting Herdr or logging in again isn't enough (a hub launch
+fails at `chgrp`, and `devbox doctor` says so). With `agent_token_ref` set the sync saved the
 agent's token; otherwise run `claude setup-token` and `devbox agent-login`
 once per account. Until there is one the wrapper refuses to start an
 agent and `devbox doctor` says why. A box whose agents need `az` sets
