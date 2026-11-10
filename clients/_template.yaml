@@ -206,12 +206,23 @@ skills: []
 # your home but for ~/work, gives it its own Claude Code, mise tools and
 # rootless Docker, and writes agent_user into the box policy, which
 # ticket-skill's launcher and the tk daemon read. The agent has no sudo,
-# docker group, 1Password, gh, az, SSH keys or Ovis. Turn it on only on a box
-# with no ticket running, and not yet on a box whose agents need az (they lose
-# it). Turning it off removes the wrapper, rule and /etc/tk-agent.conf; the
-# user and its home stay. Devbox only. See README.md, Ticket agents as their
-# own user. Default: false.
-# agent_user: true
+# docker group, 1Password, gh, az, SSH keys or Ovis. It reaches a box with no
+# ticket running only (agents running when it turns on keep running as you);
+# a box whose agents need az sets it false (they lose az). Turning it off
+# removes the wrapper, rule and /etc/tk-agent.conf; the user and its home
+# stay. Devbox only. See README.md, Ticket agents as their own user.
+# Default: true.
+# agent_user: false
+
+# The agent user's Claude login: an op://<vault>/<item>/<field> reference to a
+# token from `claude setup-token`, which `devbox sync` reads with op (the box's
+# service account) and saves for the agent as
+# ~/.config/tk-agent/oauth-token-default, mode 600, when it changed. One token
+# serves every box signed in to the same Claude account, so boxes on one
+# account share one item; a client on another account names its own. Empty
+# leaves the saved token as it is (none, or one from `devbox agent-login`).
+# Devbox only. Default: empty.
+# agent_token_ref: op://devbox/claude-agent/token
 
 # Repos to clone into ~/work/<repo>: GitHub ones as <owner>/<repo>, Azure
 # DevOps ones as their SSH URL, git@ssh.dev.azure.com:v3/<org>/<project>/<repo>.

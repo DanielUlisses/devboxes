@@ -718,7 +718,7 @@ a herdr workspace in one step.
 
 ### Ticket agents as their own user
 
-With `agent_user: true` (off by default), ticket agents run as
+With `agent_user: true` (the default on a devbox), ticket agents run as
 `<user>-agent` (`daniel-agent`) instead of as you, so an agent that is
 talked into something has none of your credentials: no sudo, no `docker`
 group, no 1Password token, no gh, az, SSH keys or Ovis config. `devbox
@@ -755,6 +755,13 @@ claude setup-token            # as you, signed in to that account; prints the to
 devbox agent-login [<name>]   # paste it (default: default); saved in the agent's
                               # home as ~/.config/tk-agent/oauth-token-<name>, mode 600
 ```
+
+One token serves every box signed in to that account, so keep it in
+1Password and name it in the client file as `agent_token_ref:
+op://<vault>/<item>/<field>`: each sync reads it with the box's service account
+and saves it for the agent's default account when it changed (a client on
+another Claude account names its own item). `devbox agent-login` is for a box
+without one.
 
 The wrapper passes it as `CLAUDE_CODE_OAUTH_TOKEN` and refuses to start
 without one; `devbox doctor` lists the accounts that have one. Not your
@@ -801,13 +808,17 @@ could start but never fork (Podman issue 29826). crun reads 0 as no limit, as
 Docker does; the agent's user slice (`TasksMax`) still caps its containers.
 `devbox doctor` fails when the runtime isn't crun.
 
-**Rollout.** Turn it on only on a box with no ticket running: the
-transcripts of running agents stay in your home, so their resume starts from
-the full brief. Restart Herdr (and log in again) after the first sync, so its
-panes have the `tkwork` group, then run `devbox agent-login` once per
-account. Not yet on a box whose agents need `az`: they lose it until
-per-project read-only MCPs exist. Off again: the wrapper, shim, sudoers rule
-and `/etc/tk-agent.conf` go; the user, its home and its tokens stay.
+**Rollout.** On by default since 2026-11-10, after the by-hand trial passed
+on dev-daniel. Let the first sync with it on reach a box with no ticket
+running: the transcripts of running agents stay in your home, so their resume
+starts from the full brief. Then restart Herdr (and log in again), so its
+panes have the `tkwork` group. With `agent_token_ref` set the sync saved the
+agent's token; otherwise run `claude setup-token` and `devbox agent-login`
+once per account. Until there is one the wrapper refuses to start an
+agent and `devbox doctor` says why. A box whose agents need `az` sets
+`agent_user: false`: they lose it until per-project read-only MCPs exist.
+Off again: the wrapper, shim, sudoers rule and `/etc/tk-agent.conf` go; the
+user, its home and its tokens stay.
 
 ### Azure DevOps pull requests
 

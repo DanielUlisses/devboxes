@@ -97,8 +97,12 @@ ovis_token_ref: ""
 skills_catalog: false
 
 # Ticket agents as their own user (<user>-agent), without the box user's
-# credentials: off by default; see clients/_template.yaml.
-agent_user: false
+# credentials: on by default on a devbox (trial passed 2026-11-10); see
+# clients/_template.yaml.
+agent_user: true
+# The agent's Claude token, as an op:// reference: empty here, set in the
+# client file; see clients/_template.yaml.
+agent_token_ref: ""
 
 repos: []
 
