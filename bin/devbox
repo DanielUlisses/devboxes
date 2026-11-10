@@ -106,7 +106,8 @@ RUNNER_DISPATCH_UNIT=devbox-runner-dispatch.service
 RUNNER_JOB_BIN=/usr/local/libexec/devbox-runner-job
 # A deploy box's job-started hook, also under /usr for the same reason, at the
 # path bin/devbox-runner-job names.
-RUNNER_HOOK_BIN=/usr/local/libexec/devbox-runner-hook
+# The runner refuses a hook whose name doesn't end in .sh, .ps1 or .js.
+RUNNER_HOOK_BIN=/usr/local/libexec/devbox-runner-hook.sh
 
 # The unattended OS upgrade every box gets: a systemd timer running `devbox
 # upgrade` daily, so a box is patched without anyone running sync or update.
@@ -731,6 +732,11 @@ runner_dispatcher() {
     say "dispatcher: installed $RUNNER_JOB_BIN"
   ! write_if_changed "$RUNNER_HOOK_BIN" "$(<"$ROOT/bin/devbox-runner-hook")" 755 ||
     say "dispatcher: installed $RUNNER_HOOK_BIN"
+  # Its first install had no .sh, which the runner refused.
+  if [[ -e ${RUNNER_HOOK_BIN%.sh} ]]; then
+    rm -f -- "${RUNNER_HOOK_BIN%.sh}"
+    say "dispatcher: removed ${RUNNER_HOOK_BIN%.sh}"
+  fi
   if write_if_changed "$RUNNER_DISPATCH_BIN" "$(<"$ROOT/bin/devbox-runner-dispatch")" 755; then
     say "dispatcher: installed $RUNNER_DISPATCH_BIN"
     restart=true
