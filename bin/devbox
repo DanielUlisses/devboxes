@@ -1424,6 +1424,15 @@ doctor_agent_user() {
   if [[ $(cat /proc/sys/dev/tty/legacy_tiocsti 2>/dev/null) != 0 ]]; then
     doctor_line fail "TIOCSTI is allowed (dev.tty.legacy_tiocsti isn't 0), so the wrapper refuses to start ticket agents; set it on the host (a Proxmox LXC: on pve), see README.md"
   fi
+  # Groups are fixed when a process starts: a user manager (lingering) from before
+  # sync joined you to the group keeps tk-daemon and Herdr without it.
+  local mpid gid
+  mpid="$(systemctl show -p MainPID --value "user@$(id -u "$USER_NAME").service" 2>/dev/null)"
+  gid="$(getent group "$AGENT_GROUP" | cut -d: -f3)"
+  if [[ -n $gid && ${mpid:-0} != 0 && -r /proc/$mpid/status ]] &&
+    ! grep '^Groups:' "/proc/$mpid/status" | tr -s ' \t' '\n' | grep -qx "$gid"; then
+    doctor_line fail "your systemd user manager started before you joined $AGENT_GROUP, so tk-daemon and Herdr can't hand worktrees to $AGENT_USER (hub launches fail at chgrp); reboot the box"
+  fi
   if ! systemctl is-active -q "$AGENT_ACL_UNIT" 2>/dev/null; then
     doctor_line warn "$AGENT_ACL_UNIT isn't running, so the tk daemon can't read the agent's transcripts; run devbox sync"
   fi
@@ -1671,7 +1680,7 @@ sync_agent_user() {
     useradd --create-home --home-dir "/home/$AGENT_USER" --shell /bin/bash --user-group "$AGENT_USER"
     say "agent-user: added $AGENT_USER"
   fi
-  id -nG "$USER_NAME" | tr ' ' '\n' | grep -qx "$AGENT_GROUP" || { usermod -aG "$AGENT_GROUP" "$USER_NAME"; say "agent-user: $USER_NAME joined $AGENT_GROUP (new shells pick it up)"; }
+  id -nG "$USER_NAME" | tr ' ' '\n' | grep -qx "$AGENT_GROUP" || { usermod -aG "$AGENT_GROUP" "$USER_NAME"; say "agent-user: $USER_NAME joined $AGENT_GROUP: reboot the box, since tk-daemon and Herdr keep the groups they started with"; }
   id -nG "$AGENT_USER" | tr ' ' '\n' | grep -qx "$AGENT_GROUP" || usermod -aG "$AGENT_GROUP" "$AGENT_USER"
   # Never in a group that is root by another name.
   for e in docker wheel sudo; do
