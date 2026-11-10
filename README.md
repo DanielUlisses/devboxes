@@ -731,7 +731,7 @@ sync` sets up:
 | who is who, for the wrapper and ticket-skill | `/etc/tk-agent.conf` |
 | the files an agent writes outside its worktree (report, phase, questions), made one by one by ticket-skill's launcher | `/var/lib/tk-agent/<user>/` |
 | `agent_user` in the box policy, which ticket-skill's launcher and the tk daemon read | `~/.config/tk-daemon/policy.json` |
-| ACLs: the agent may pass through your home to `~/work`, nothing else; you may read its `~/.claude` and `~/.claude-switch` (the daemon reads its transcripts) | `setfacl` |
+| ACLs: the agent may pass through your home to `~/work`, nothing else; you may read its `~/.claude` and `~/.claude-switch` (the daemon reads its transcripts); it may read and write your `.credentials.json` per account, nothing else in your config roots | `setfacl` |
 | its own Claude Code, your mise tools (installed again in its home), git that trusts your repos | the agent's home |
 | rootless Docker, never the `docker` group | `dockerd-rootless-setuptool.sh`, a user unit with lingering |
 
@@ -744,15 +744,16 @@ If it replaces the worktree's `.git` file, your git refuses the worktree
 
 **Signing the agent in.** The agent has its own config root per claude-acc
 account (`~/.claude` for the default, `~/.claude-switch/accounts/<name>`),
-never yours: yours holds settings and hooks your own sessions load. Sign each
-in once as the agent, either way:
-
-```
-sudo -u daniel-agent -i claude login                       # default account
-sudo -u daniel-agent -i env CLAUDE_CONFIG_DIR=~daniel-agent/.claude-switch/accounts/<name> claude login
-# or a long-lived token: run `claude setup-token` as yourself on that account,
-# then, as the agent, save it (mode 600) as ~/.config/tk-agent/oauth-token-<name>
-```
+never yours: yours holds settings and hooks your own sessions load. It signs
+in with the box's login: sync links each root's `.credentials.json` to yours
+for the same account, and an ACL lets the agent read and write that one file
+(a token refresh rewrites it) and pass through your root to it, nothing else
+there. Sign in as yourself (`claude login`, or `claude-acc`), then run `devbox
+sync` again for a new account. A token from `claude setup-token`, saved by the
+agent (mode 600) as `~/.config/tk-agent/oauth-token-<name>`, wins over the
+shared file. If something replaces your credentials file instead of rewriting
+it, the ACL goes with it: `devbox doctor` says so, the wrapper refuses to
+start, and the next sync puts it back.
 
 **Rollout.** Turn it on only on a box with no ticket running: the
 transcripts of running agents stay in your home, so their resume starts from
@@ -761,8 +762,8 @@ panes have the `tkwork` group. Not yet on a box whose agents need `az`: they
 lose it until per-project read-only MCPs exist. In an unprivileged LXC,
 rootless Docker needs subordinate ids (`AGENT_SUBIDS` in `bin/devbox`) that
 the container itself has mapped; sync says so when it can't set it up. Off
-again: the wrapper, shim, sudoers rule and `/etc/tk-agent.conf` go; the user
-and its home stay.
+again: the wrapper, shim, sudoers rule, `/etc/tk-agent.conf` and the agent's
+ACL on your credentials files go; the user and its home stay.
 
 ### Azure DevOps pull requests
 
