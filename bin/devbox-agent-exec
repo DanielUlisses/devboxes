@@ -18,9 +18,11 @@
 # agent's own config root for that claude-acc account: ~/.claude for default,
 # else ~/.claude-switch/accounts/<name> under the agent's home, never the box
 # user's (a config root holds settings and hooks the box user's sessions
-# load). A long-lived token from `claude setup-token`, saved by the agent user
-# as ~/.config/tk-agent/oauth-token-<account> (mode 600), is used when present;
-# otherwise the config root's own login (`claude login` as the agent user).
+# load). Its .credentials.json is a link to the box user's for that account
+# (devbox sync shares the box's login, an ACL letting the agent read and write
+# that one file). A long-lived token from `claude setup-token`, saved by the
+# agent user as ~/.config/tk-agent/oauth-token-<account> (mode 600), wins
+# when present.
 set -euo pipefail
 
 CONF=/etc/tk-agent.conf
@@ -116,6 +118,8 @@ if [[ $mode == claude ]]; then
   if [[ -f $token ]]; then
     [[ $(stat -c %a "$token") == 600 ]] || die "$token must be mode 600"
     env+=(CLAUDE_CODE_OAUTH_TOKEN="$(<"$token")")
+  elif [[ -L $config/.credentials.json && ! ( -r $config/.credentials.json && -w $config/.credentials.json ) ]]; then
+    die "can't read and write $(readlink "$config/.credentials.json"), the login shared for account $account (replaced, so its ACL is gone): run devbox sync"
   fi
 fi
 env+=(${setenv[@]+"${setenv[@]}"})

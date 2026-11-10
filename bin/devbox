@@ -1340,7 +1340,7 @@ doctor_notify() {
 # With agent_user: the wrapper, rule and conf in place, the agent user in no
 # root-like group and signed in to Claude, rootless Docker running for it.
 doctor_agent_user() {
-  local config="$1" home uid g signed=false f
+  local config="$1" home uid g signed=false f lost=()
   [[ $(jq -r '.agent_user == true' <<<"$config") == true ]] || return 0
   if [[ ! -r $AGENT_CONF || ! -x $AGENT_LIBEXEC/tk-agent-claude || ! -f $AGENT_SUDOERS ]] || ! id "$AGENT_USER" &>/dev/null; then
     doctor_line fail "agent_user is on, but $AGENT_USER, its wrapper, sudoers rule or $AGENT_CONF is missing; ticket launches refuse until devbox sync sets them up"
@@ -1354,12 +1354,22 @@ doctor_agent_user() {
   home="$(getent passwd "$AGENT_USER" | cut -d: -f6)"
   uid="$(id -u "$AGENT_USER")"
   for f in "$home"/.claude/.credentials.json "$home"/.claude-switch/accounts/*/.credentials.json "$home"/.config/tk-agent/oauth-token-*; do
-    [[ -s $f ]] && signed=true
+    if [[ -L $f ]]; then
+      if runuser -u "$AGENT_USER" -- test -r "$f" -a -w "$f"; then
+        signed=true
+      else
+        lost+=("$(readlink "$f")")
+      fi
+    elif [[ -s $f ]]; then
+      signed=true
+    fi
   done
-  if $signed; then
-    doctor_line ok "ticket agents run as $AGENT_USER, signed in to Claude"
+  if ((${#lost[@]})); then
+    doctor_line fail "$AGENT_USER can't read and write ${lost[*]} (replaced, so its ACL is gone); ticket agents on that account can't start until devbox sync"
+  elif $signed; then
+    doctor_line ok "ticket agents run as $AGENT_USER, signed in to Claude with your login"
   else
-    doctor_line warn "$AGENT_USER isn't signed in to Claude, so ticket agents can't start; see README.md, Ticket agents as their own user"
+    doctor_line warn "$AGENT_USER has no Claude login to share: sign in as yourself, then devbox sync; see README.md, Ticket agents as their own user"
   fi
   if [[ -S /run/user/$uid/docker.sock ]]; then
     doctor_line ok "rootless Docker runs for $AGENT_USER"
@@ -1410,13 +1420,73 @@ doctor() {
 # Docker where the box can run it. Off: the conf, sudoers rule, wrapper and
 # shim are removed (so nothing starts as the agent and the shell hook is
 # inert); the user, its home and its transcripts stay.
+# Your Claude login, shared with the agent: for each of your config roots
+# that is signed in (~/.claude, ~/.claude-switch/accounts/<name>), the agent's
+# matching root links .credentials.json to yours, and an ACL lets it read and
+# write that one file (a token refresh rewrites it). It may pass through your
+# root to reach it, and nothing else there: each other entry is denied to it by
+# name, and the default ACL denies it what is made later. Your settings, hooks
+# and plugins stay yours. A credentials file replaced rather than rewritten
+# drops its ACL, and the agent then can't start until the next sync.
+agent_share_credentials() {
+  local home="$1" root name mine theirs e
+  for root in "$USER_HOME/.claude" "$USER_HOME"/.claude-switch/accounts/*; do
+    [[ -d $root && ! -L $root ]] || continue
+    mine="$root/.credentials.json"
+    if [[ ! -f $mine || -L $mine ]]; then
+      say "agent-user: $root isn't signed in, nothing to share with $AGENT_USER"
+      [[ $root == "$USER_HOME/.claude" ]] || setfacl -m "u:$AGENT_USER:---" "$root"
+      continue
+    fi
+    if [[ $root == "$USER_HOME/.claude" ]]; then
+      theirs="$home/.claude"
+    else
+      name="${root##*/}"
+      theirs="$home/.claude-switch/accounts/$name"
+      setfacl -m "u:$AGENT_USER:--x" "$USER_HOME/.claude-switch" "$USER_HOME/.claude-switch/accounts"
+      for e in "$USER_HOME/.claude-switch"/{,.}[!.]* "$USER_HOME/.claude-switch/accounts"/{,.}[!.]*; do
+        [[ -e $e && ! -L $e && $e != "$USER_HOME/.claude-switch/accounts" && $e != "$USER_HOME/.claude-switch/accounts/"* ]] || continue
+        setfacl -m "u:$AGENT_USER:---" "$e"
+      done
+    fi
+    setfacl -m "u:$AGENT_USER:--x" "$root"
+    setfacl -d -m "u:$AGENT_USER:---" "$root"
+    for e in "$root"/{,.}[!.]*; do
+      [[ -e $e && ! -L $e && $e != "$mine" ]] || continue
+      setfacl -m "u:$AGENT_USER:---" "$e"
+    done
+    setfacl -m "u:$AGENT_USER:rw-" "$mine"
+    install -d -o "$AGENT_USER" -g "$AGENT_USER" -m 700 "$theirs"
+    if [[ -f $theirs/.credentials.json && ! -L $theirs/.credentials.json ]]; then
+      mv -f "$theirs/.credentials.json" "$theirs/.credentials.json.own-login"
+      say "agent-user: $theirs had its own login, kept as .credentials.json.own-login"
+    fi
+    if [[ $(readlink "$theirs/.credentials.json" 2>/dev/null) != "$mine" ]]; then
+      ln -sfn "$mine" "$theirs/.credentials.json"
+      chown -h "$AGENT_USER:$AGENT_USER" "$theirs/.credentials.json"
+      say "agent-user: $AGENT_USER signs in with $mine"
+    fi
+  done
+}
+
+# Off: the agent's access to your Claude login goes with the rest.
+agent_unshare_credentials() {
+  local root
+  id "$AGENT_USER" &>/dev/null || return 0
+  for root in "$USER_HOME/.claude" "$USER_HOME"/.claude-switch/accounts/*; do
+    [[ -f $root/.credentials.json ]] && setfacl -x "u:$AGENT_USER" "$root/.credentials.json" 2>/dev/null
+  done
+  return 0
+}
+
 sync_agent_user() {
   local config="$1" home uid rules conf start count e
   [[ $(box_role "$config") == devbox ]] || return 0
   if [[ $(jq -r '.agent_user == true' <<<"$config") != true ]]; then
     if [[ -e $AGENT_CONF || -e $AGENT_SUDOERS ]]; then
       rm -f "$AGENT_CONF" "$AGENT_SUDOERS" "$AGENT_LIBEXEC/tk-agent-claude" "$AGENT_LIBEXEC/tk-agent-run" "$AGENT_SHIM_DIR/claude"
-      say "agent-user: off (wrapper, shim, sudoers rule and $AGENT_CONF removed; $AGENT_USER and its home kept)"
+      agent_unshare_credentials
+      say "agent-user: off (wrapper, shim, sudoers rule, $AGENT_CONF and its share of your Claude login removed; $AGENT_USER and its home kept)"
     fi
     return 0
   fi
@@ -1484,6 +1554,7 @@ STATE=$AGENT_STATE"
   setfacl -m "u:$USER_NAME:--x" "$home"
   setfacl -R -m "u:$USER_NAME:rX" "$home/.claude" "$home/.claude-switch"
   setfacl -R -d -m "u:$USER_NAME:rX" "$home/.claude" "$home/.claude-switch"
+  agent_share_credentials "$home"
 
   # The agent's git: it trusts the box user's repos (git refuses another
   # user's otherwise). The box user never trusts the agent's.
