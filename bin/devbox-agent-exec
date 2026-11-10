@@ -98,9 +98,9 @@ env=(
   GIT_OPTIONAL_LOCKS=0
   TK_AGENT=1
 )
-# Rootless Docker, when the agent's user unit runs it.
-if [[ -S $runtime/docker.sock ]]; then
-  env+=(XDG_RUNTIME_DIR="$runtime" DOCKER_HOST="unix://$runtime/docker.sock")
+# Rootless Podman's Docker-compatible socket, when the agent's podman.socket runs.
+if [[ -S $runtime/podman/podman.sock ]]; then
+  env+=(XDG_RUNTIME_DIR="$runtime" DOCKER_HOST="unix://$runtime/podman/podman.sock")
 elif [[ -d $runtime ]]; then
   env+=(XDG_RUNTIME_DIR="$runtime")
 fi

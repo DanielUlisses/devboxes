@@ -221,10 +221,11 @@ AGENT_STATE=/var/lib/tk-agent/$USER_NAME
 # (bin/devbox-agent-acl): Claude Code writes them mode 600, which hides them
 # behind the ACL mask.
 AGENT_ACL_UNIT=tk-agent-acl.service
-# The agent's subordinate ids for rootless Docker: start:count in
+# The agent's subordinate ids for rootless Podman: start:count in
 # /etc/subuid and /etc/subgid. In an unprivileged LXC these must be ids the
-# container itself has mapped (see README.md).
-AGENT_SUBIDS=100000:65536
+# container itself has mapped, so it needs 131072 of them, not Proxmox's
+# default 65536 (see README.md, Ticket agents as their own user).
+AGENT_SUBIDS=65536:65536
 
 # Telegraf, on a devbox whose config sets metrics: the latest
 # influxdata/telegraf release (its linux_amd64 tarball from TELEGRAF_DOWNLOADS,
@@ -1342,7 +1343,7 @@ doctor_notify() {
 # the hub. Warnings want a look; a failure, or a hub that couldn't be told, also
 # exits 1, so the unit shows up as failed.
 # With agent_user: the wrapper, rule and conf in place, the agent user in no
-# root-like group and signed in to Claude, rootless Docker running for it.
+# root-like group and signed in to Claude, rootless Podman running for it.
 doctor_agent_user() {
   local config="$1" home uid g signed=false f lost=()
   [[ $(jq -r '.agent_user == true' <<<"$config") == true ]] || return 0
@@ -1381,10 +1382,10 @@ doctor_agent_user() {
   if ! systemctl is-active -q "$AGENT_ACL_UNIT" 2>/dev/null; then
     doctor_line warn "$AGENT_ACL_UNIT isn't running, so the tk daemon can't read the agent's transcripts; run devbox sync"
   fi
-  if [[ -S /run/user/$uid/docker.sock ]]; then
-    doctor_line ok "rootless Docker runs for $AGENT_USER"
+  if [[ -S /run/user/$uid/podman/podman.sock ]]; then
+    doctor_line ok "rootless Podman serves $AGENT_USER's docker"
   else
-    doctor_line warn "no rootless Docker for $AGENT_USER, so tests that start containers fail; devbox sync says why"
+    doctor_line warn "no rootless Podman for $AGENT_USER, so tests that start containers fail; devbox sync says why"
   fi
 }
 
@@ -1525,8 +1526,47 @@ WantedBy=multi-user.target"
   fi
 }
 
+# Whether ids start..start+count-1 exist in this (user namespace's) uid_map:
+# in an unprivileged LXC only the ids the host maps for the container do.
+ids_mapped() {
+  local start="$1" count="$2" inside n
+  while read -r inside _ n; do
+    ((start >= inside && start + count <= inside + n)) && return 0
+  done </proc/self/uid_map
+  return 1
+}
+
+# The agent's rootless Podman: subordinate ids, lingering, podman.socket.
+agent_podman() {
+  local home="$1" uid="$2" start count range bus
+  pacman -Q podman &>/dev/null || pacman -S --needed --noconfirm podman >/dev/null ||
+    { say "agent-user: installing podman failed, so no containers for $AGENT_USER"; return 0; }
+  IFS=: read -r start count <<<"$AGENT_SUBIDS"
+  if ! ids_mapped "$start" "$count"; then
+    say "agent-user: no containers for $AGENT_USER: ids $start-$((start + count - 1)) aren't mapped in this container ($(tr -s ' ' </proc/self/uid_map | paste -sd';')); widen its id map on the host, see README.md"
+    return 0
+  fi
+  range="$start-$((start + count - 1))"
+  if [[ $(grep "^$AGENT_USER:" /etc/subuid 2>/dev/null) != "$AGENT_USER:$start:$count" || $(grep "^$AGENT_USER:" /etc/subgid 2>/dev/null) != "$AGENT_USER:$start:$count" ]]; then
+    sed -i "/^$AGENT_USER:/d" /etc/subuid /etc/subgid
+    usermod --add-subuids "$range" --add-subgids "$range" "$AGENT_USER"
+    say "agent-user: $AGENT_USER has subordinate ids $range"
+    runuser -u "$AGENT_USER" -- env -C "$home" HOME="$home" XDG_RUNTIME_DIR="/run/user/$uid" podman system migrate >/dev/null 2>&1 || true
+  fi
+  [[ -d /run/systemd/system ]] || { say "agent-user: no systemd, podman.socket not started for $AGENT_USER"; return 0; }
+  loginctl enable-linger "$AGENT_USER"
+  systemctl start "user@$uid.service"
+  bus="unix:path=/run/user/$uid/bus"
+  if [[ ! -S /run/user/$uid/podman/podman.sock ]]; then
+    runuser -u "$AGENT_USER" -- env -C "$home" HOME="$home" XDG_RUNTIME_DIR="/run/user/$uid" DBUS_SESSION_BUS_ADDRESS="$bus" \
+      systemctl --user enable --now podman.socket >/dev/null 2>&1 ||
+      { say "agent-user: podman.socket didn't start for $AGENT_USER (systemctl --user status podman.socket as $AGENT_USER)"; return 0; }
+    say "agent-user: rootless Podman on /run/user/$uid/podman/podman.sock for $AGENT_USER"
+  fi
+}
+
 sync_agent_user() {
-  local config="$1" home uid rules conf start count e
+  local config="$1" home uid rules conf e
   [[ $(box_role "$config") == devbox ]] || return 0
   if [[ $(jq -r '.agent_user == true' <<<"$config") != true ]]; then
     if [[ -e $AGENT_CONF || -e $AGENT_SUDOERS ]]; then
@@ -1631,21 +1671,9 @@ STATE=$AGENT_STATE"
   runuser -u "$AGENT_USER" -- env -C "$home" HOME="$home" PATH="/usr/local/bin:/usr/bin" MISE_YES=1 mise install >/dev/null ||
     say "agent-user: mise install for $AGENT_USER failed (run it as $AGENT_USER to see why)"
 
-  # Rootless Docker: the agent never joins the docker group.
-  if ! command -v dockerd-rootless-setuptool.sh >/dev/null; then
-    say "agent-user: rootless Docker not set up: no dockerd-rootless-setuptool.sh (Arch: the docker-rootless-extras AUR package)"
-    return 0
-  fi
-  IFS=: read -r start count <<<"$AGENT_SUBIDS"
-  grep -q "^$AGENT_USER:" /etc/subuid 2>/dev/null || usermod --add-subuids "$start-$((start + count - 1))" "$AGENT_USER"
-  grep -q "^$AGENT_USER:" /etc/subgid 2>/dev/null || usermod --add-subgids "$start-$((start + count - 1))" "$AGENT_USER"
-  loginctl enable-linger "$AGENT_USER"
-  if [[ ! -S /run/user/$uid/docker.sock ]]; then
-    runuser -u "$AGENT_USER" -- env -C "$home" HOME="$home" XDG_RUNTIME_DIR="/run/user/$uid" PATH="/usr/local/bin:/usr/bin" \
-      dockerd-rootless-setuptool.sh install --skip-iptables >/dev/null ||
-      die "agent-user: rootless Docker setup failed for $AGENT_USER (run dockerd-rootless-setuptool.sh check as $AGENT_USER)"
-    say "agent-user: rootless Docker running for $AGENT_USER"
-  fi
+  # Rootless Podman, served on a Docker-compatible socket the wrapper points
+  # DOCKER_HOST at: the agent never joins the docker group.
+  agent_podman "$home" "$uid"
 }
 
 sync() {

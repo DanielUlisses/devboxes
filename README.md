@@ -733,7 +733,7 @@ sync` sets up:
 | `agent_user` in the box policy, which ticket-skill's launcher and the tk daemon read | `~/.config/tk-daemon/policy.json` |
 | ACLs: the agent may pass through your home to `~/work`, nothing else; you may read its `~/.claude` and `~/.claude-switch` (the daemon reads its transcripts); it may read and write your `.credentials.json` per account, nothing else in your config roots | `setfacl` |
 | its own Claude Code, your mise tools (installed again in its home), git that trusts your repos | the agent's home |
-| rootless Docker, never the `docker` group | `dockerd-rootless-setuptool.sh`, a user unit with lingering |
+| rootless Podman on a Docker-compatible socket (the agent's `docker` and `docker compose` talk to it), never the `docker` group | `podman`, the agent's `podman.socket` with lingering, `DOCKER_HOST` set by the wrapper |
 | a root service that opens the ACL mask of each file Claude Code writes in the agent's config roots (it writes transcripts mode 600, which hides them from your ACL entry) | `tk-agent-acl.service` (`bin/devbox-agent-acl`, inotify) |
 
 ticket-skill's launcher makes each ticket's worktree group `tkwork`, its
@@ -765,13 +765,28 @@ so the wrapper refuses to start unless the kernel forbids it:
 container's: on Proxmox, set it on pve (`/etc/sysctl.d/90-tiocsti.conf`,
 then `sysctl --system`). `devbox doctor` says when it isn't.
 
+**Containers in an unprivileged LXC.** Rootless Podman gives the agent
+65536 subordinate ids (`AGENT_SUBIDS`, 65536-131071), and the container has
+only the ids the host maps for it: Proxmox maps 65536 by default. Widen the
+map to 131072 on pve, then restart the container (`<id>` is its CT id):
+
+```
+# /etc/subuid and /etc/subgid on pve: root:100000:65536 becomes
+root:100000:131072
+# /etc/pve/lxc/<id>.conf, two lines each:
+lxc.idmap: u 0 100000 131072
+lxc.idmap: g 0 100000 131072
+pct reboot <id>
+```
+
+The container's own files keep their ids (the map starts at the same
+place). Sync says when the range isn't mapped and leaves containers out.
+
 **Rollout.** Turn it on only on a box with no ticket running: the
 transcripts of running agents stay in your home, so their resume starts from
 the full brief. Restart Herdr (and log in again) after the first sync, so its
 panes have the `tkwork` group. Not yet on a box whose agents need `az`: they
-lose it until per-project read-only MCPs exist. In an unprivileged LXC,
-rootless Docker needs subordinate ids (`AGENT_SUBIDS` in `bin/devbox`) that
-the container itself has mapped; sync says so when it can't set it up. Off
+lose it until per-project read-only MCPs exist. Off
 again: the wrapper, shim, sudoers rule, `/etc/tk-agent.conf` and the agent's
 ACL on your credentials files go; the user and its home stay.
 
