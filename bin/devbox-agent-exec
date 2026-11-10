@@ -106,6 +106,12 @@ elif [[ -d $runtime ]]; then
 fi
 
 if [[ $mode == claude ]]; then
+  # Claude shares the pane's tty (sudo's !use_pty, so Herdr sees it), and a
+  # process on a tty can push keystrokes into it with TIOCSTI: into the box
+  # user's shell once claude exits. Only a kernel that refuses TIOCSTI to
+  # unprivileged processes is safe.
+  [[ $(cat /proc/sys/dev/tty/legacy_tiocsti 2>/dev/null) == 0 ]] ||
+    die "TIOCSTI is allowed on this kernel (dev.tty.legacy_tiocsti isn't 0): set it on the host, see devboxes' README"
   if [[ $account == default ]]; then
     config="$home/.claude"
   else

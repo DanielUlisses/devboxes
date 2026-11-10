@@ -734,6 +734,7 @@ sync` sets up:
 | ACLs: the agent may pass through your home to `~/work`, nothing else; you may read its `~/.claude` and `~/.claude-switch` (the daemon reads its transcripts); it may read and write your `.credentials.json` per account, nothing else in your config roots | `setfacl` |
 | its own Claude Code, your mise tools (installed again in its home), git that trusts your repos | the agent's home |
 | rootless Docker, never the `docker` group | `dockerd-rootless-setuptool.sh`, a user unit with lingering |
+| a root service that opens the ACL mask of each file Claude Code writes in the agent's config roots (it writes transcripts mode 600, which hides them from your ACL entry) | `tk-agent-acl.service` (`bin/devbox-agent-acl`, inotify) |
 
 ticket-skill's launcher makes each ticket's worktree group `tkwork`, its
 files group-writable and its git metadata not: the agent edits files and runs
@@ -754,6 +755,15 @@ agent (mode 600) as `~/.config/tk-agent/oauth-token-<name>`, wins over the
 shared file. If something replaces your credentials file instead of rewriting
 it, the ACL goes with it: `devbox doctor` says so, the wrapper refuses to
 start, and the next sync puts it back.
+
+**Herdr and the pane's tty.** Herdr finds an agent among the pane's
+foreground process group, so sudo runs the wrapper without a pty of its own
+(`!use_pty`, for `tk-agent-claude` only) and claude shares the pane's tty.
+A process on a tty could then push keystrokes into your shell with TIOCSTI,
+so the wrapper refuses to start unless the kernel forbids it:
+`dev.tty.legacy_tiocsti = 0`. The setting is the host's, not the
+container's: on Proxmox, set it on pve (`/etc/sysctl.d/90-tiocsti.conf`,
+then `sysctl --system`). `devbox doctor` says when it isn't.
 
 **Rollout.** Turn it on only on a box with no ticket running: the
 transcripts of running agents stay in your home, so their resume starts from
