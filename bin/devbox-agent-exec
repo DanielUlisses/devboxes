@@ -18,11 +18,12 @@
 # agent's own config root for that claude-acc account: ~/.claude for default,
 # else ~/.claude-switch/accounts/<name> under the agent's home, never the box
 # user's (a config root holds settings and hooks the box user's sessions
-# load). Its .credentials.json is a link to the box user's for that account
-# (devbox sync shares the box's login, an ACL letting the agent read and write
-# that one file). A long-lived token from `claude setup-token`, saved by the
-# agent user as ~/.config/tk-agent/oauth-token-<account> (mode 600), wins
-# when present.
+# load). It signs in to that account with a long-lived token from `claude
+# setup-token`, which `devbox agent-login <account>` saves in the agent's home
+# as ~/.config/tk-agent/oauth-token-<account> (mode 600). Never with the box
+# user's .credentials.json: Claude Code replaces that file on a refresh and the
+# refresh token is single use, so whichever of the two refreshed first signed
+# the other out (the by-hand trial, 2026-11-10).
 set -euo pipefail
 
 CONF=/etc/tk-agent.conf
@@ -84,6 +85,32 @@ top="${rel%%/*}"
 [[ $top == *--* ]] || die "$cwd is not in a ticket worktree ($WORK/<repo>--<branch>)"
 [[ $(stat -c %G "$WORK/$top") == tkwork ]] || die "$WORK/$top is not a tkwork worktree (made by ticket-skill's launcher with the agent user on)"
 
+# A new config root opens on onboarding, the bypass-permissions warning and
+# the folder-trust dialog, and Herdr's prompt waits behind them for good (the
+# by-hand trial: "blocked during startup"). Answered here, only when missing,
+# written to a temp file and moved into place.
+# shellcheck disable=SC2016 # $wt is jq's, not the shell's
+seed_config() {
+  local root="$1" wt="$2"
+  command -v jq >/dev/null 2>&1 || return 0
+  jq_seed "$root/.claude.json" '.hasCompletedOnboarding == true and .bypassPermissionsModeAccepted == true
+      and .projects[$wt].hasTrustDialogAccepted == true' '.hasCompletedOnboarding = true | .bypassPermissionsModeAccepted = true
+      | .theme //= "dark" | .projects[$wt].hasTrustDialogAccepted = true | .projects[$wt].hasCompletedProjectOnboarding = true' "$wt"
+  jq_seed "$root/settings.json" '.skipDangerousModePermissionPrompt == true' '.skipDangerousModePermissionPrompt = true' "$wt"
+}
+# file, the test that says it's done, the filter that does it, the worktree ($wt).
+jq_seed() {
+  local f="$1" tmp
+  [[ -s $f ]] || printf '{}' >"$f"
+  jq -e --arg wt "$4" "$2" "$f" >/dev/null 2>&1 && return 0
+  tmp="$(mktemp "$f.XXXXXX")"
+  if jq --arg wt "$4" "$3" "$f" >"$tmp" && chmod 600 "$tmp"; then
+    mv -f "$tmp" "$f"
+  else
+    rm -f "$tmp"
+  fi
+}
+
 home="$(getent passwd "$AGENT_USER" | cut -d: -f6)"
 [[ -d $home ]] || die "no home for $AGENT_USER"
 uid="$(id -u)"
@@ -121,12 +148,10 @@ if [[ $mode == claude ]]; then
   chmod 700 "$config"
   env+=(CLAUDE_CONFIG_DIR="$config")
   token="$home/.config/tk-agent/oauth-token-$account"
-  if [[ -f $token ]]; then
-    [[ $(stat -c %a "$token") == 600 ]] || die "$token must be mode 600"
-    env+=(CLAUDE_CODE_OAUTH_TOKEN="$(<"$token")")
-  elif [[ -L $config/.credentials.json && ! ( -r $config/.credentials.json && -w $config/.credentials.json ) ]]; then
-    die "can't read and write $(readlink "$config/.credentials.json"), the login shared for account $account (replaced, so its ACL is gone): run devbox sync"
-  fi
+  [[ -s $token ]] || die "no Claude token for account $account: as $BOX_USER, run claude setup-token (signed in to that account), then devbox agent-login $account"
+  [[ $(stat -c %a "$token") == 600 ]] || die "$token must be mode 600"
+  env+=(CLAUDE_CODE_OAUTH_TOKEN="$(<"$token")")
+  seed_config "$config" "$WORK/$top"
 fi
 env+=(${setenv[@]+"${setenv[@]}"})
 

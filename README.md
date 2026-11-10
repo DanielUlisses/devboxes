@@ -733,7 +733,7 @@ sync` sets up:
 | who is who, for the wrapper and ticket-skill | `/etc/tk-agent.conf` |
 | the files an agent writes outside its worktree (report, phase, questions), made one by one by ticket-skill's launcher | `/var/lib/tk-agent/<user>/` |
 | `agent_user` in the box policy, which ticket-skill's launcher and the tk daemon read | `~/.config/tk-daemon/policy.json` |
-| ACLs: the agent may pass through your home to `~/work`, nothing else; you may read its `~/.claude` and `~/.claude-switch` (the daemon reads its transcripts); it may read and write your `.credentials.json` per account, nothing else in your config roots | `setfacl` |
+| ACLs: the agent may pass through your home to `~/work`, nothing else; you may read its `~/.claude` and `~/.claude-switch` (the daemon reads its transcripts) | `setfacl` |
 | its own Claude Code, your mise tools (installed again in its home), git that trusts your repos | the agent's home |
 | rootless Podman on a Docker-compatible socket (the agent's `docker` and `docker compose` talk to it), never the `docker` group | `podman`, the agent's `podman.socket` with lingering, `DOCKER_HOST` set by the wrapper |
 | a root service that opens the ACL mask of each file Claude Code writes in the agent's config roots (it writes transcripts mode 600, which hides them from your ACL entry) | `tk-agent-acl.service` (`bin/devbox-agent-acl`, inotify) |
@@ -748,15 +748,24 @@ If it replaces the worktree's `.git` file, your git refuses the worktree
 **Signing the agent in.** The agent has its own config root per claude-acc
 account (`~/.claude` for the default, `~/.claude-switch/accounts/<name>`),
 never yours: yours holds settings and hooks your own sessions load. It signs
-in with the box's login: sync links each root's `.credentials.json` to yours
-for the same account, and an ACL lets the agent read and write that one file
-(a token refresh rewrites it) and pass through your root to it, nothing else
-there. Sign in as yourself (`claude login`, or `claude-acc`), then run `devbox
-sync` again for a new account. A token from `claude setup-token`, saved by the
-agent (mode 600) as `~/.config/tk-agent/oauth-token-<name>`, wins over the
-shared file. If something replaces your credentials file instead of rewriting
-it, the ACL goes with it: `devbox doctor` says so, the wrapper refuses to
-start, and the next sync puts it back.
+in to the same Claude account as you, with a long-lived token of its own:
+
+```
+claude setup-token            # as you, signed in to that account; prints the token
+devbox agent-login [<name>]   # paste it (default: default); saved in the agent's
+                              # home as ~/.config/tk-agent/oauth-token-<name>, mode 600
+```
+
+The wrapper passes it as `CLAUDE_CODE_OAUTH_TOKEN` and refuses to start
+without one; `devbox doctor` lists the accounts that have one. Not your
+`.credentials.json`: Claude Code replaces that file on a refresh and the
+refresh token is single use, so a file shared with the agent signed one of
+you out (the by-hand trial, 2026-11-10). A sync takes back what an earlier one
+shared: the agent's ACL on your credentials files and its links to them.
+
+The wrapper also answers, in the agent's config root, what a new one would
+ask before Herdr's prompt gets through: onboarding, the bypass-permissions
+warning (`skipDangerousModePermissionPrompt`) and the worktree's folder trust.
 
 **Herdr and the pane's tty.** Herdr finds an agent among the pane's
 foreground process group, so sudo runs the wrapper without a pty of its own
@@ -787,10 +796,10 @@ place). Sync says when the range isn't mapped and leaves containers out.
 **Rollout.** Turn it on only on a box with no ticket running: the
 transcripts of running agents stay in your home, so their resume starts from
 the full brief. Restart Herdr (and log in again) after the first sync, so its
-panes have the `tkwork` group. Not yet on a box whose agents need `az`: they
-lose it until per-project read-only MCPs exist. Off
-again: the wrapper, shim, sudoers rule, `/etc/tk-agent.conf` and the agent's
-ACL on your credentials files go; the user and its home stay.
+panes have the `tkwork` group, then run `devbox agent-login` once per
+account. Not yet on a box whose agents need `az`: they lose it until
+per-project read-only MCPs exist. Off again: the wrapper, shim, sudoers rule
+and `/etc/tk-agent.conf` go; the user, its home and its tokens stay.
 
 ### Azure DevOps pull requests
 
