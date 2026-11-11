@@ -8,7 +8,8 @@
 # The box user may run exactly these two as the agent user, through sudo
 # (/etc/sudoers.d/tk-agent). sudo resets the environment, and this script
 # builds the one the agent gets from scratch: nothing the box user had
-# (1Password, gh, ssh-agent, Ovis) reaches it.
+# (1Password, gh, ssh-agent, Ovis) reaches it. Its own read-only Terraform
+# Cloud token, when sync saved one, is passed as TF_TOKEN_app_terraform_io.
 #
 #   tk-agent-claude [--account <name>] --cwd <worktree> [--setenv TICKET_X=v]... -- <claude args>
 #   tk-agent-run --cwd <worktree> [--setenv TICKET_X=v]... -- <command> [args]
@@ -152,6 +153,11 @@ if [[ $mode == claude ]]; then
   [[ $(stat -c %a "$token") == 600 ]] || die "$token must be mode 600"
   env+=(CLAUDE_CODE_OAUTH_TOKEN="$(<"$token")")
   seed_config "$config" "$WORK/$top"
+fi
+# A read-only Terraform Cloud token (agent_tfc_token_ref), for private modules.
+tfc_token="$home/.config/tk-agent/tfc-token"
+if [[ -s $tfc_token && $(stat -c %a "$tfc_token") == 600 ]]; then
+  env+=(TF_TOKEN_app_terraform_io="$(<"$tfc_token")")
 fi
 env+=(${setenv[@]+"${setenv[@]}"})
 

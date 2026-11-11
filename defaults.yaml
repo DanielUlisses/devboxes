@@ -104,6 +104,9 @@ agent_user: true
 # Daniel's Claude account; a client on another account names its own (see
 # clients/_template.yaml).
 agent_token_ref: op://work/claude-daniel-token/credential
+# A read-only Terraform Cloud token for the agent, for private registry
+# modules: none by default (see clients/_template.yaml).
+agent_tfc_token_ref: ""
 
 repos: []
 

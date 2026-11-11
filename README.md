@@ -770,6 +770,15 @@ refresh token is single use, so a file shared with the agent signed one of
 you out (the by-hand trial, 2026-11-10). A sync takes back what an earlier one
 shared: the agent's ACL on your credentials files and its links to them.
 
+**Terraform Cloud.** Off by default. A client whose repos use private
+registry modules (`app.terraform.io/<org>/...`) can give the agent a token
+for them, so `terraform init` and `validate` work in a ticket: a team token
+whose team only reads the registry, never a user or org token. Keep it in
+1Password and name it as `agent_tfc_token_ref: op://<vault>/<item>/<field>`;
+sync saves it as `~/.config/tk-agent/tfc-token` (mode 600) and the wrapper
+passes it as `TF_TOKEN_app_terraform_io`. `devbox doctor` says when one is
+saved.
+
 The wrapper also answers, in the agent's config root, what a new one would
 ask before Herdr's prompt gets through: onboarding, the bypass-permissions
 warning (`skipDangerousModePermissionPrompt`) and the worktree's folder trust.

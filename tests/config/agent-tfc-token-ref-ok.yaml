@@ -1,0 +1,3 @@
+# expect: ok
+claude_account: example
+agent_tfc_token_ref: op://work/terraform-agent-read-token/credential

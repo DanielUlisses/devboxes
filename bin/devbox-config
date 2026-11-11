@@ -196,7 +196,7 @@ if . == null then {} else . end
   else
     unknown_keys(""; ["hostname", "host", "role", "claude_account", "git_name", "git_email", "resources", "packages", "tools", "skills",
                      "repos", "plugins", "timezone", "backup", "backup_schedule", "backup_keep", "runners", "tk_hub", "metrics",
-                     "remote_control", "remote_control_tickets", "skills_catalog", "agent_user", "agent_token_ref", "ovis", "ovis_owner", "ovis_token_ref"]
+                     "remote_control", "remote_control_tickets", "skills_catalog", "agent_user", "agent_token_ref", "agent_tfc_token_ref", "ovis", "ovis_owner", "ovis_token_ref"]
                      + if $required then [] else ["runner_resources", "hub_resources"] end),
 
     (.hostname | str_match("hostname"; "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$";
@@ -317,6 +317,14 @@ if . == null then {} else . end
          else str_match("agent_token_ref"; "^op://[A-Za-z0-9._-]([A-Za-z0-9._ -]*[A-Za-z0-9._-])?(/[A-Za-z0-9._-]([A-Za-z0-9._ -]*[A-Za-z0-9._-])?){2,3}$";
            "an op://<vault>/<item>/<field> reference, or empty") end end),
 
+    # The agent user'"'"'s read-only Terraform Cloud token, read with op at each sync. A reference, never the token.
+    ((.role // $default_role) as $role
+     | if $required and $role != "devbox" and .agent_tfc_token_ref != null
+       then err("agent_tfc_token_ref"; "allowed only when role is devbox (role is \($role))")
+       else .agent_tfc_token_ref | if . == null or . == "" then empty
+         else str_match("agent_tfc_token_ref"; "^op://[A-Za-z0-9._-]([A-Za-z0-9._ -]*[A-Za-z0-9._-])?(/[A-Za-z0-9._-]([A-Za-z0-9._ -]*[A-Za-z0-9._-])?){2,3}$";
+           "an op://<vault>/<item>/<field> reference, or empty") end end),
+
     # The skills catalog is synced for a devbox'"'"'s ticket agents.
     ((.role // $default_role) as $role
      | if $required and $role != "devbox" and .skills_catalog != null
@@ -360,13 +368,13 @@ def strip_nulls: if type == "object" then with_entries(select(.value != null) | 
 | ($d * $c)
 | .hostname //= "dev-\($name)"
 | .skills = (reduce (($d.skills // []) + ($c.skills // []))[] as $s ([]; if IN(.[]; $s) then . else . + [$s] end))
-| {hostname, host, role, claude_account, git_name, git_email, resources, packages, tools, skills, repos, plugins, timezone, backup, backup_schedule, backup_keep, runners, tk_hub, metrics, remote_control, remote_control_tickets, skills_catalog, agent_user, agent_token_ref, ovis, ovis_owner, ovis_token_ref}
+| {hostname, host, role, claude_account, git_name, git_email, resources, packages, tools, skills, repos, plugins, timezone, backup, backup_schedule, backup_keep, runners, tk_hub, metrics, remote_control, remote_control_tickets, skills_catalog, agent_user, agent_token_ref, agent_tfc_token_ref, ovis, ovis_owner, ovis_token_ref}
 | if .role == "runner" then . else del(.runners) end
 | if .role == "devbox" then .remote_control = false | .remote_control_tickets = false
   else del(.remote_control, .remote_control_tickets) end
 | if .role == "devbox" then .ovis //= true | .ovis_owner //= "" | .ovis_token_ref //= "" else del(.ovis, .ovis_owner, .ovis_token_ref) end
 | if .role == "devbox" then .skills_catalog //= false else del(.skills_catalog) end
-| if .role == "devbox" then (if .agent_user == null then .agent_user = true else . end) | .agent_token_ref //= "" else del(.agent_user, .agent_token_ref) end
+| if .role == "devbox" then (if .agent_user == null then .agent_user = true else . end) | .agent_token_ref //= "" | .agent_tfc_token_ref //= "" else del(.agent_user, .agent_token_ref, .agent_tfc_token_ref) end
 | if .role == "devbox" and .tk_hub != null then . else del(.tk_hub) end
 | if .role == "devbox" and .metrics != null then . else del(.metrics) end
 '

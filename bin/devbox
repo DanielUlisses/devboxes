@@ -1421,6 +1421,13 @@ doctor_agent_user() {
   else
     doctor_line warn "$AGENT_USER has no Claude token, so ticket agents can't start: set agent_token_ref and devbox sync, or run claude setup-token, then devbox agent-login; see README.md, Ticket agents as their own user"
   fi
+  # Only boxes that use Terraform Cloud have one, so none is no warning.
+  f="$home/.config/tk-agent/tfc-token"
+  if [[ -s $f && $(stat -c %a "$f") == 600 ]]; then
+    doctor_line ok "ticket agents fetch private Terraform Cloud modules with a read-only token"
+  elif [[ -e $f ]]; then
+    doctor_line fail "$f is empty or not mode 600; run devbox sync"
+  fi
   if [[ $(cat /proc/sys/dev/tty/legacy_tiocsti 2>/dev/null) != 0 ]]; then
     doctor_line fail "TIOCSTI is allowed (dev.tty.legacy_tiocsti isn't 0), so the wrapper refuses to start ticket agents; set it on the host (a Proxmox LXC: on pve), see README.md"
   fi
@@ -1637,6 +1644,37 @@ agent_token_from_ref() {
   say "agent-user: saved the agent's Claude token from $ref"
 }
 
+# With agent_tfc_token_ref: the agent's read-only Terraform Cloud token, saved
+# as ~/.config/tk-agent/tfc-token the same way. A failed read keeps the saved one.
+agent_tfc_token_from_ref() {
+  local config="$1" home="$2" ref token file
+  ref="$(jq -r '.agent_tfc_token_ref // ""' <<<"$config")"
+  [[ -n $ref ]] || return 0
+  file="$home/.config/tk-agent/tfc-token"
+  if [[ ! -s $USER_HOME/.config/op/service-account-token ]]; then
+    say "agent-user: agent_tfc_token_ref is set but there's no 1Password token yet (devbox login); the agent's Terraform Cloud token is unchanged"
+    return 0
+  fi
+  # shellcheck disable=SC2016 # for the box user's shell, as install_ovis's
+  if ! token="$(as_user bash -c 'OP_SERVICE_ACCOUNT_TOKEN="$(<"$HOME/.config/op/service-account-token")" op read "$1"' _ "$ref")"; then
+    say "agent-user: op could not read agent_tfc_token_ref ($ref); the agent's Terraform Cloud token is unchanged"
+    return 0
+  fi
+  token="${token//[[:space:]]/}"
+  if [[ ! $token =~ ^[A-Za-z0-9]{8,}\.atlasv1\.[A-Za-z0-9_-]{20,}$ ]]; then
+    say "agent-user: agent_tfc_token_ref ($ref) doesn't hold a Terraform Cloud token (<id>.atlasv1.<secret>); the agent's Terraform Cloud token is unchanged"
+    return 0
+  fi
+  if [[ -f $file && $(<"$file") == "$token" ]]; then
+    return 0
+  fi
+  install -d -o "$AGENT_USER" -g "$AGENT_USER" -m 700 "${file%/*}"
+  (umask 077 && printf '%s' "$token" >"$file")
+  chown "$AGENT_USER:$AGENT_USER" "$file"
+  chmod 600 "$file"
+  say "agent-user: saved the agent's Terraform Cloud token from $ref"
+}
+
 # The agent's Claude login for one account: a token from `claude setup-token`,
 # pasted (the terminal wraps it, so line breaks and spaces are dropped), saved
 # in the agent's home mode 600. The wrapper passes it as CLAUDE_CODE_OAUTH_TOKEN.
@@ -1746,6 +1784,7 @@ STATE=$AGENT_STATE"
   install -d -o "$AGENT_USER" -g "$AGENT_USER" -m 700 "$home/.config" "$home/.config/tk-agent"
   agent_unshare_credentials
   agent_token_from_ref "$config" "$home"
+  agent_tfc_token_from_ref "$config" "$home"
   agent_acl_service
 
   # The agent's git: it trusts the box user's repos (git refuses another
