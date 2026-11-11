@@ -1,0 +1,6 @@
+# expect: agent_tfc_token_ref: allowed only when role is devbox
+role: runner
+runners:
+  org: example-org
+  labels: [homelab]
+agent_tfc_token_ref: op://devbox/terraform-agent/token
