@@ -936,7 +936,7 @@ what tells them apart is what each box has, not a rule inside one box:
 | | PR box | Deploy box |
 | --- | --- | --- |
 | `labels` | `[homelab]` | `[homelab-deploy]` |
-| Takes | any queued job asking for its label: pull requests, nightly and weekly runs, compat | only `trusted_workflows`, run by a `push` or `workflow_dispatch` on the repo's default branch, checked twice (see [The dispatcher](#the-dispatcher)) |
+| Takes | any queued job asking for its label: pull requests, nightly and weekly runs, compat | only `trusted_workflows`, run by a `push` or `workflow_dispatch` on the branch the entry names, checked twice (see [The dispatcher](#the-dispatcher)) |
 | 1Password | none (`op_token: false`); the GitHub App's id and key are stored on the box | the `homelab-ci` service account, as before; deploy jobs get the token |
 | GitHub App | its own App (`homelab-ci-pr`), which can register runners and read Actions, nothing else | the `homelab-ci` App, from 1Password |
 | Tailnet | `tailscale_tag: tag:ci`, which no grant or ssh rule names as a source | `tag:runner`, which the hub's deploy grant names |
@@ -963,6 +963,7 @@ runners:
   runner_group: <id of the deploy group, or leave out for Default>
   trusted_workflows:
     - UlissesTech/ticket-board/.github/workflows/deploy.yml@refs/heads/main
+    - UlissesTech/ticket-board/.github/workflows/deploy.yml@refs/heads/next   # the second hub (ticket-board docs/hub-next.md)
     - UlissesTech/home-assistant/.github/workflows/<its deploy file>@refs/heads/main
 ```
 
@@ -1076,9 +1077,9 @@ Every 20 seconds or so it:
    queued ones whose `runs-on` labels are all among the box's `labels` plus
    `self-hosted` (case-insensitively). On a deploy box (`trusted_workflows`
    set) it looks only at repos a listed workflow belongs to, and keeps a run
-   only when its `event` is `push` or `workflow_dispatch`, its `head_branch`
-   is the repo's default branch, and `<repo>/<run's path>@refs/heads/<branch>`
-   is in the list (case-insensitively);
+   only when its `event` is `push` or `workflow_dispatch` and
+   `<repo>/<run's path>@refs/heads/<branch>` is in the list
+   (case-insensitively): an entry names the one branch it may run from;
 3. starts min(matching jobs − runners still waiting for one, `max_jobs` −
    runners running) runners. Each one gets a just-in-time config from
    `POST /orgs/{org}/actions/runners/generate-jitconfig` (the box's labels,
@@ -1208,16 +1209,18 @@ box. So the boxes are split by what a job may reach:
 - **The deploy box** (`homelab-deploy`) holds the `homelab-ci` service
   account (and with it the `homelab-ci` App's key) and the tailnet
   identity that may deploy. It runs only `trusted_workflows`, and only for
-  a push or `workflow_dispatch` on the default branch: the dispatcher starts
+  a push or `workflow_dispatch` on the branch its entry names: the dispatcher starts
   a runner only for such a run, and `bin/devbox-runner-hook`, installed as
   `/usr/local/libexec/devbox-runner-hook.sh` (the runner takes a hook only
   with a `.sh`, `.ps1` or `.js` name) and set as the runner's
   `ACTIONS_RUNNER_HOOK_JOB_STARTED`, fails any other job that reaches one of
   its runners before its first step (it reads `GITHUB_EVENT_NAME`,
-  `GITHUB_REF` against the event's default branch, and
+  `GITHUB_REF` against the branch `GITHUB_WORKFLOW_REF` names, and
   `GITHUB_WORKFLOW_REF` against the list root wrote into the sandbox, not
-  one the job could set). A trusted workflow runs code from `main` only,
-  so whoever can merge to `main` can run code there, as before.
+  one the job could set). A trusted workflow runs code only from the branch
+  its entry names, so whoever can push to that branch can run code there:
+  `main` for the hub, and `next` while ticket-board's second hub is piloted
+  (its docs/hub-next.md).
 
 ### Job sandboxes
 

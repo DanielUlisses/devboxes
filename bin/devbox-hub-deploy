@@ -4,12 +4,15 @@
 # ticket-board's deploy workflow, on the UlissesTech runner box, reaches the
 # hub over Tailscale SSH as that user (the tailnet policy lets tag:runner in
 # as nobody else), and may only read and push /opt/ticket-board (as daniel,
-# who owns it) and reinstall it (devbox update, as root); anything else,
+# who owns it) and reinstall it (devbox update, as root), and the same for the
+# second hub's checkout, /opt/ticket-board-next (ticket-board docs/hub-next.md):
+# push it and run its own installer as daniel; anything else,
 # including an interactive login, is refused. The hub never pulls: the push
 # (receive.denyCurrentBranch=updateInstead) is how a commit of main gets here.
 set -euo pipefail
 
 HUB_DIR=/opt/ticket-board
+NEXT_DIR=/opt/ticket-board-next
 HUB_OWNER=daniel
 
 # Called as a login shell: `<shell> -c <command>`.
@@ -23,8 +26,13 @@ case "$cmd" in
   "git-receive-pack '$HUB_DIR'" | "git-receive-pack $HUB_DIR")
     exec sudo -n -u "$HUB_OWNER" /usr/bin/git-receive-pack "$HUB_DIR" ;;
   install) exec sudo -n /usr/local/bin/devbox update ;;
+  "git-upload-pack '$NEXT_DIR'" | "git-upload-pack $NEXT_DIR")
+    exec sudo -n -u "$HUB_OWNER" /usr/bin/git-upload-pack "$NEXT_DIR" ;;
+  "git-receive-pack '$NEXT_DIR'" | "git-receive-pack $NEXT_DIR")
+    exec sudo -n -u "$HUB_OWNER" /usr/bin/git-receive-pack "$NEXT_DIR" ;;
+  install-next) exec sudo -n -H -u "$HUB_OWNER" "$NEXT_DIR/deploy/hub-next/install.sh" --restart ;;
   *)
-    printf 'devbox-hub-deploy: refused %q: this user may only push %s and run install\n' "$cmd" "$HUB_DIR" >&2
+    printf 'devbox-hub-deploy: refused %q: this user may only push %s or %s and run install or install-next\n' "$cmd" "$HUB_DIR" "$NEXT_DIR" >&2
     exit 1
     ;;
 esac

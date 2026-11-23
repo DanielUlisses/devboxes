@@ -933,8 +933,9 @@ hub_tk() {
 
 # The hub's deploy user, as root: HUB_DEPLOY_USER, a system user with
 # bin/devbox-hub-deploy as its login shell, and sudo for exactly what that
-# shell runs: git-upload-pack and git-receive-pack of HUB_DIR as the box
-# user, and devbox update as root. Who may log in as it is the tailnet
+# shell runs: git-upload-pack and git-receive-pack of HUB_DIR and of
+# HUB_DIR-next (the second hub) as the box user, the second hub's installer as
+# the box user, and devbox update as root. Who may log in as it is the tailnet
 # policy's call (tag:runner only; see README.md, Deploys from ticket-board).
 hub_deploy_user() {
   local rules
@@ -950,6 +951,7 @@ hub_deploy_user() {
     say "hub: $HUB_DEPLOY_USER's shell is $HUB_DEPLOY_BIN again"
   fi
   rules="$HUB_DEPLOY_USER ALL=($USER_NAME) NOPASSWD: /usr/bin/git-upload-pack $HUB_DIR, /usr/bin/git-receive-pack $HUB_DIR
+$HUB_DEPLOY_USER ALL=($USER_NAME) NOPASSWD: /usr/bin/git-upload-pack $HUB_DIR-next, /usr/bin/git-receive-pack $HUB_DIR-next, $HUB_DIR-next/deploy/hub-next/install.sh --restart
 $HUB_DEPLOY_USER ALL=(root) NOPASSWD: /usr/local/bin/devbox update"
   if write_if_changed "$HUB_DEPLOY_SUDOERS" "$rules" 440; then
     visudo -cqf "$HUB_DEPLOY_SUDOERS" || { rm -f "$HUB_DEPLOY_SUDOERS"; die "hub: invalid sudoers entry"; }
