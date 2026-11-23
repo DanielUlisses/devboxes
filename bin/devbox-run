@@ -1,0 +1,854 @@
+#!/usr/bin/env bash
+# shellcheck disable=SC2016 # jq programs and the pane's bash -c expand later, not here
+# The box's runner: starts commands (Claude Code sessions, mostly) detached in
+# tmux, reports facts about them as JSON, types into them and resumes them.
+# It holds no ticket state: whoever drives it (an on-box coordinator, the tk
+# daemon) derives a thread's state from what `status` reports. Runs as the box
+# user, so sessions use the box's own Claude account. See README.md, The runner.
+#
+#   devbox-run start <name> (--dir <path> | --repo <path> [--branch <b>] [--base <b>])
+#                    [--env K=V]... [--prompt <text> | --prompt-file <file>] [--trust] -- <command> [args...]
+#   devbox-run status [<name>...] [--pr] [--json]
+#   devbox-run log <name> [--lines N] [--transcript]
+#   devbox-run say <name> [--force] <text...>|-
+#   devbox-run keys <name> <tmux key>...
+#   devbox-run resume <name> [--note <text>] | --all
+#   devbox-run stop <name>
+#   devbox-run forget <name>
+#   devbox-run attach <name>
+#   devbox-run list
+#
+# Its own tmux server (socket DEVBOX_RUN_SOCKET, default devbox-run) keeps it
+# apart from Herdr and from any tmux a person runs. Every session has a state
+# directory, $STATE_ROOT/<name>, holding meta.json (what started it), cmd and
+# env (NUL-separated, read by the _exec verb inside the pane), the prompt, and
+# exit.json once the command ends. A claude session's prompt (and a resume's
+# note) is typed in once claude is ready, never passed as an argument. Dead panes stay (remain-on-exit), so log
+# still shows how a command ended.
+#
+# A claude session also gets hooks (through --settings) that write what only
+# claude knows into the state directory: its current session id and
+# transcript (SessionStart, so /clear and resumes are followed), whether a turn
+# is under way (UserPromptSubmit/Stop) and its last notification.
+#
+# Exit codes: 1 failure, 2 usage, 3 no such session, 4 already running (start
+# prints its status anyway), 5 not deliverable (say into a dead pane or one
+# showing a dialog).
+set -euo pipefail
+
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+STATE_ROOT="${DEVBOX_RUN_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/devbox-run}"
+SOCKET="${DEVBOX_RUN_SOCKET:-devbox-run}"
+NAME_RE='^[A-Za-z0-9][A-Za-z0-9_-]{0,62}$'
+PR_CACHE_S=60
+# Pane size of a detached session: claude draws to it, and log reads it.
+COLS=200
+ROWS=50
+
+die() {
+  printf 'devbox-run: %s\n' "$*" >&2
+  exit 1
+}
+
+# die with exit code $1.
+fail() {
+  local code="$1"
+  shift
+  printf 'devbox-run: %s\n' "$*" >&2
+  exit "$code"
+}
+
+SCHEMA=1
+
+usage() {
+  sed -n '3,/^set -euo/{/^set -euo/d;s/^# \{0,1\}//;p}' "$SELF"
+}
+
+now_iso() {
+  date -u +%Y-%m-%dT%H:%M:%SZ
+}
+
+epoch_iso() {
+  date -u -d "@$1" +%Y-%m-%dT%H:%M:%SZ
+}
+
+tm() {
+  tmux -L "$SOCKET" -f "$STATE_ROOT/tmux.conf" "$@"
+}
+
+# Starts this socket's tmux server when none runs, in a systemd user scope of
+# its own when there is a user manager: a server forked from a caller's
+# service (the tk daemon) would otherwise live in that service's cgroup and
+# die with every restart of it, taking every session along.
+tmux_server() {
+  tm list-sessions &>/dev/null && return 0
+  if command -v systemd-run >/dev/null && systemctl --user is-system-running &>/dev/null; then
+    systemd-run --user --scope --quiet --collect --unit "devbox-run-tmux-$$" -- \
+      tmux -L "$SOCKET" -f "$STATE_ROOT/tmux.conf" new-session -d -s _keep 'exec sleep infinity' 2>/dev/null && return 0
+  fi
+  tm new-session -d -s _keep 'exec sleep infinity'
+}
+
+# The server's options, read only when this socket's server starts.
+tmux_conf() {
+  mkdir -p "$STATE_ROOT"
+  chmod 700 "$STATE_ROOT"
+  local want
+  want="$(printf '%s\n' \
+    '# Written by devbox-run.' \
+    'set -g remain-on-exit on' \
+    'set -g history-limit 50000' \
+    'set -g exit-empty off' \
+    'set -g default-terminal tmux-256color' \
+    'set -g window-size latest')"
+  [[ -f $STATE_ROOT/tmux.conf && $(<"$STATE_ROOT/tmux.conf") == "$want" ]] ||
+    printf '%s\n' "$want" >"$STATE_ROOT/tmux.conf"
+  tmux_server
+}
+
+check_name() {
+  [[ $1 =~ $NAME_RE ]] || die "bad name '$1': letters, digits, - and _, up to 63, starting with a letter or digit"
+}
+
+sdir() {
+  printf '%s/%s' "$STATE_ROOT" "$1"
+}
+
+need_session() {
+  check_name "$1"
+  [[ -f $(sdir "$1")/meta.json ]] || fail 3 "no session named $1"
+}
+
+meta() {
+  cat "$(sdir "$1")/meta.json"
+}
+
+# Applies jq filter $2 (with --arg/--argjson pairs after it) to $1's meta.json.
+meta_set() {
+  local name="$1" filter="$2" f tmp
+  shift 2
+  f="$(sdir "$name")/meta.json"
+  tmp="$(mktemp "$f.XXXXXX")"
+  jq "$@" "$filter" "$f" >"$tmp" && mv "$tmp" "$f"
+}
+
+# One lock per session, held for the rest of the verb: two starts or a start
+# and a resume of one name never race.
+lock() {
+  local d
+  d="$(sdir "$1")"
+  mkdir -p "$d"
+  chmod 700 "$d"
+  exec 9>"$d/.lock"
+  flock -w 30 9 || die "$1 is busy (another devbox-run holds its lock)"
+}
+
+# "dead pid activity" of the session's pane, empty when there's no session.
+pane_info() {
+  tm list-panes -t "=$1:" -F '#{pane_dead} #{pane_pid} #{window_activity}' 2>/dev/null | head -n1 || true
+}
+
+alive() {
+  local info
+  info="$(pane_info "$1")"
+  [[ -n $info && ${info%% *} == 0 ]]
+}
+
+claude_config_dir() {
+  local name="$1" d
+  d="$(meta "$name" | jq -r '.env.CLAUDE_CONFIG_DIR // empty')"
+  printf '%s' "${d:-${CLAUDE_CONFIG_DIR:-$HOME/.claude}}"
+}
+
+# The transcript of claude session id $2 for session $1, if one is written.
+transcript() {
+  local name="$1" sid="$2" f
+  f="$(jq -r --arg s "$sid" 'select(.session_id == $s) | .transcript_path // empty' "$(sdir "$name")/session.json" 2>/dev/null || true)"
+  [[ -n $f && -f $f ]] && { printf '%s' "$f"; return 0; }
+  [[ -n $sid ]] || return 0
+  for f in "$(claude_config_dir "$name")"/projects/*/"$sid".jsonl; do
+    [[ -f $f ]] && { printf '%s' "$f"; return 0; }
+  done
+  return 0
+}
+
+# Is command $1 claude (or a wrapper named *-claude that takes its flags)?
+is_claude() {
+  [[ $(basename -- "$1") == claude || $(basename -- "$1") == *-claude ]]
+}
+
+# The session id claude args "$@" name (--session-id or --resume), if any.
+claude_sid() {
+  local prev=""
+  for a in "$@"; do
+    case $prev in --session-id | --resume | -r) printf '%s' "$a"; return 0 ;; esac
+    case $a in --session-id=* | --resume=*) printf '%s' "${a#*=}"; return 0 ;; esac
+    prev="$a"
+  done
+  return 0
+}
+
+has_arg() {
+  local want="$1" a
+  shift
+  for a in "$@"; do
+    [[ $a == "$want" || $a == "$want="* ]] && return 0
+  done
+  return 1
+}
+
+# The --settings a claude session gets: hooks that call `devbox-run _hook`.
+hook_settings() {
+  local name="$1" ev
+  local -A events=([SessionStart]=session [UserPromptSubmit]=prompt [Stop]=stop [Notification]=notice)
+  for ev in "${!events[@]}"; do
+    jq -n --arg ev "$ev" --arg c "$(printf '%q _hook %q %q' "$SELF" "$name" "${events[$ev]}")" \
+      '{($ev): [{hooks: [{type: "command", command: $c, timeout: 10}]}]}'
+  done | jq -s '{hooks: add}'
+}
+
+# A hook, inside claude: event JSON on stdin. Writes facts, prints nothing
+# (SessionStart and UserPromptSubmit output would reach the model) and never
+# fails the session.
+cmd_hook() {
+  local name="$1" what="$2" d in t
+  d="$(sdir "$name")"
+  [[ -d $d ]] || exit 0
+  in="$(cat)"
+  t="$(now_iso)"
+  {
+    case $what in
+      session)
+        jq -c --arg t "$t" '{session_id, transcript_path, source, at: $t}' <<<"$in" >"$d/session.json.tmp" &&
+          mv "$d/session.json.tmp" "$d/session.json"
+        meta_set "$name" '.session_id = $s' --arg s "$(jq -r '.session_id // empty' <<<"$in")"
+        ;;
+      prompt)
+        jq -n --arg t "$t" '{turn: "working", at: $t}' >"$d/turn.json"
+        rm -f "$d/notice.json"
+        ;;
+      stop) jq -n --arg t "$t" '{turn: "done", at: $t}' >"$d/turn.json" ;;
+      notice) jq -c --arg t "$t" '{message: (.message // ""), at: $t}' <<<"$in" >"$d/notice.json" ;;
+    esac
+  } >/dev/null 2>&1 || true
+  exit 0
+}
+
+# Its input without the trailing blank rows of a screen.
+drop_blank_tail() {
+  sed -e :a -e '/^[[:space:]]*\n*$/{$d;N;ba' -e '}'
+}
+
+# What the pane shows that blocks typing: trust, permission, limit, or empty.
+pane_dialog() {
+  local screen
+  screen="$(tm capture-pane -p -t "=$1:" 2>/dev/null | drop_blank_tail | tail -n 25)" || return 0
+  case $screen in
+    *"trust this folder"* | *"Quick safety check"* | *"trust the files"* | *"Do you trust"*) printf trust ;;
+    *"Do you want to proceed?"* | *"Do you want to make this edit"* | *"Do you want to create"* | *"Do you want to allow"*) printf permission ;;
+    *"usage limit"* | *"limit reached"* | *"Limit reached"*) printf limit ;;
+  esac
+}
+
+# Starts the pane for session $1 from its cmd/env files. $2 = "prompt" to
+# send the stored prompt (a first start), "note" the stored note (a resume).
+# A non-claude command gets it as its last argument. A claude session gets it
+# typed in, as say does, once claude is ready: given as an argument, claude
+# drops it when the folder-trust dialog comes first (dev-lanvera, 2026-11-23).
+launch() {
+  local name="$1" extra="${2:-}" d dir first
+  d="$(sdir "$name")"
+  dir="$(meta "$name" | jq -r .dir)"
+  [[ -d $dir ]] || die "$name: its directory $dir is gone"
+  rm -f "$d/exit.json" "$d/pending"
+  first="$(head -z -n1 "$d/cmd.run" | tr -d '\0')"
+  if is_claude "$first"; then
+    case $extra in
+      prompt) [[ -s $d/prompt ]] && cp "$d/prompt" "$d/pending" ;;
+      note) [[ -s $d/note ]] && cp "$d/note" "$d/pending" ;;
+    esac
+    extra=""
+  fi
+  printf '%s' "$extra" >"$d/extra"
+  tm kill-session -t "=$name:" 2>/dev/null || true
+  # A login shell, so the pane gets the box user's PATH (profile.d) whoever
+  # started the tmux server.
+  tm new-session -d -s "$name" -x "$COLS" -y "$ROWS" -c "$dir" \
+    bash -lc 'exec "$0" _exec "$1"' "$SELF" "$name"
+  meta_set "$name" '.state = "running" | .started_at = $t | .runs += 1' --arg t "$(now_iso)"
+  if [[ -f $d/pending || $(meta "$name" | jq -r '.trust // false') == true ]]; then
+    ready_watch "$name"
+  fi
+  return 0
+}
+
+# Answers claude's folder-trust dialog with its trust choice ("Yes, I trust
+# this folder", or "Yes, proceed" on older versions), wherever the cursor
+# starts: Down until that line carries the cursor, then Enter.
+answer_trust() {
+  local name="$1" i line
+  for ((i = 0; i < 4; i++)); do
+    line="$(tm capture-pane -p -t "=$name:" 2>/dev/null | grep -E 'Yes, (I trust|proceed)' | head -n1)"
+    [[ -n $line ]] || return 1
+    if [[ $line =~ ^[[:space:]]*(❯|›|>) ]]; then
+      tm send-keys -t "=$name:" Enter
+      return 0
+    fi
+    tm send-keys -t "=$name:" Down
+    sleep 0.3
+  done
+  return 1
+}
+
+# In the background for up to 5 minutes after a launch, so start returns at
+# once: answers the trust dialog (with --trust), then, once claude is ready
+# (its SessionStart hook ran, when it has the runner's hooks, and no dialog
+# shows twice in a row), types the pending prompt or note in. Without --trust
+# a trust dialog waits for whoever answers it (keys, attach); the prompt
+# follows. status shows prompt_pending until it went in.
+ready_watch() {
+  local name="$1"
+  (
+    d="$(sdir "$name")"
+    trust="$(meta "$name" | jq -r '.trust // false')"
+    clear=0
+    for ((i = 0; i < 600; i++)); do
+      sleep 0.5
+      alive "$name" || exit 0
+      dialog="$(pane_dialog "$name")"
+      if [[ $dialog == trust && $trust == true ]]; then
+        answer_trust "$name" || true
+        clear=0
+        continue
+      fi
+      if [[ -n $dialog ]]; then clear=0; continue; fi
+      [[ -f $d/pending ]] || exit 0
+      if [[ -f $d/settings.json && ! -f $d/session.json ]]; then continue; fi
+      clear=$((clear + 1))
+      ((clear >= 3)) || continue
+      lock "$name"
+      paste_text "$name" "$(<"$d/pending")"
+      rm -f "$d/pending"
+      exit 0
+    done
+  ) </dev/null >/dev/null 2>&1 9>&- &
+  disown
+}
+
+# Types text $2 into session $1: one bracketed paste (claude takes a
+# multi-line message as one, and newlines don't submit it early), then Enter
+# once the TUI has taken the paste.
+paste_text() {
+  local name="$1"
+  printf '%s' "$2" | tm load-buffer -b "say-$name" -
+  tm paste-buffer -p -d -b "say-$name" -t "=$name:"
+  sleep 0.3
+  tm send-keys -t "=$name:" Enter
+}
+
+# Inside the pane: runs the session's command, then records how it ended.
+cmd_exec() {
+  local name="$1" d code dir
+  d="$(sdir "$name")"
+  dir="$(jq -r .dir "$d/meta.json")"
+  cd -- "$dir"
+  # A runner started from inside a Claude Code session (a coordinator) must
+  # not hand its markers on: claude refuses to start nested in another.
+  unset CLAUDECODE CLAUDE_CODE_ENTRYPOINT CLAUDE_CODE_SSE_PORT TMUX TMUX_PANE
+  local -a cmd envs
+  mapfile -d '' -t envs <"$d/env"
+  ((${#envs[@]})) && export "${envs[@]}"
+  mapfile -d '' -t cmd <"$d/cmd.run"
+  case $(<"$d/extra") in
+    prompt) [[ -f $d/prompt ]] && cmd+=("$(<"$d/prompt")") ;;
+    note) [[ -s $d/note ]] && cmd+=("$(<"$d/note")") ;;
+  esac
+  set +e
+  "${cmd[@]}"
+  code=$?
+  set -e
+  jq -n --argjson c "$code" --arg t "$(now_iso)" '{exit_code: $c, ended_at: $t}' >"$d/exit.json"
+  exit "$code"
+}
+
+# Default branch of repo $1's origin, else its current branch.
+default_base() {
+  local ref
+  if ref="$(git -C "$1" symbolic-ref -q --short refs/remotes/origin/HEAD 2>/dev/null)"; then
+    printf '%s' "${ref#origin/}"
+  else
+    git -C "$1" symbolic-ref -q --short HEAD || die "$1: no origin HEAD and a detached HEAD; pass --base"
+  fi
+}
+
+# Makes (or reuses) worktree $4 of repo $1 on branch $2, branched from base $3.
+make_worktree() {
+  local repo="$1" branch="$2" base="$3" dir="$4" have
+  if [[ -e $dir ]]; then
+    have="$(git -C "$dir" symbolic-ref -q --short HEAD 2>/dev/null)" ||
+      die "$dir exists and isn't a worktree on a branch"
+    [[ $have == "$branch" ]] || die "$dir exists on branch $have, not $branch"
+    return 0
+  fi
+  mkdir -p "$(dirname "$dir")"
+  timeout 60 git -C "$repo" fetch -q origin "$base" "$branch" 2>/dev/null ||
+    timeout 60 git -C "$repo" fetch -q origin "$base" 2>/dev/null || true
+  if git -C "$repo" show-ref -q --verify "refs/heads/$branch"; then
+    git -C "$repo" worktree add -q "$dir" "$branch" >&2
+  elif git -C "$repo" show-ref -q --verify "refs/remotes/origin/$branch"; then
+    git -C "$repo" worktree add -q --track -b "$branch" "$dir" "origin/$branch" >&2
+  else
+    local from="$base"
+    git -C "$repo" show-ref -q --verify "refs/remotes/origin/$base" && from="origin/$base"
+    git -C "$repo" worktree add -q --no-track -b "$branch" "$dir" "$from" >&2
+  fi
+}
+
+cmd_start() {
+  local name="" dir="" repo="" branch="" base="" prompt="" prompt_file="" sid="" trust="" d
+  local -a envs=() cmd=()
+  while (($#)); do
+    case $1 in
+      --dir) dir="${2:?--dir needs a path}"; shift 2 ;;
+      --repo) repo="${2:?--repo needs a path}"; shift 2 ;;
+      --branch) branch="${2:?--branch needs a name}"; shift 2 ;;
+      --base) base="${2:?--base needs a branch}"; shift 2 ;;
+      --env)
+        [[ ${2:-} =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] || die "--env wants K=V, got '${2:-}'"
+        envs+=("$2"); shift 2 ;;
+      --prompt) prompt="${2?--prompt needs text}"; shift 2 ;;
+      --prompt-file) prompt_file="${2:?--prompt-file needs a file}"; shift 2 ;;
+      --trust) trust=1; shift ;;
+      --) shift; cmd=("$@"); break ;;
+      -*) fail 2 "start: unknown option $1" ;;
+      *) [[ -z $name ]] || fail 2 "start: one name only (got $name and $1)"; name="$1"; shift ;;
+    esac
+  done
+  [[ -n $name ]] || fail 2 "start: no name"
+  check_name "$name"
+  ((${#cmd[@]})) || fail 2 "start: no command after --"
+  [[ -n $dir || -n $repo ]] || fail 2 "start: --dir or --repo"
+  [[ -z $prompt || -z $prompt_file ]] || fail 2 "start: --prompt or --prompt-file, not both"
+  [[ -z $prompt_file || -r $prompt_file ]] || fail 2 "start: can't read $prompt_file"
+
+  tmux_conf
+  lock "$name"
+  if alive "$name"; then
+    status_json "$name" | jq '.sessions[0]'
+    fail 4 "$name is running; stop it first, or resume it"
+  fi
+
+  if [[ -n $repo ]]; then
+    repo="$(cd -- "$repo" && git rev-parse --show-toplevel)" || die "--repo $repo isn't a git checkout"
+    branch="${branch:-$name}"
+    base="${base:-$(default_base "$repo")}"
+    dir="${dir:-$(dirname "$repo")/.worktrees/$(basename "$repo")-$name}"
+    make_worktree "$repo" "$branch" "$base" "$dir"
+  fi
+  [[ -d $dir ]] || die "--dir $dir isn't a directory"
+  dir="$(cd -- "$dir" && pwd -P)"
+
+  d="$(sdir "$name")"
+  if is_claude "${cmd[0]}"; then
+    sid="$(claude_sid "${cmd[@]:1}")"
+    if [[ -z $sid ]] && ! has_arg --continue "${cmd[@]:1}" && ! has_arg -c "${cmd[@]:1}"; then
+      sid="$(cat /proc/sys/kernel/random/uuid)"
+      cmd=("${cmd[0]}" --session-id "$sid" "${cmd[@]:1}")
+    fi
+    if has_arg --settings "${cmd[@]:1}"; then
+      printf 'devbox-run: %s passes its own --settings, so it gets no runner hooks (no turn or notice in status)\n' "$name" >&2
+    else
+      hook_settings "$name" >"$d/settings.json"
+      cmd=("${cmd[0]}" --settings "$d/settings.json" "${cmd[@]:1}")
+    fi
+  fi
+  # The caller's claude config root, unless --env names one: the pane's
+  # environment comes from the tmux server, not from this call.
+  if [[ -n ${CLAUDE_CONFIG_DIR:-} ]] && ! printf '%s\n' "${envs[@]}" | grep -q '^CLAUDE_CONFIG_DIR='; then
+    envs+=("CLAUDE_CONFIG_DIR=$CLAUDE_CONFIG_DIR")
+  fi
+
+  rm -f "$d/prompt" "$d/note" "$d/pr.json" "$d/exit.json" "$d/session.json" "$d/turn.json" "$d/notice.json"
+  if [[ -n $prompt_file ]]; then
+    cp -- "$prompt_file" "$d/prompt"
+  elif [[ -n $prompt ]]; then
+    printf '%s' "$prompt" >"$d/prompt"
+  fi
+  printf '%s\0' "${cmd[@]}" >"$d/cmd"
+  cp "$d/cmd" "$d/cmd.run"
+  : >"$d/env"
+  ((${#envs[@]})) && printf '%s\0' "${envs[@]}" >"$d/env"
+  chmod 600 "$d/env"
+
+  jq -n --arg name "$name" --arg dir "$dir" --arg repo "$repo" --arg branch "$branch" \
+    --arg base "$base" --arg sid "$sid" --arg t "$(now_iso)" --argjson trust "$([[ -n $trust ]] && echo true || echo false)" \
+    --argjson cmd "$(printf '%s\0' "${cmd[@]}" | jq -Rs 'split("\u0000")[:-1]')" \
+    --argjson env "$( ((${#envs[@]})) && printf '%s\0' "${envs[@]}" | jq -Rs 'split("\u0000")[:-1] | map(capture("^(?<k>[^=]+)=(?<v>.*)$"; "s")) | map({(.k): .v}) | add' || echo '{}')" \
+    '{name: $name, dir: $dir, repo: ($repo | if . == "" then null else . end), branch: ($branch | if . == "" then null else . end),
+      base: ($base | if . == "" then null else . end), command: $cmd, env: $env,
+      session_id: ($sid | if . == "" then null else . end), trust: $trust, created_at: $t, started_at: $t, state: "running", runs: 0}' \
+    >"$d/meta.json"
+  launch "$name" prompt
+  status_json "$name" | jq '.sessions[0]'
+}
+
+# Builds the resume command of a claude session: its original command with
+# --session-id/--resume/--continue taken out and --resume <sid> put in.
+resume_cmd() {
+  local name="$1" sid prev="" a
+  local -a orig out
+  mapfile -d '' -t orig <"$(sdir "$name")/cmd"
+  sid="$(meta "$name" | jq -r '.session_id // empty')"
+  out=("${orig[0]}")
+  for a in "${orig[@]:1}"; do
+    if [[ -n $prev ]]; then prev=""; continue; fi
+    case $a in
+      --session-id | --resume | -r) prev=1; continue ;;
+      --session-id=* | --resume=* | --continue | -c) continue ;;
+    esac
+    out+=("$a")
+  done
+  out+=(--resume "$sid")
+  printf '%s\0' "${out[@]}"
+}
+
+resume_one() {
+  local name="$1" note="${2:-}" d sid tr
+  need_session "$name"
+  tmux_conf
+  lock "$name"
+  if alive "$name"; then
+    printf 'devbox-run: %s is already running\n' "$name" >&2
+    return 0
+  fi
+  d="$(sdir "$name")"
+  local -a first
+  mapfile -d '' -t first <"$d/cmd"
+  sid="$(meta "$name" | jq -r '.session_id // empty')"
+  tr="$(transcript "$name" "$sid")"
+  printf '%s' "$note" >"$d/note"
+  if is_claude "${first[0]}" && [[ -n $tr ]]; then
+    # cmd stays the record of how it first started; the pane runs cmd.run.
+    resume_cmd "$name" >"$d/cmd.run"
+    launch "$name" note
+  else
+    # Nothing to resume (not claude, or no transcript yet): start it again as
+    # it first started, prompt included.
+    cp "$d/cmd" "$d/cmd.run"
+    launch "$name" prompt
+  fi
+}
+
+cmd_resume() {
+  local all="" note="" name=""
+  while (($#)); do
+    case $1 in
+      --all) all=1; shift ;;
+      --note) note="${2?--note needs text}"; shift 2 ;;
+      -*) fail 2 "resume: unknown option $1" ;;
+      *) name="$1"; shift ;;
+    esac
+  done
+  if [[ -n $all ]]; then
+    [[ -z $name ]] || fail 2 "resume: a name or --all, not both"
+    local m n
+    for m in "$STATE_ROOT"/*/meta.json; do
+      [[ -f $m ]] || continue
+      [[ $(jq -r .state "$m") == stopped ]] && continue
+      n="$(jq -r .name "$m")"
+      alive "$n" && continue
+      ( resume_one "$n" "$note" ) && printf 'resumed %s\n' "$n"
+    done
+    return 0
+  fi
+  [[ -n $name ]] || fail 2 "resume: a name or --all"
+  resume_one "$name" "$note"
+  status_json "$name" | jq '.sessions[0]'
+}
+
+# The race this avoids: the pane must exist and run before the paste.
+cmd_say() {
+  local name="${1:-}" text force="" dialog i
+  [[ -n $name ]] || fail 2 "say: no name"
+  shift
+  [[ ${1:-} == --force ]] && { force=1; shift; }
+  need_session "$name"
+  alive "$name" || fail 5 "$name isn't running (resume it first)"
+  # The first prompt goes in before anything said: wait up to 30 s for it,
+  # before the lock, which the watcher typing it needs.
+  for ((i = 0; i < 60; i++)); do
+    [[ -f $(sdir "$name")/pending ]] || break
+    sleep 0.5
+  done
+  [[ ! -f $(sdir "$name")/pending || -n $force ]] ||
+    fail 5 "$name hasn't taken its first prompt yet ($(pane_dialog "$name") dialog?); answer it or say --force"
+  lock "$name"
+  # A claude session takes typing once its SessionStart hook ran: before it,
+  # bracketed paste may not be on yet and a newline would submit early.
+  if [[ -f $(sdir "$name")/settings.json ]]; then
+    for ((i = 0; i < 60; i++)); do
+      [[ -f $(sdir "$name")/session.json ]] && break
+      sleep 0.5
+    done
+  fi
+  dialog="$(pane_dialog "$name")"
+  [[ -z $dialog || -n $force ]] || fail 5 "$name shows a $dialog dialog; answer it (devbox-run keys, attach) or say --force"
+  if [[ ${1:-} == - && $# == 1 ]]; then
+    text="$(cat)"
+  else
+    text="$*"
+  fi
+  [[ -n ${text//[[:space:]]/} ]] || die "say: nothing to say"
+  paste_text "$name" "$text"
+}
+
+# Raw tmux keys into the pane (Enter, Down, 1, Escape...): how a caller
+# answers a dialog.
+cmd_keys() {
+  local name="${1:-}"
+  [[ -n $name ]] || fail 2 "keys: no name"
+  shift
+  (($#)) || fail 2 "keys: no keys"
+  need_session "$name"
+  alive "$name" || fail 5 "$name isn't running"
+  tm send-keys -t "=$name:" "$@"
+}
+
+render_transcript() {
+  jq -r 'select(.type == "user" or .type == "assistant")
+    | (.message.content) as $c
+    | (if ($c | type) == "string" then $c
+       else ([$c[]? | select(.type == "text") | .text] | join("\n")) end) as $t
+    | select($t != "")
+    | "[\(.type)] \($t)"' "$1"
+}
+
+cmd_log() {
+  local name="" lines=200 mode=pane sid tr
+  while (($#)); do
+    case $1 in
+      --lines) lines="${2:?--lines needs a number}"; shift 2 ;;
+      --transcript) mode=transcript; shift ;;
+      -*) fail 2 "log: unknown option $1" ;;
+      *) name="$1"; shift ;;
+    esac
+  done
+  [[ -n $name ]] || fail 2 "log: no name"
+  [[ $lines =~ ^[0-9]+$ ]] || die "--lines wants a number"
+  need_session "$name"
+  if [[ $mode == pane && -n $(pane_info "$name") ]]; then
+    # Trailing blank rows of the screen dropped.
+    tm capture-pane -p -J -t "=$name:" -S - | drop_blank_tail | tail -n "$lines"
+    return 0
+  fi
+  sid="$(meta "$name" | jq -r '.session_id // empty')"
+  tr="$(transcript "$name" "$sid")"
+  [[ -n $tr ]] || die "$name: no pane (box restarted?) and no transcript"
+  render_transcript "$tr" | tail -n "$lines"
+}
+
+# Git facts of directory $1 with base $2, as JSON, or null.
+git_json() {
+  local dir="$1" base="$2" branch head dirty upstream="" pushed=false ahead=null behind=null ref counts
+  git -C "$dir" rev-parse --is-inside-work-tree &>/dev/null || { echo null; return; }
+  branch="$(git -C "$dir" symbolic-ref -q --short HEAD 2>/dev/null || true)"
+  head="$(git -C "$dir" rev-parse -q --verify HEAD 2>/dev/null || true)"
+  dirty="$(git -C "$dir" status --porcelain 2>/dev/null | wc -l)"
+  if upstream="$(git -C "$dir" rev-parse -q --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null)"; then
+    [[ $(git -C "$dir" rev-parse -q --verify '@{u}' 2>/dev/null) == "$head" ]] && pushed=true
+  else
+    upstream=""
+  fi
+  if [[ -n $base && -n $head ]]; then
+    ref="$base"
+    git -C "$dir" rev-parse -q --verify "refs/remotes/origin/$base" &>/dev/null && ref="origin/$base"
+    if counts="$(git -C "$dir" rev-list --left-right --count "$ref...HEAD" 2>/dev/null)"; then
+      behind="${counts%%[[:space:]]*}"
+      ahead="${counts##*[[:space:]]}"
+    fi
+  fi
+  jq -n --arg branch "$branch" --arg head "$head" --arg base "$base" --argjson dirty "$dirty" \
+    --arg upstream "$upstream" --argjson pushed "$pushed" --argjson ahead "$ahead" --argjson behind "$behind" \
+    '{branch: ($branch | if . == "" then null else . end), head: ($head | if . == "" then null else . end), base: ($base | if . == "" then null else . end),
+      ahead: $ahead, behind: $behind, dirty: $dirty, upstream: ($upstream | if . == "" then null else . end), pushed: $pushed}
+     | with_entries(.value //= null) | .pushed = $pushed'
+}
+
+# The forge's pull request for branch $3 in directory $2 of session $1:
+# JSON object, null when there is none, {"error": ...} when the call failed.
+# Cached PR_CACHE_S seconds per branch.
+pr_json() {
+  local name="$1" dir="$2" branch="$3" cache url host out err now
+  cache="$(sdir "$name")/pr.json"
+  now="$(date +%s)"
+  if [[ -f $cache ]] && jq -e --arg b "$branch" --argjson now "$now" --argjson ttl "$PR_CACHE_S" \
+    '.branch == $b and ($now - .at) < $ttl' "$cache" &>/dev/null; then
+    jq -c .pr "$cache"
+    return
+  fi
+  url="$(git -C "$dir" remote get-url origin 2>/dev/null || true)"
+  if [[ -z $url ]]; then
+    out=null
+  elif [[ $url =~ dev\.azure\.com|visualstudio\.com ]]; then
+    if out="$(cd -- "$dir" && timeout 30 az repos pr list --detect true --source-branch "$branch" \
+      --status all --top 1 -o json 2>&1)"; then
+      out="$(jq -c '.[0] // null | if . == null then null else
+        {number: .pullRequestId,
+         url: "\(.repository.webUrl)/pullrequest/\(.pullRequestId)",
+         state: ({active: "open", completed: "merged", abandoned: "closed"}[.status] // .status),
+         draft: (.isDraft // false),
+         review: ([.reviewers[]?.vote] as $v
+           | if any($v[]; . < 0) then "CHANGES_REQUESTED"
+             elif any($v[]; . >= 5) then "APPROVED" else null end)} end' <<<"$out")"
+    else
+      out="$(jq -cn --arg e "${out:0:300}" '{error: $e}')"
+    fi
+  else
+    # github.com, or a GitHub Enterprise host named by the remote.
+    host="$(sed -E 's#^(https?://|ssh://)?([^@/]*@)?([^/:]+).*#\3#' <<<"$url")"
+    local -a ghenv=()
+    [[ $host == github.com ]] || ghenv=(GH_HOST="$host")
+    if out="$(cd -- "$dir" && env "${ghenv[@]}" timeout 30 gh pr view "$branch" \
+      --json number,url,state,isDraft,reviewDecision 2>&1)"; then
+      out="$(jq -c '{number, url, state: (.state | ascii_downcase), draft: .isDraft,
+        review: (.reviewDecision | if . == "" then null else . end)}' <<<"$out")"
+    elif [[ $out == *"no pull requests found"* ]]; then
+      out=null
+    else
+      err="${out:0:300}"
+      out="$(jq -cn --arg e "$err" '{error: $e}')"
+    fi
+  fi
+  if ! jq -e 'type == "object" and has("error")' <<<"$out" &>/dev/null; then
+    jq -n --arg b "$branch" --argjson at "$now" --argjson pr "$out" '{branch: $b, at: $at, pr: $pr}' >"$cache"
+  fi
+  printf '%s\n' "$out"
+}
+
+# One session's status object.
+session_json() {
+  local name="$1" with_pr="$2" d m info dead="" pid="" act="" alive=false sid tr tr_at="" last_turn="" git pr=null
+  d="$(sdir "$name")"
+  m="$(meta "$name")"
+  info="$(pane_info "$name")"
+  if [[ -n $info ]]; then
+    read -r dead pid act <<<"$info"
+    [[ $dead == 0 ]] && alive=true
+  fi
+  sid="$(jq -r '.session_id // empty' <<<"$m")"
+  tr="$(transcript "$name" "$sid")"
+  if [[ -f $d/turn.json ]]; then
+    last_turn="$(jq -r 'if .turn == "done" then "assistant_done" else "working" end' "$d/turn.json")"
+  fi
+  if [[ -n $tr ]]; then
+    tr_at="$(epoch_iso "$(stat -c %Y "$tr")")"
+  fi
+  if [[ -n $tr && -z $last_turn ]]; then
+    # No hook (its own --settings): the last user/assistant entry. An
+    # assistant turn with no tool call is claude waiting at its prompt.
+    last_turn="$(tac "$tr" | jq -rn 'first(inputs | select(.type == "user" or .type == "assistant"))
+      | if .type == "assistant" and ([.message.content[]? | select(.type == "tool_use")] | length) == 0
+        then "assistant_done" else "working" end' 2>/dev/null || true)"
+  fi
+  local dialog=""
+  [[ $alive == true ]] && dialog="$(pane_dialog "$name")"
+  git="$(git_json "$(jq -r .dir <<<"$m")" "$(jq -r '.base // empty' <<<"$m")")"
+  if [[ -n $with_pr ]]; then
+    local branch
+    branch="$(jq -r '.branch // empty' <<<"$git")"
+    [[ -n $branch ]] && pr="$(pr_json "$name" "$(jq -r .dir <<<"$m")" "$branch")"
+  fi
+  jq -c --argjson alive "$alive" --arg pid "$([[ $alive == true ]] && printf '%s' "$pid")" \
+    --arg act "$([[ -n $act ]] && epoch_iso "$act")" --arg tr "$tr" --arg tr_at "$tr_at" \
+    --arg last_turn "$last_turn" --argjson git "$git" --argjson pr "$pr" --arg with_pr "$with_pr" \
+    --argjson exit "$(cat "$d/exit.json" 2>/dev/null || echo '{}')" \
+    --argjson notice "$(cat "$d/notice.json" 2>/dev/null || echo null)" --arg dialog "$dialog" \
+    --argjson pending "$([[ -f $d/pending ]] && echo true || echo false)" \
+    '{name, alive: $alive,
+      state: (if .state == "stopped" then "stopped" elif $alive then "running"
+              elif $exit.exit_code != null then "exited" else "lost" end),
+      pid: ($pid | if . == "" then null else tonumber end),
+      dir, repo, branch, base, command, started_at, created_at, runs,
+      ended_at: (if $alive then null else $exit.ended_at end),
+      exit_code: (if $alive then null else $exit.exit_code end),
+      last_output_at: ($act | if . == "" then null else . end),
+      session_id, transcript: ($tr | if . == "" then null else . end), transcript_at: ($tr_at | if . == "" then null else . end),
+      prompt_pending: $pending,
+      last_turn: ($last_turn | if . == "" then null else . end), dialog: ($dialog | if . == "" then null else . end),
+      notice: $notice, git: $git}
+     | with_entries(.value //= null)
+     | .alive = $alive | .prompt_pending = $pending
+     | if $with_pr != "" then .pr = $pr else . end' <<<"$m"
+}
+
+status_json() {
+  local with_pr="" n m
+  local -a names=()
+  while (($#)); do
+    case $1 in
+      --pr) with_pr=1; shift ;;
+      --json) shift ;;
+      -*) fail 2 "status: unknown option $1" ;;
+      *) need_session "$1"; names+=("$1"); shift ;;
+    esac
+  done
+  if ((${#names[@]} == 0)); then
+    for m in "$STATE_ROOT"/*/meta.json; do
+      [[ -f $m ]] && names+=("$(jq -r .name "$m")")
+    done
+  fi
+  {
+    for n in "${names[@]}"; do session_json "$n" "$with_pr"; done
+  } | jq -s --argjson v "$SCHEMA" '{schema: $v, sessions: .}'
+}
+
+cmd_list() {
+  status_json | jq -r '["NAME", "STATE", "BRANCH", "LAST_OUTPUT", "DIR"],
+    (.sessions[] | [.name, .state, (.git.branch // "-"), (.last_output_at // "-"), .dir]) | @tsv' |
+    if command -v column >/dev/null; then column -t -s $'\t'; else cat; fi
+}
+
+cmd_stop() {
+  local name="${1:-}"
+  [[ -n $name ]] || fail 2 "stop: no name"
+  need_session "$name"
+  lock "$name"
+  tm kill-session -t "=$name:" 2>/dev/null || true
+  meta_set "$name" '.state = "stopped" | .stopped_at = $t' --arg t "$(now_iso)"
+}
+
+cmd_forget() {
+  local name="${1:-}"
+  [[ -n $name ]] || fail 2 "forget: no name"
+  need_session "$name"
+  alive "$name" && die "$name is running; stop it first"
+  tm kill-session -t "=$name:" 2>/dev/null || true
+  rm -rf -- "$(sdir "$name")"
+}
+
+cmd_attach() {
+  local name="${1:-}"
+  [[ -n $name ]] || fail 2 "attach: no name"
+  need_session "$name"
+  [[ -n $(pane_info "$name") ]] || die "$name has no pane (resume it first)"
+  exec tmux -L "$SOCKET" attach -t "=$name:"
+}
+
+verb="${1:-}"
+(($#)) && shift
+case $verb in
+  start) cmd_start "$@" ;;
+  status) status_json "$@" ;;
+  log) cmd_log "$@" ;;
+  say) cmd_say "$@" ;;
+  keys) cmd_keys "$@" ;;
+  _hook) cmd_hook "$@" ;;
+  resume) cmd_resume "$@" ;;
+  stop) cmd_stop "$@" ;;
+  forget) cmd_forget "$@" ;;
+  attach) cmd_attach "$@" ;;
+  list) cmd_list ;;
+  _exec) cmd_exec "$@" ;;
+  -h | --help | help | "") usage ;;
+  *) fail 2 "unknown verb $verb (devbox-run help)" ;;
+esac

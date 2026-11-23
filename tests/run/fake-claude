@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+# A stand-in for claude, for bin/devbox-check's run section: takes the flags
+# devbox-run passes, runs the runner's hooks from --settings as claude would,
+# writes a transcript, answers each submitted message with "got: <message>"
+# and exits 7 on "exit". With FAKE_TRUST set it first shows claude's
+# folder-trust dialog, cursor on "No, exit" (exits 1 when that is chosen), as
+# claude 2.x does, after its SessionStart hook (the order that loses an
+# argument prompt).
+set -uo pipefail
+sid="" settings="" resume="" prompt=""
+while (($#)); do
+  case $1 in
+    --session-id) sid="$2"; shift 2 ;;
+    --resume) resume="$2"; sid="$2"; shift 2 ;;
+    --settings) settings="$2"; shift 2 ;;
+    --model) shift 2 ;;
+    -*) shift ;;
+    *) prompt="$1"; shift ;;
+  esac
+done
+cfg="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+tr="$cfg/projects/$(pwd | tr -c 'A-Za-z0-9\n' -)/$sid.jsonl"
+mkdir -p "$(dirname "$tr")"
+hook() {
+  [[ -n $settings ]] || return 0
+  local c
+  c="$(jq -r --arg e "$1" '.hooks[$e][0].hooks[0].command' "$settings")"
+  jq -nc --arg s "$sid" --arg t "$tr" '{session_id: $s, transcript_path: $t, source: "startup"}' | bash -c "$c"
+}
+entry() {
+  jq -nc --arg ty "$1" --arg tx "$2" '{type: $ty, message: {role: $ty, content: [{type: "text", text: $tx}]}}' >>"$tr"
+}
+turn() {
+  hook UserPromptSubmit
+  entry user "$1"
+  printf 'got: %s\n' "$1"
+  entry assistant "reply to: $1"
+  hook Stop
+}
+hook SessionStart
+banner() {
+  printf 'fake claude resume=%s FOO=%s CLAUDECODE=%s\n' "${resume:-no}" "${FOO:-}" "${CLAUDECODE:-unset}"
+}
+if [[ -n ${FAKE_TRUST:-} ]]; then
+  sel=1
+  draw() {
+    printf '\e[2J\e[H Quick safety check: Is this a project you created or one you trust?\n'
+    if ((sel == 1)); then printf ' ❯ 1. No, exit\n   2. Yes, I trust this folder\n'; else printf '   1. No, exit\n ❯ 2. Yes, I trust this folder\n'; fi
+  }
+  draw
+  keys=""
+  while IFS= read -r -N1 c; do
+    keys+="$c"
+    if [[ $keys == *$'\e[B' ]]; then sel=2; keys=""; draw; continue; fi
+    if [[ $keys == *$'\e[A' ]]; then sel=1; keys=""; draw; continue; fi
+    if [[ $c == $'\r' || $c == $'\n' ]]; then
+      ((sel == 2)) || exit 1
+      printf '\e[2J\e[H'
+      break
+    fi
+  done
+  # Like claude: an argument prompt is gone after the dialog.
+  prompt=""
+fi
+banner
+[[ -n $prompt ]] && turn "$prompt"
+printf '\e[?2004h'
+buf="" inpaste=0
+while IFS= read -r -N1 c; do
+  buf+="$c"
+  if [[ $buf == *$'\e[200~' ]]; then buf="${buf%$'\e[200~'}"; inpaste=1; continue; fi
+  if [[ $buf == *$'\e[201~' ]]; then buf="${buf%$'\e[201~'}"; inpaste=0; continue; fi
+  if [[ ($c == $'\r' || $c == $'\n') && $inpaste == 0 ]]; then
+    msg="${buf%?}"
+    buf=""
+    [[ $msg == exit ]] && exit 7
+    turn "$(tr '\r' '\n' <<<"$msg")"
+  fi
+done
