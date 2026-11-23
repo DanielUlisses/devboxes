@@ -32,7 +32,7 @@ export LC_ALL=C # one collation for sort and comm
 # Installed by bootstrap, and by sync when missing; sync never removes them.
 # tree-sitter-cli builds nvim-treesitter's parsers (LazyVim otherwise fetches
 # it through mason on nvim's first start, racing the parser installs).
-BASE_PACKAGES=(base-devel git openssh sudo acl inotify-tools stow jq go-yq unzip less mise github-cli tailscale bash-completion starship zoxide neovim tree-sitter-cli ripgrep fd docker docker-buildx docker-compose)
+BASE_PACKAGES=(base-devel git openssh sudo acl inotify-tools stow jq go-yq unzip less mise github-cli tailscale bash-completion starship zoxide neovim tree-sitter-cli ripgrep fd docker docker-buildx docker-compose tmux)
 
 # A runner box's base packages instead: no developer tooling, but what a job
 # finds on PATH (git, ssh, curl, jq, gh, docker; op comes from mise) and
@@ -1997,6 +1997,7 @@ sync() {
     return
   fi
   sync_tools "$config"
+  run_link
   # Before the repos, so a failed clone doesn't hold back an identity change.
   if [[ -f $FINISHED ]]; then
     git_identity "$config"
@@ -2011,6 +2012,16 @@ sync() {
     die "synced, but some update steps failed (above)"
   fi
   say "synced"
+}
+
+# The runner (bin/devbox-run) on every devbox's PATH, for the box user, the
+# tk daemon and the coordinator alike. It uses tmux (a base package) and
+# nothing else of Herdr's.
+run_link() {
+  if [[ $(readlink /usr/local/bin/devbox-run 2>/dev/null) != "$ROOT/bin/devbox-run" ]]; then
+    ln -sfn "$ROOT/bin/devbox-run" /usr/local/bin/devbox-run
+    say "devbox-run: /usr/local/bin/devbox-run -> $ROOT/bin/devbox-run"
+  fi
 }
 
 gh_logged_in() {
