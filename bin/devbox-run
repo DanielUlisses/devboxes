@@ -177,7 +177,10 @@ hdir() {
 
 # A hook file of session $1 as JSON, or null (missing, or emptied).
 hook_json() {
-  jq -cs '.[0] // null' "$(hdir "$1")/$2" 2>/dev/null || echo null
+  local f
+  f="$(hdir "$1")/$2"
+  if [[ -r $f ]] && jq -cs '.[0] // null' "$f" 2>/dev/null; then return 0; fi
+  echo null
 }
 
 # Session $1's current claude session id: the SessionStart hook's (it follows
@@ -268,6 +271,42 @@ pane_dialog() {
   esac
 }
 
+# Is session $1 a claude session, and does it have the runner's hooks? From
+# meta, or for a session started by an older devbox-run (no such fields) from
+# its command and its settings.json.
+is_claude_session() {
+  local v
+  v="$(meta "$1" | jq -r '.claude // empty')"
+  [[ -n $v ]] || { is_claude "$(head -z -n1 "$(sdir "$1")/cmd" | tr -d '\0')" && v=true; }
+  [[ $v == true ]]
+}
+has_hooks() {
+  local v
+  v="$(meta "$1" | jq -r '.hooks // empty')"
+  [[ -n $v ]] || { [[ -f $(sdir "$1")/settings.json ]] && v=true; }
+  [[ $v == true ]]
+}
+
+# The hook verb of the devbox-run before hooks went inline: a session started
+# then still has settings.json calling it, so it stays, writing what the inline
+# hooks write. Prints nothing and never fails.
+cmd_hook() {
+  local name="$1" what="$2" d in t
+  d="$(sdir "$name")"
+  [[ -d $d ]] || exit 0
+  in="$(cat)"
+  t="$(now_iso)"
+  {
+    case $what in
+      session) jq -c --arg t "$t" '{session_id, transcript_path, source, at: $t}' <<<"$in" >"$d/session.json" ;;
+      prompt) jq -nc --arg t "$t" '{turn: "working", at: $t}' >"$d/turn.json"; : >"$d/notice.json" ;;
+      stop) jq -nc --arg t "$t" '{turn: "done", at: $t}' >"$d/turn.json" ;;
+      notice) jq -c --arg t "$t" '{message: (.message // ""), at: $t}' <<<"$in" >"$d/notice.json" ;;
+    esac
+  } >/dev/null 2>&1 || true
+  exit 0
+}
+
 agent_conf() {
   sed -n "s/^$1=//p" "$AGENT_CONF" | head -1
 }
@@ -321,8 +360,8 @@ launch() {
   dir="$(meta "$name" | jq -r .dir)"
   [[ -d $dir ]] || die "$name: its directory $dir is gone"
   rm -f "$d/exit.json" "$d/pending"
-  [[ $(meta "$name" | jq -r '.hooks // false') == true ]] && reset_hook_files "$name"
-  if [[ $(meta "$name" | jq -r '.claude // false') == true ]]; then
+  has_hooks "$name" && reset_hook_files "$name"
+  if is_claude_session "$name"; then
     case $extra in
       prompt) [[ -s $d/prompt ]] && cp "$d/prompt" "$d/pending" ;;
       note) [[ -s $d/note ]] && cp "$d/note" "$d/pending" ;;
@@ -383,7 +422,7 @@ ready_watch() {
       fi
       if [[ -n $dialog ]]; then clear=0; continue; fi
       [[ -f $d/pending ]] || exit 0
-      if [[ $(meta "$name" | jq -r '.hooks // false') == true && ! -s $(hdir "$name")/session.json ]]; then continue; fi
+      if has_hooks "$name" && [[ ! -s $(hdir "$name")/session.json ]]; then continue; fi
       clear=$((clear + 1))
       ((clear >= 3)) || continue
       lock "$name"
@@ -678,7 +717,7 @@ cmd_say() {
   lock "$name"
   # A claude session takes typing once its SessionStart hook ran: before it,
   # bracketed paste may not be on yet and a newline would submit early.
-  if [[ $(meta "$name" | jq -r '.hooks // false') == true ]]; then
+  if has_hooks "$name"; then
     for ((i = 0; i < 60; i++)); do
       [[ -s $(hdir "$name")/session.json ]] && break
       sleep 0.5
@@ -935,6 +974,7 @@ case $verb in
   log) cmd_log "$@" ;;
   say) cmd_say "$@" ;;
   keys) cmd_keys "$@" ;;
+  _hook) cmd_hook "$@" ;;
   resume) cmd_resume "$@" ;;
   stop) cmd_stop "$@" ;;
   forget) cmd_forget "$@" ;;
