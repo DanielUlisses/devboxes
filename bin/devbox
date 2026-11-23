@@ -1333,8 +1333,8 @@ maintenance() {
     df -h / /tmp | sed 's/^/  /'
     echo "Could go by hand, if not needed:"
     maintenance_sizes "$PACMAN_CACHE" /var/log/journal "$USER_HOME/.cache" "$USER_HOME/.npm" \
-      "$USER_HOME/.vscode-server" "$USER_HOME/.local/share/containers" "$USER_HOME/rescue" \
-      ${agent_home:+"$agent_home/.cache" "$agent_home/.npm" "$agent_home/.local/share/containers"}
+      "$USER_HOME/.vscode-server" "$USER_HOME/.local/share/containers" "$USER_HOME/go/pkg/mod" "$USER_HOME/rescue" \
+      ${agent_home:+"$agent_home/.cache" "$agent_home/.npm" "$agent_home/go/pkg/mod" "$agent_home/.local/share/containers"}
     echo "Finished-looking worktrees (clean, no stash, all pushed):"
     report_worktrees
     if command -v docker >/dev/null && docker info >/dev/null 2>&1; then

@@ -539,7 +539,7 @@ It deletes:
   Postgres. Named volumes stay.
 
 It only reports, for a person to act on: disk use, what is left of the pacman
-cache, the journal, tool caches (the agent user's too), Podman storage,
+cache, the journal, tool caches and Go module caches (the agent user's too), Podman storage,
 `~/rescue`, and worktrees that are clean, with no stash and every commit
 pushed. Pushed doesn't mean finished, so it never removes a worktree.
 
