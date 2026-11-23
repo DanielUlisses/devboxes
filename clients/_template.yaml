@@ -158,6 +158,20 @@ skills: []
 # remote_control: false
 # remote_control_tickets: false
 
+# Which ticket loop the box runs. old: Herdr, the tk daemon and ticket-skill's
+# board session, as before. short: ticket-skill's short loop, where the
+# project coordinator runs each board through devbox-run (tmux) and the slim
+# daemon (tk-slim, ticket-board's `install.sh daemon --slim`) reports the
+# boards marked `.scratch/<board>/loop` to tk-hub; tk-daemon is disabled, and
+# Herdr, its plugins and Ovis are no longer installed, updated or started (an
+# old agent still in Herdr keeps running until you stop it). Adopt every open
+# board (`loop.sh adopt`) before switching: tk-slim reports only short-loop
+# boards. Back to old reinstalls tk-daemon and disables tk-slim. Needs
+# ticket-board's main to have `--slim`. Devbox only. See ticket-board
+# docs/hub-next.md, Rollout.
+# Default: old.
+# loop: short
+
 # Ovis (github.com/devswha/ovis), the web client for herdr: chat and live
 # terminal for every agent pane, which tk-hub's agent pages open by deep link
 # (?machine=&ws=&pane=&view=terminal). `devbox finish` and `update` install it

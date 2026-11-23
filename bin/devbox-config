@@ -196,7 +196,7 @@ if . == null then {} else . end
   else
     unknown_keys(""; ["hostname", "host", "role", "claude_account", "git_name", "git_email", "resources", "packages", "tools", "skills",
                      "repos", "plugins", "timezone", "backup", "backup_schedule", "backup_keep", "runners", "tk_hub", "metrics",
-                     "remote_control", "remote_control_tickets", "skills_catalog", "agent_user", "agent_token_ref", "agent_tfc_token_ref", "ovis", "ovis_owner", "ovis_token_ref"]
+                     "remote_control", "remote_control_tickets", "loop", "skills_catalog", "agent_user", "agent_token_ref", "agent_tfc_token_ref", "ovis", "ovis_owner", "ovis_token_ref"]
                      + if $required then [] else ["runner_resources", "hub_resources"] end),
 
     (.hostname | str_match("hostname"; "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$";
@@ -331,6 +331,13 @@ if . == null then {} else . end
        then err("skills_catalog"; "allowed only when role is devbox (role is \($role))")
        else .skills_catalog | if . == null or type == "boolean" then empty
          else err("skills_catalog"; "must be true or false \(got)") end end),
+
+    # The ticket loop, on a devbox only.
+    ((.role // $default_role) as $role
+     | if $required and $role != "devbox" and .loop != null and .loop != "old"
+       then err("loop"; "allowed only when role is devbox (role is \($role))")
+       else .loop | if . == null or . == "old" or . == "short" then empty
+         else err("loop"; "must be old or short \(got)") end end),
 
     # Ticket agents as their own user, on a devbox only.
     ((.role // $default_role) as $role

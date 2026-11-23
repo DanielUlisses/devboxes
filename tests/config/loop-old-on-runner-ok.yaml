@@ -1,0 +1,6 @@
+# expect: ok
+role: runner
+runners:
+  org: example-org
+  labels: [homelab]
+loop: old

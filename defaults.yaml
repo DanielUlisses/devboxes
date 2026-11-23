@@ -83,6 +83,11 @@ metrics:
 remote_control: false
 remote_control_tickets: false
 
+# Which ticket loop the box runs: old (Herdr, tk-daemon, ticket-skill's board
+# session) or short (the short loop: devbox-run, tk-slim); see
+# clients/_template.yaml.
+loop: old
+
 # Ovis, the herdr web client tk-hub links to (see clients/_template.yaml).
 ovis: true
 # The Tailscale login Ovis lets in without a pairing code: empty here, set in
