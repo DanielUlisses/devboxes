@@ -125,6 +125,18 @@ MAINTENANCE_TMP_DAYS=3
 MAINTENANCE_IMAGE_HOURS=168
 # The last run's report, readable by the box user.
 MAINTENANCE_REPORT=$STATE/maintenance-report.txt
+# How much the systemd journal may keep (journald's own default is 10% of the
+# disk, up to 4G: 2.6G on a 40G devbox once).
+JOURNAL_CONF=/etc/systemd/journald.conf.d/devbox.conf
+JOURNAL_MAX=500M
+# Where self-updating CLIs keep a binary per version, relative to a home; each
+# update adds one (about 200M) and none deletes the old ones. Maintenance keeps
+# the newest MAINTENANCE_KEEP_VERSIONS and whatever ~/.local/bin links to.
+VERSION_DIRS=(.local/share/claude/versions .local/share/cursor-agent/versions)
+MAINTENANCE_KEEP_VERSIONS=2
+# Where pacman keeps the packages it downloaded; maintenance deletes the
+# versions no longer installed.
+PACMAN_CACHE=/var/cache/pacman/pkg
 # The last `devbox doctor` run's report, likewise.
 DOCTOR_REPORT=$STATE/doctor-report.txt
 # Daemons `devbox upgrade` restarts once pacman has replaced their binary.
@@ -294,8 +306,10 @@ Run inside a devbox.
              was replaced; sync schedules it daily (devbox-upgrade.timer) on
              every box, whatever the role
   maintenance
-             delete unused scratchpads and Docker images (and, on a runner box,
-             Docker volumes) and report what else could go; --dry-run deletes
+             delete unused scratchpads, Docker images, the agent user's
+             Podman images, pacman's cached old versions and old Claude and
+             cursor-agent versions (and, on a runner box, Docker volumes) and
+             report what else could go; --dry-run deletes
              nothing; sync schedules it (devbox-maintenance.timer) on every box,
              weekly, or nightly on a runner box
   doctor     check disks, /tmp, memory, OOM kills, services, timers and stale
@@ -1145,6 +1159,116 @@ clean_docker() {
   fi
 }
 
+# The pacman cache's packages whose version isn't installed: every version a
+# daily upgrade replaced, and packages since removed. Each installed version
+# stays, so a reinstall needs no download. `pacman -Sc` (CleanMethod
+# KeepInstalled, pacman's default) deletes them unless $1 is true.
+clean_pacman() {
+  local dry_run="$1" file base name version count=0 bytes=0
+  local -A installed=()
+  command -v pacman >/dev/null && [[ -d $PACMAN_CACHE ]] || { echo "  no pacman cache"; return 0; }
+  while read -r name version; do
+    installed[$name-$version]=1
+  done < <(pacman -Q)
+  shopt -s nullglob
+  for file in "$PACMAN_CACHE"/*.pkg.tar.*; do
+    [[ $file != *.sig ]] || continue
+    base="${file##*/}"
+    base="${base%.pkg.tar.*}"
+    [[ -z ${installed[${base%-*}]:-} ]] || continue
+    count=$((count + 1))
+    bytes=$((bytes + $(stat -c %s "$file")))
+  done
+  shopt -u nullglob
+  if ((count == 0)); then
+    echo "  nothing to delete"
+  elif [[ $dry_run == true ]]; then
+    printf '  would delete %s package(s), %s\n' "$count" "$(numfmt --to=iec "$bytes")"
+  elif pacman -Sc --noconfirm >/dev/null 2>&1; then
+    printf '  deleted %s package(s), %s\n' "$count" "$(numfmt --to=iec "$bytes")"
+  else
+    echo "  pacman -Sc failed (an upgrade holding its lock?); the next run tries again"
+  fi
+}
+
+# Old versions of the CLIs in VERSION_DIRS under home $2: all but the newest
+# MAINTENANCE_KEEP_VERSIONS, never one a link in $2/.local/bin points into
+# (the version running now). Deletes them unless $1 is true.
+clean_versions() {
+  local dry_run="$1" home="$2" rel dir entry link size
+  local -A current=()
+  shopt -s nullglob
+  for link in "$home"/.local/bin/*; do
+    [[ -L $link ]] && current[$(readlink -f "$link")]=1
+  done
+  for rel in "${VERSION_DIRS[@]}"; do
+    dir="$home/$rel"
+    [[ -d $dir && ! -L $dir ]] || continue
+    # Version names are plain, and ls -t sorts newest first.
+    # shellcheck disable=SC2012
+    while IFS= read -r entry; do
+      [[ -n $entry ]] || continue
+      entry="$dir/$entry"
+      [[ -z ${current[$(readlink -f "$entry")]:-} ]] || continue
+      # A link's target inside a version directory keeps that directory.
+      [[ -z $(printf '%s\n' "${!current[@]}" | grep -F "$entry/" | head -n1) ]] || continue
+      size="$(du -sh "$entry" 2>/dev/null | cut -f1)"
+      if [[ $dry_run == true ]]; then
+        printf '  would delete %s %s\n' "$size" "$entry"
+      else
+        rm -rf --one-file-system -- "$entry"
+        printf '  deleted %s %s\n' "$size" "$entry"
+      fi
+    done < <(ls -t "$dir" | tail -n +"$((MAINTENANCE_KEEP_VERSIONS + 1))")
+  done
+  shopt -u nullglob
+}
+
+# Caps the journal at JOURNAL_MAX: a drop-in for journald, which it reads on
+# restart and applies at once.
+journal_cap() {
+  [[ -d /run/systemd/system ]] || return 0
+  write_if_changed "$JOURNAL_CONF" "[Journal]
+SystemMaxUse=$JOURNAL_MAX" 644 || return 0
+  systemctl restart systemd-journald
+  say "journal: capped at $JOURNAL_MAX ($JOURNAL_CONF)"
+}
+
+# Runs $@ as AGENT_USER in its home, with its runtime directory, which rootless
+# Podman needs; fails when the agent user doesn't exist or isn't logged in or
+# lingering.
+as_agent() {
+  local home uid
+  id "$AGENT_USER" &>/dev/null || return 1
+  home="$(getent passwd "$AGENT_USER" | cut -d: -f6)"
+  uid="$(id -u "$AGENT_USER")"
+  [[ -d /run/user/$uid ]] || return 1
+  runuser -u "$AGENT_USER" -- env -C "$home" HOME="$home" XDG_RUNTIME_DIR="/run/user/$uid" "$@"
+}
+
+# The agent user's rootless Podman images (ticket agents' test containers and
+# their builds) no container uses, created over $MAINTENANCE_IMAGE_HOURS hours
+# ago: clean_docker's rule, for the storage in the agent's home that the box's
+# Docker prune never sees. Deletes them unless $1 is true.
+clean_agent_podman() {
+  local dry_run="$1"
+  if ! command -v podman >/dev/null || ! as_agent true 2>/dev/null; then
+    echo "  no agent user running Podman"
+    return 0
+  fi
+  if [[ $dry_run == true ]]; then
+    as_agent podman image ls --filter "until=${MAINTENANCE_IMAGE_HOURS}h" \
+      --format '  would delete, unless a container uses it, {{.Size}} {{.Repository}}:{{.Tag}}' 2>/dev/null || true
+  else
+    local deleted
+    if deleted="$(as_agent podman image prune -af --filter "until=${MAINTENANCE_IMAGE_HOURS}h" 2>/dev/null)"; then
+      printf '  images deleted: %s\n' "$(grep -c . <<<"$deleted" || true)"
+    else
+      echo "  image prune failed"
+    fi
+  fi
+}
+
 # Anonymous volumes no container, stopped ones included, uses: what a runner's
 # job containers leave behind, up to a GB a job from a service like Postgres.
 # Named volumes stay. Deletes them unless $1 is true.
@@ -1185,7 +1309,7 @@ report_worktrees() {
 # Everything but the deleting is a report: what took space, what could go by
 # hand. The journal gets it, and $MAINTENANCE_REPORT keeps the last one.
 maintenance() {
-  local config="$1" dry_run=false
+  local config="$1" dry_run=false agent_home
   [[ ${2:-} != --dry-run ]] || dry_run=true
   {
     printf 'devbox maintenance, %s%s\n' "$(date '+%F %T')" "$($dry_run && echo ' (dry run, nothing deleted)')"
@@ -1193,6 +1317,14 @@ maintenance() {
     clean_tmp "$dry_run"
     echo "Docker, unused for $((MAINTENANCE_IMAGE_HOURS / 24)) days:"
     clean_docker "$dry_run"
+    echo "The agent user's Podman images, unused for $((MAINTENANCE_IMAGE_HOURS / 24)) days:"
+    clean_agent_podman "$dry_run"
+    echo "Pacman cache, versions no longer installed:"
+    clean_pacman "$dry_run"
+    echo "Claude and cursor-agent versions, all but the newest $MAINTENANCE_KEEP_VERSIONS:"
+    agent_home="$(getent passwd "$AGENT_USER" | cut -d: -f6 || true)"
+    clean_versions "$dry_run" "$USER_HOME"
+    [[ -z $agent_home ]] || clean_versions "$dry_run" "$agent_home"
     if [[ $(box_role "$config") == runner ]]; then
       echo "Docker volumes no container uses:"
       clean_docker_volumes "$dry_run"
@@ -1200,8 +1332,9 @@ maintenance() {
     echo "Disk:"
     df -h / /tmp | sed 's/^/  /'
     echo "Could go by hand, if not needed:"
-    maintenance_sizes /var/cache/pacman/pkg /var/log/journal "$USER_HOME/.cache" "$USER_HOME/.npm" \
-      "$USER_HOME/.vscode-server" "$USER_HOME/.local/share/cursor-agent/versions" "$USER_HOME/.local/share/claude/versions"
+    maintenance_sizes "$PACMAN_CACHE" /var/log/journal "$USER_HOME/.cache" "$USER_HOME/.npm" \
+      "$USER_HOME/.vscode-server" "$USER_HOME/.local/share/containers" "$USER_HOME/go/pkg/mod" "$USER_HOME/rescue" \
+      ${agent_home:+"$agent_home/.cache" "$agent_home/.npm" "$agent_home/go/pkg/mod" "$agent_home/.local/share/containers"}
     echo "Finished-looking worktrees (clean, no stash, all pushed):"
     report_worktrees
     if command -v docker >/dev/null && docker info >/dev/null 2>&1; then
@@ -1233,9 +1366,9 @@ doctor_disk() {
   local used
   used="$(df --output=pcent "$2" | tail -n1 | tr -dc 0-9)"
   if ((used >= 90)); then
-    doctor_line fail "$1 is $used% full"
+    doctor_line fail "$1 is $used% full; devbox maintenance --dry-run says what could go"
   elif ((used >= 80)); then
-    doctor_line warn "$1 is $used% full"
+    doctor_line warn "$1 is $used% full; devbox maintenance --dry-run says what could go"
   else
     doctor_line ok "$1 is $used% full"
   fi
@@ -1832,13 +1965,14 @@ sync() {
   role="$(box_role "$config")"
   base_packages "$role"
   sync_timezone "$config"
+  journal_cap
   sync_packages "$config"
   upgrade_timer
   # A runner's jobs can fill its small disk in far less than a week.
   if [[ $role == runner ]]; then
-    calendar_timer "$MAINTENANCE_UNIT" "delete unused scratchpads, images and volumes, report the rest" maintenance "*-*-* 04:30"
+    calendar_timer "$MAINTENANCE_UNIT" "delete unused scratchpads, images, old packages and volumes, report the rest" maintenance "*-*-* 04:30"
   else
-    calendar_timer "$MAINTENANCE_UNIT" "delete unused scratchpads and images, report the rest" maintenance "Sun 04:30"
+    calendar_timer "$MAINTENANCE_UNIT" "delete unused scratchpads, images and old packages, report the rest" maintenance "Sun 04:30"
   fi
   # After the cleanup, so it reports what the cleanup left.
   calendar_timer "$DOCTOR_UNIT" "check the box's health" doctor "Sun 05:30"

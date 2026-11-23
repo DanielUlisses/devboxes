@@ -526,13 +526,26 @@ It deletes:
   cache, created over 7 days ago. That's when the image was built, not when it
   was pulled, so an old image pulled today goes at the next run if nothing uses
   it. Images come back with a pull; one built locally needs its build again.
+- With `agent_user`, the agent user's rootless Podman images by the same rule:
+  they live in its home, where the box's Docker prune never looks.
+- Packages in the pacman cache whose version isn't installed: every version the
+  daily upgrade replaced, and packages since removed (`pacman -Sc`). Each
+  installed version stays.
+- Old Claude Code and cursor-agent versions (each update adds a binary of
+  about 200M and keeps the rest), the box user's and the agent user's: all but
+  the newest two, never the one `~/.local/bin` links to.
 - On a runner box, anonymous Docker volumes no container uses, whatever their
   age: job containers leave them behind, up to a GB a job from a service like
   Postgres. Named volumes stay.
 
-It only reports, for a person to act on: disk use, the pacman cache, journal and
-tool caches, and worktrees that are clean, with no stash and every commit
+It only reports, for a person to act on: disk use, what is left of the pacman
+cache, the journal, tool caches and Go module caches (the agent user's too), Podman storage,
+`~/rescue`, and worktrees that are clean, with no stash and every commit
 pushed. Pushed doesn't mean finished, so it never removes a worktree.
+
+`devbox sync` also caps the systemd journal at 500M
+(`/etc/systemd/journald.conf.d/devbox.conf`); journald's own cap is 10% of the
+disk, up to 4G.
 
 systemd's own `systemd-tmpfiles-clean` still removes anything in `/tmp` untouched
 for 10 days.
