@@ -2,7 +2,10 @@
 # A stand-in for claude, for bin/devbox-check's run section: takes the flags
 # devbox-run passes, runs the runner's hooks from --settings as claude would,
 # writes a transcript, answers each submitted message with "got: <message>"
-# and exits 7 on "exit". With FAKE_TRUST set it shows a trust dialog line.
+# and exits 7 on "exit". With FAKE_TRUST set it first shows claude's
+# folder-trust dialog, cursor on "No, exit" (exits 1 when that is chosen), as
+# claude 2.x does, after its SessionStart hook (the order that loses an
+# argument prompt).
 set -uo pipefail
 sid="" settings="" resume="" prompt=""
 while (($#)); do
@@ -35,9 +38,32 @@ turn() {
   hook Stop
 }
 hook SessionStart
-printf 'fake claude resume=%s FOO=%s CLAUDECODE=%s\n' "${resume:-no}" "${FOO:-}" "${CLAUDECODE:-unset}"
+banner() {
+  printf 'fake claude resume=%s FOO=%s CLAUDECODE=%s\n' "${resume:-no}" "${FOO:-}" "${CLAUDECODE:-unset}"
+}
+if [[ -n ${FAKE_TRUST:-} ]]; then
+  sel=1
+  draw() {
+    printf '\e[2J\e[H Quick safety check: Is this a project you created or one you trust?\n'
+    if ((sel == 1)); then printf ' ❯ 1. No, exit\n   2. Yes, I trust this folder\n'; else printf '   1. No, exit\n ❯ 2. Yes, I trust this folder\n'; fi
+  }
+  draw
+  keys=""
+  while IFS= read -r -N1 c; do
+    keys+="$c"
+    if [[ $keys == *$'\e[B' ]]; then sel=2; keys=""; draw; continue; fi
+    if [[ $keys == *$'\e[A' ]]; then sel=1; keys=""; draw; continue; fi
+    if [[ $c == $'\r' || $c == $'\n' ]]; then
+      ((sel == 2)) || exit 1
+      printf '\e[2J\e[H'
+      break
+    fi
+  done
+  # Like claude: an argument prompt is gone after the dialog.
+  prompt=""
+fi
+banner
 [[ -n $prompt ]] && turn "$prompt"
-[[ -n ${FAKE_TRUST:-} ]] && echo "Do you trust the files in this folder?"
 printf '\e[?2004h'
 buf="" inpaste=0
 while IFS= read -r -N1 c; do

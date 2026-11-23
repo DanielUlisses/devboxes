@@ -313,15 +313,24 @@ check_run() {
   "$r" say w1 hi 2>/dev/null && code=0 || code=$?
   expect_code 5 "$code" "run/say refuses a dead pane (5)"
 
-  mkdir -p "$dir/plain"
-  "$r" start w2 --dir "$dir/plain" --env FAKE_TRUST=1 -- "$fake" >/dev/null
-  wait_for w2 "Do you trust" || true
+  mkdir -p "$dir/plain" "$dir/trusted"
+  "$r" start w2 --dir "$dir/plain" --env FAKE_TRUST=1 --prompt "after trust" -- "$fake" >/dev/null
+  wait_for w2 "Quick safety check" || true
+  sleep 0.5
   "$r" say w2 hi 2>/dev/null && code=0 || code=$?
-  if [[ $("$r" status w2 | jq -r '.sessions[0].dialog') == trust ]] && ((code == 5)); then
-    pass "run/a dialog shows in status and blocks say (5)"
+  if [[ $("$r" status w2 | jq -c '.sessions[0] | [.dialog, .prompt_pending]') == '["trust",true]' ]] && ((code == 5)); then
+    pass "run/a trust dialog shows in status and holds the prompt and say (5)"
   else
-    fail "run/a dialog shows in status and blocks say (5)" "say exit $code" "$("$r" status w2)"
+    fail "run/a trust dialog shows in status and holds the prompt and say (5)" "say exit $code" "$("$r" status w2)$("$r" log w2)"
   fi
+
+  "$r" start w3 --trust --dir "$dir/trusted" --env FAKE_TRUST=1 --prompt "after trust" -- "$fake" >/dev/null
+  if wait_for w3 "got: after trust"; then
+    pass "run/--trust answers the dialog, then the prompt goes in"
+  else
+    fail "run/--trust answers the dialog, then the prompt goes in" "pane shows" "$("$r" log w3 2>&1)"
+  fi
+  "$r" stop w3
 
   "$r" stop w2
   "$r" status w1 >/dev/null

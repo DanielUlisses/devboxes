@@ -22,7 +22,8 @@
 # apart from Herdr and from any tmux a person runs. Every session has a state
 # directory, $STATE_ROOT/<name>, holding meta.json (what started it), cmd and
 # env (NUL-separated, read by the _exec verb inside the pane), the prompt, and
-# exit.json once the command ends. Dead panes stay (remain-on-exit), so log
+# exit.json once the command ends. A claude session's prompt (and a resume's
+# note) is typed in once claude is ready, never passed as an argument. Dead panes stay (remain-on-exit), so log
 # still shows how a command ended.
 #
 # A claude session also gets hooks (through --settings) that write what only
@@ -243,20 +244,31 @@ pane_dialog() {
   local screen
   screen="$(tm capture-pane -p -t "=$1:" 2>/dev/null | drop_blank_tail | tail -n 25)" || return 0
   case $screen in
-    *"trust the files"* | *"Do you trust"*) printf trust ;;
+    *"trust this folder"* | *"Quick safety check"* | *"trust the files"* | *"Do you trust"*) printf trust ;;
     *"Do you want to proceed?"* | *"Do you want to make this edit"* | *"Do you want to create"* | *"Do you want to allow"*) printf permission ;;
     *"usage limit"* | *"limit reached"* | *"Limit reached"*) printf limit ;;
   esac
 }
 
-# Starts the pane for session $1 from its cmd/env files. $2 = "prompt" to add
-# the stored prompt (a first start), "note" to add the stored note (a resume).
+# Starts the pane for session $1 from its cmd/env files. $2 = "prompt" to
+# send the stored prompt (a first start), "note" the stored note (a resume).
+# A non-claude command gets it as its last argument. A claude session gets it
+# typed in, as say does, once claude is ready: given as an argument, claude
+# drops it when the folder-trust dialog comes first (dev-lanvera, 2026-11-23).
 launch() {
-  local name="$1" extra="${2:-}" d dir
+  local name="$1" extra="${2:-}" d dir first
   d="$(sdir "$name")"
   dir="$(meta "$name" | jq -r .dir)"
   [[ -d $dir ]] || die "$name: its directory $dir is gone"
-  rm -f "$d/exit.json"
+  rm -f "$d/exit.json" "$d/pending"
+  first="$(head -z -n1 "$d/cmd.run" | tr -d '\0')"
+  if is_claude "$first"; then
+    case $extra in
+      prompt) [[ -s $d/prompt ]] && cp "$d/prompt" "$d/pending" ;;
+      note) [[ -s $d/note ]] && cp "$d/note" "$d/pending" ;;
+    esac
+    extra=""
+  fi
   printf '%s' "$extra" >"$d/extra"
   tm kill-session -t "=$name:" 2>/dev/null || true
   # A login shell, so the pane gets the box user's PATH (profile.d) whoever
@@ -264,26 +276,74 @@ launch() {
   tm new-session -d -s "$name" -x "$COLS" -y "$ROWS" -c "$dir" \
     bash -lc 'exec "$0" _exec "$1"' "$SELF" "$name"
   meta_set "$name" '.state = "running" | .started_at = $t | .runs += 1' --arg t "$(now_iso)"
-  [[ $(meta "$name" | jq -r '.trust // false') == true ]] && trust_watch "$name"
+  if [[ -f $d/pending || $(meta "$name" | jq -r '.trust // false') == true ]]; then
+    ready_watch "$name"
+  fi
   return 0
 }
 
-# With --trust: for 30 s after a launch, answers claude's folder-trust dialog
-# with its first choice (trust) the moment the pane shows it. In the
-# background, so start returns at once; claude sends the prompt after it.
-trust_watch() {
+# Answers claude's folder-trust dialog with its trust choice ("Yes, I trust
+# this folder", or "Yes, proceed" on older versions), wherever the cursor
+# starts: Down until that line carries the cursor, then Enter.
+answer_trust() {
+  local name="$1" i line
+  for ((i = 0; i < 4; i++)); do
+    line="$(tm capture-pane -p -t "=$name:" 2>/dev/null | grep -E 'Yes, (I trust|proceed)' | head -n1)"
+    [[ -n $line ]] || return 1
+    if [[ $line =~ ^[[:space:]]*(❯|›|>) ]]; then
+      tm send-keys -t "=$name:" Enter
+      return 0
+    fi
+    tm send-keys -t "=$name:" Down
+    sleep 0.3
+  done
+  return 1
+}
+
+# In the background for up to 5 minutes after a launch, so start returns at
+# once: answers the trust dialog (with --trust), then, once claude is ready
+# (its SessionStart hook ran, when it has the runner's hooks, and no dialog
+# shows twice in a row), types the pending prompt or note in. Without --trust
+# a trust dialog waits for whoever answers it (keys, attach); the prompt
+# follows. status shows prompt_pending until it went in.
+ready_watch() {
   local name="$1"
   (
-    for ((i = 0; i < 60; i++)); do
+    d="$(sdir "$name")"
+    trust="$(meta "$name" | jq -r '.trust // false')"
+    clear=0
+    for ((i = 0; i < 600; i++)); do
       sleep 0.5
       alive "$name" || exit 0
-      if [[ $(pane_dialog "$name") == trust ]]; then
-        tm send-keys -t "=$name:" Enter
-        exit 0
+      dialog="$(pane_dialog "$name")"
+      if [[ $dialog == trust && $trust == true ]]; then
+        answer_trust "$name" || true
+        clear=0
+        continue
       fi
+      if [[ -n $dialog ]]; then clear=0; continue; fi
+      [[ -f $d/pending ]] || exit 0
+      if [[ -f $d/settings.json && ! -f $d/session.json ]]; then continue; fi
+      clear=$((clear + 1))
+      ((clear >= 3)) || continue
+      lock "$name"
+      paste_text "$name" "$(<"$d/pending")"
+      rm -f "$d/pending"
+      exit 0
     done
   ) </dev/null >/dev/null 2>&1 9>&- &
   disown
+}
+
+# Types text $2 into session $1: one bracketed paste (claude takes a
+# multi-line message as one, and newlines don't submit it early), then Enter
+# once the TUI has taken the paste.
+paste_text() {
+  local name="$1"
+  printf '%s' "$2" | tm load-buffer -b "say-$name" -
+  tm paste-buffer -p -d -b "say-$name" -t "=$name:"
+  sleep 0.3
+  tm send-keys -t "=$name:" Enter
 }
 
 # Inside the pane: runs the session's command, then records how it ended.
@@ -514,6 +574,14 @@ cmd_say() {
   [[ ${1:-} == --force ]] && { force=1; shift; }
   need_session "$name"
   alive "$name" || fail 5 "$name isn't running (resume it first)"
+  # The first prompt goes in before anything said: wait up to 30 s for it,
+  # before the lock, which the watcher typing it needs.
+  for ((i = 0; i < 60; i++)); do
+    [[ -f $(sdir "$name")/pending ]] || break
+    sleep 0.5
+  done
+  [[ ! -f $(sdir "$name")/pending || -n $force ]] ||
+    fail 5 "$name hasn't taken its first prompt yet ($(pane_dialog "$name") dialog?); answer it or say --force"
   lock "$name"
   # A claude session takes typing once its SessionStart hook ran: before it,
   # bracketed paste may not be on yet and a newline would submit early.
@@ -531,12 +599,7 @@ cmd_say() {
     text="$*"
   fi
   [[ -n ${text//[[:space:]]/} ]] || die "say: nothing to say"
-  # Bracketed paste: claude takes a multi-line message as one, and newlines
-  # don't submit it early. Then Enter, after the TUI has taken the paste.
-  printf '%s' "$text" | tm load-buffer -b "say-$name" -
-  tm paste-buffer -p -d -b "say-$name" -t "=$name:"
-  sleep 0.3
-  tm send-keys -t "=$name:" Enter
+  paste_text "$name" "$text"
 }
 
 # Raw tmux keys into the pane (Enter, Down, 1, Escape...): how a caller
@@ -700,6 +763,7 @@ session_json() {
     --arg last_turn "$last_turn" --argjson git "$git" --argjson pr "$pr" --arg with_pr "$with_pr" \
     --argjson exit "$(cat "$d/exit.json" 2>/dev/null || echo '{}')" \
     --argjson notice "$(cat "$d/notice.json" 2>/dev/null || echo null)" --arg dialog "$dialog" \
+    --argjson pending "$([[ -f $d/pending ]] && echo true || echo false)" \
     '{name, alive: $alive,
       state: (if .state == "stopped" then "stopped" elif $alive then "running"
               elif $exit.exit_code != null then "exited" else "lost" end),
@@ -709,10 +773,11 @@ session_json() {
       exit_code: (if $alive then null else $exit.exit_code end),
       last_output_at: ($act | if . == "" then null else . end),
       session_id, transcript: ($tr | if . == "" then null else . end), transcript_at: ($tr_at | if . == "" then null else . end),
+      prompt_pending: $pending,
       last_turn: ($last_turn | if . == "" then null else . end), dialog: ($dialog | if . == "" then null else . end),
       notice: $notice, git: $git}
      | with_entries(.value //= null)
-     | .alive = $alive
+     | .alive = $alive | .prompt_pending = $pending
      | if $with_pr != "" then .pr = $pr else . end' <<<"$m"
 }
 

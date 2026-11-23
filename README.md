@@ -1599,7 +1599,11 @@ devbox-run stop <name> | forget <name> | attach <name> | list
   cached 60 s.
 - `say` pastes the text as one bracketed paste and presses Enter; it refuses
   (exit 5) a dead pane or one showing a dialog. `keys` answers a dialog.
-  `--trust` answers claude's folder-trust dialog for a new worktree by itself.
+  `--trust` answers claude's folder-trust dialog for a new worktree by itself
+  ("Yes, I trust this folder"). A claude session's prompt is typed in once
+  claude is ready, after any dialog, never passed as an argument (claude drops
+  one when the trust dialog comes first); `status` shows `prompt_pending`
+  until then, and `say` waits for it.
 - `resume` runs `claude --resume <session id>` in the same directory with the
   same environment (the original command again when there is no transcript);
   `resume --all`, for after a reboot, does every session that isn't running
