@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# Stands in for `sudo -n -u <agent> tk-agent-claude` in bin/devbox-check's run
+# section: takes the wrapper's arguments, checks what it would, and runs
+# tests/run/fake-claude in --cwd with the --setenv values and AGENT=yes.
+set -euo pipefail
+cwd="" envs=()
+while (($#)); do
+  case $1 in
+    --account) shift 2 ;;
+    --cwd) cwd="$2"; shift 2 ;;
+    --setenv)
+      [[ $2 =~ ^TICKET_[A-Z0-9_]+= ]] || { echo "fake wrapper: --setenv $2 refused" >&2; exit 1; }
+      envs+=("$2"); shift 2 ;;
+    --) shift; break ;;
+    *) echo "fake wrapper: unknown $1" >&2; exit 1 ;;
+  esac
+done
+cd "$cwd"
+exec env AGENT=yes ${envs[@]+"${envs[@]}"} "$(dirname "$0")/fake-claude" "$@"

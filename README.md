@@ -1571,7 +1571,7 @@ the sessions down, and keeps one directory per session in
 `~/.local/state/devbox-run/<name>/`.
 
 ```
-devbox-run start <name> --dir <path> [--env K=V]... [--prompt <text> | --prompt-file <f>] [--trust] -- claude [args...]
+devbox-run start <name> --dir <path> [--env K=V]... [--prompt <text> | --prompt-file <f>] [--trust] [--agent [--account <a>]] -- claude [args...]
 devbox-run start <name> --repo <path> [--branch <b>] [--base <b>] ... -- claude [args...]
 devbox-run status [<name>...] [--pr]        JSON: {"schema": 1, "sessions": [...]}
 devbox-run log <name> [--lines N] [--transcript]
@@ -1610,8 +1610,18 @@ devbox-run stop <name> | forget <name> | attach <name> | list
   and wasn't stopped.
 - Exit codes: 1 failure, 2 usage, 3 no such session, 4 already running (start
   prints its status anyway), 5 not deliverable.
-- Sessions run as the box user even where `agent_user` is on: the runner
-  starts the box user's own `claude`, not ticket-skill's agent shim. Running
-  them as the agent user is left for later.
+- `--agent [--account <name>]` runs claude as the box's agent user
+  (`agent_user: true`, see Ticket agents as their own user) through
+  `sudo -n -u <user>-agent /usr/local/libexec/tk-agent-claude --cwd <dir>`,
+  in a worktree the caller prepared for it (`$WORK/<repo>--<branch>`, group
+  `tkwork`: ticket-skill's `agent_prepare_worktree`). Only `TICKET_*` `--env`
+  values reach it, as `--setenv`. The hooks and their `--settings` then live
+  in the shared state directory, `/var/lib/tk-agent/<user>/devbox-run/<name>/`,
+  made by the box user and group-writable file by file; the transcript is the
+  agent's, which the box user reads through the ACL sync sets. Without
+  `--agent`, sessions run as the box user whatever `agent_user` says.
+- At boot, the box user's `devbox-run-resume.service` (installed and enabled
+  by `devbox update`, never started by it) runs `devbox-run resume --all`.
 
-`bin/devbox-check`'s `run` section drives it against `tests/run/fake-claude`.
+`bin/devbox-check`'s `run` section drives it against `tests/run/fake-claude`
+(and `tests/run/fake-agent-wrapper` for `--agent`).

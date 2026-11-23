@@ -7,7 +7,8 @@
 # user, so sessions use the box's own Claude account. See README.md, The runner.
 #
 #   devbox-run start <name> (--dir <path> | --repo <path> [--branch <b>] [--base <b>])
-#                    [--env K=V]... [--prompt <text> | --prompt-file <file>] [--trust] -- <command> [args...]
+#                    [--env K=V]... [--prompt <text> | --prompt-file <file>] [--trust]
+#                    [--agent [--account <name>]] -- <command> [args...]
 #   devbox-run status [<name>...] [--pr] [--json]
 #   devbox-run log <name> [--lines N] [--transcript]
 #   devbox-run say <name> [--force] <text...>|-
@@ -31,6 +32,13 @@
 # transcript (SessionStart, so /clear and resumes are followed), whether a turn
 # is under way (UserPromptSubmit/Stop) and its last notification.
 #
+# With --agent, claude runs as the box's agent user (devboxes agent_user: the
+# root-owned wrapper tk-agent-claude, through sudo), in a worktree the caller
+# prepared for it ($WORK/<repo>--<branch>, group tkwork; ticket-skill's
+# agent_prepare_worktree). Its hooks then write into the box's shared state
+# directory ($STATE/devbox-run/<name>/ from /etc/tk-agent.conf), and only
+# TICKET_* --env values reach it (the wrapper's --setenv).
+#
 # Exit codes: 1 failure, 2 usage, 3 no such session, 4 already running (start
 # prints its status anyway), 5 not deliverable (say into a dead pane or one
 # showing a dialog).
@@ -41,6 +49,10 @@ STATE_ROOT="${DEVBOX_RUN_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/devbox-run
 SOCKET="${DEVBOX_RUN_SOCKET:-devbox-run}"
 NAME_RE='^[A-Za-z0-9][A-Za-z0-9_-]{0,62}$'
 PR_CACHE_S=60
+AGENT_CONF="${DEVBOX_RUN_AGENT_CONF:-/etc/tk-agent.conf}"
+AGENT_WRAPPER=/usr/local/libexec/tk-agent-claude
+# Tests only: a command run in place of `sudo -n -u <agent> $AGENT_WRAPPER`.
+AGENT_EXEC_TEST="${DEVBOX_RUN_AGENT_EXEC:-}"
 # Pane size of a detached session: claude draws to it, and log reads it.
 COLS=200
 ROWS=50
@@ -154,6 +166,32 @@ alive() {
   [[ -n $info && ${info%% *} == 0 ]]
 }
 
+# Where session $1's hooks write (session.json, turn.json, notice.json) and its
+# settings.json lives: its state directory, or for an agent-user session the
+# box's shared state directory, which the agent can write to.
+hdir() {
+  local h
+  h="$(jq -r '.hookdir // empty' "$(sdir "$1")/meta.json" 2>/dev/null || true)"
+  printf '%s' "${h:-$(sdir "$1")}"
+}
+
+# A hook file of session $1 as JSON, or null (missing, or emptied).
+hook_json() {
+  local f
+  f="$(hdir "$1")/$2"
+  if [[ -r $f ]] && jq -cs '.[0] // null' "$f" 2>/dev/null; then return 0; fi
+  echo null
+}
+
+# Session $1's current claude session id: the SessionStart hook's (it follows
+# /clear and resumes), else the one it started with.
+sid_of() {
+  local s
+  s="$(hook_json "$1" session.json | jq -r '.session_id // empty')"
+  [[ -n $s ]] || s="$(meta "$1" | jq -r '.session_id // empty')"
+  printf '%s' "$s"
+}
+
 claude_config_dir() {
   local name="$1" d
   d="$(meta "$name" | jq -r '.env.CLAUDE_CONFIG_DIR // empty')"
@@ -163,7 +201,7 @@ claude_config_dir() {
 # The transcript of claude session id $2 for session $1, if one is written.
 transcript() {
   local name="$1" sid="$2" f
-  f="$(jq -r --arg s "$sid" 'select(.session_id == $s) | .transcript_path // empty' "$(sdir "$name")/session.json" 2>/dev/null || true)"
+  f="$(hook_json "$name" session.json | jq -r --arg s "$sid" 'select(. != null and .session_id == $s) | .transcript_path // empty')"
   [[ -n $f && -f $f ]] && { printf '%s' "$f"; return 0; }
   [[ -n $sid ]] || return 0
   for f in "$(claude_config_dir "$name")"/projects/*/"$sid".jsonl; do
@@ -197,41 +235,24 @@ has_arg() {
   return 1
 }
 
-# The --settings a claude session gets: hooks that call `devbox-run _hook`.
+# The --settings a claude session gets: hooks writing into hook dir $1, as
+# plain shell and jq so they run as whoever claude runs as (the agent user
+# can't run this script, which lives in the box user's home). They print
+# nothing (SessionStart and UserPromptSubmit output would reach the model) and
+# never fail the session. They write in place: the agent may rewrite these
+# files but not make new ones.
 hook_settings() {
-  local name="$1" ev
-  local -A events=([SessionStart]=session [UserPromptSubmit]=prompt [Stop]=stop [Notification]=notice)
-  for ev in "${!events[@]}"; do
-    jq -n --arg ev "$ev" --arg c "$(printf '%q _hook %q %q' "$SELF" "$name" "${events[$ev]}")" \
-      '{($ev): [{hooks: [{type: "command", command: $c, timeout: 10}]}]}'
+  local h="$1" ev c
+  local -A cmds=(
+    [SessionStart]="jq -c '{session_id, transcript_path, source, at: (now | todate)}' > $(printf %q "$h/session.json")"
+    [UserPromptSubmit]="cat >/dev/null; jq -nc '{turn: \"working\", at: (now | todate)}' > $(printf %q "$h/turn.json"); : > $(printf %q "$h/notice.json")"
+    [Stop]="cat >/dev/null; jq -nc '{turn: \"done\", at: (now | todate)}' > $(printf %q "$h/turn.json")"
+    [Notification]="jq -c '{message: (.message // \"\"), at: (now | todate)}' > $(printf %q "$h/notice.json")"
+  )
+  for ev in "${!cmds[@]}"; do
+    c="{ ${cmds[$ev]}; } >/dev/null 2>&1 || true"
+    jq -n --arg ev "$ev" --arg c "$c" '{($ev): [{hooks: [{type: "command", command: $c, timeout: 10}]}]}'
   done | jq -s '{hooks: add}'
-}
-
-# A hook, inside claude: event JSON on stdin. Writes facts, prints nothing
-# (SessionStart and UserPromptSubmit output would reach the model) and never
-# fails the session.
-cmd_hook() {
-  local name="$1" what="$2" d in t
-  d="$(sdir "$name")"
-  [[ -d $d ]] || exit 0
-  in="$(cat)"
-  t="$(now_iso)"
-  {
-    case $what in
-      session)
-        jq -c --arg t "$t" '{session_id, transcript_path, source, at: $t}' <<<"$in" >"$d/session.json.tmp" &&
-          mv "$d/session.json.tmp" "$d/session.json"
-        meta_set "$name" '.session_id = $s' --arg s "$(jq -r '.session_id // empty' <<<"$in")"
-        ;;
-      prompt)
-        jq -n --arg t "$t" '{turn: "working", at: $t}' >"$d/turn.json"
-        rm -f "$d/notice.json"
-        ;;
-      stop) jq -n --arg t "$t" '{turn: "done", at: $t}' >"$d/turn.json" ;;
-      notice) jq -c --arg t "$t" '{message: (.message // ""), at: $t}' <<<"$in" >"$d/notice.json" ;;
-    esac
-  } >/dev/null 2>&1 || true
-  exit 0
 }
 
 # Its input without the trailing blank rows of a screen.
@@ -250,6 +271,84 @@ pane_dialog() {
   esac
 }
 
+# Is session $1 a claude session, and does it have the runner's hooks? From
+# meta, or for a session started by an older devbox-run (no such fields) from
+# its command and its settings.json.
+is_claude_session() {
+  local v
+  v="$(meta "$1" | jq -r '.claude // empty')"
+  [[ -n $v ]] || { is_claude "$(head -z -n1 "$(sdir "$1")/cmd" | tr -d '\0')" && v=true; }
+  [[ $v == true ]]
+}
+has_hooks() {
+  local v
+  v="$(meta "$1" | jq -r '.hooks // empty')"
+  [[ -n $v ]] || { [[ -f $(sdir "$1")/settings.json ]] && v=true; }
+  [[ $v == true ]]
+}
+
+# The hook verb of the devbox-run before hooks went inline: a session started
+# then still has settings.json calling it, so it stays, writing what the inline
+# hooks write. Prints nothing and never fails.
+cmd_hook() {
+  local name="$1" what="$2" d in t
+  d="$(sdir "$name")"
+  [[ -d $d ]] || exit 0
+  in="$(cat)"
+  t="$(now_iso)"
+  {
+    case $what in
+      session) jq -c --arg t "$t" '{session_id, transcript_path, source, at: $t}' <<<"$in" >"$d/session.json" ;;
+      prompt) jq -nc --arg t "$t" '{turn: "working", at: $t}' >"$d/turn.json"; : >"$d/notice.json" ;;
+      stop) jq -nc --arg t "$t" '{turn: "done", at: $t}' >"$d/turn.json" ;;
+      notice) jq -c --arg t "$t" '{message: (.message // ""), at: $t}' <<<"$in" >"$d/notice.json" ;;
+    esac
+  } >/dev/null 2>&1 || true
+  exit 0
+}
+
+agent_conf() {
+  sed -n "s/^$1=//p" "$AGENT_CONF" | head -1
+}
+
+# The command the pane runs for session $1, from its logical command on stdin
+# (NUL-separated, as in cmd): as it is, or for an agent-user session through
+# the wrapper, with the session's --env values as --setenv.
+wrap_cmd() {
+  local name="$1" m user
+  local -a c out
+  mapfile -d '' -t c
+  m="$(meta "$name")"
+  user="$(jq -r '.agent.user // empty' <<<"$m")"
+  if [[ -z $user ]]; then
+    printf '%s\0' "${c[@]}"
+    return
+  fi
+  out=(sudo -n -u "$user" "$AGENT_WRAPPER")
+  [[ -z $AGENT_EXEC_TEST ]] || out=("$AGENT_EXEC_TEST")
+  [[ -n $(jq -r '.agent.account // empty' <<<"$m") ]] && out+=(--account "$(jq -r .agent.account <<<"$m")")
+  out+=(--cwd "$(jq -r .dir <<<"$m")")
+  local e
+  while IFS= read -r -d '' e; do
+    out+=(--setenv "$e")
+  done < <(jq -j '.env | to_entries[] | "\(.key)=\(.value)\u0000"' <<<"$m")
+  out+=(-- "${c[@]:1}")
+  printf '%s\0' "${out[@]}"
+}
+
+# Empties session $1's hook files (making them when missing) so the next
+# start's facts aren't the last one's. For an agent-user session they are the
+# box user's, group-writable: the agent rewrites them but can't make files.
+reset_hook_files() {
+  local name="$1" h group="" f
+  h="$(hdir "$name")"
+  group="$(meta "$name" | jq -r '.agent.group // empty')"
+  for f in session.json turn.json notice.json; do
+    : >"$h/$f"
+    if [[ -n $group ]]; then chgrp "$group" "$h/$f" && chmod 660 "$h/$f"; else chmod 600 "$h/$f"; fi
+  done
+}
+
 # Starts the pane for session $1 from its cmd/env files. $2 = "prompt" to
 # send the stored prompt (a first start), "note" the stored note (a resume).
 # A non-claude command gets it as its last argument. A claude session gets it
@@ -261,8 +360,8 @@ launch() {
   dir="$(meta "$name" | jq -r .dir)"
   [[ -d $dir ]] || die "$name: its directory $dir is gone"
   rm -f "$d/exit.json" "$d/pending"
-  first="$(head -z -n1 "$d/cmd.run" | tr -d '\0')"
-  if is_claude "$first"; then
+  has_hooks "$name" && reset_hook_files "$name"
+  if is_claude_session "$name"; then
     case $extra in
       prompt) [[ -s $d/prompt ]] && cp "$d/prompt" "$d/pending" ;;
       note) [[ -s $d/note ]] && cp "$d/note" "$d/pending" ;;
@@ -323,7 +422,7 @@ ready_watch() {
       fi
       if [[ -n $dialog ]]; then clear=0; continue; fi
       [[ -f $d/pending ]] || exit 0
-      if [[ -f $d/settings.json && ! -f $d/session.json ]]; then continue; fi
+      if has_hooks "$name" && [[ ! -s $(hdir "$name")/session.json ]]; then continue; fi
       clear=$((clear + 1))
       ((clear >= 3)) || continue
       lock "$name"
@@ -405,7 +504,8 @@ make_worktree() {
 }
 
 cmd_start() {
-  local name="" dir="" repo="" branch="" base="" prompt="" prompt_file="" sid="" trust="" d
+  local name="" dir="" repo="" branch="" base="" prompt="" prompt_file="" sid="" trust="" agent="" account="" d h
+  local agent_json=null hooks=false claude=false
   local -a envs=() cmd=()
   while (($#)); do
     case $1 in
@@ -419,6 +519,8 @@ cmd_start() {
       --prompt) prompt="${2?--prompt needs text}"; shift 2 ;;
       --prompt-file) prompt_file="${2:?--prompt-file needs a file}"; shift 2 ;;
       --trust) trust=1; shift ;;
+      --agent) agent=1; shift ;;
+      --account) account="${2:?--account needs a name}"; shift 2 ;;
       --) shift; cmd=("$@"); break ;;
       -*) fail 2 "start: unknown option $1" ;;
       *) [[ -z $name ]] || fail 2 "start: one name only (got $name and $1)"; name="$1"; shift ;;
@@ -430,6 +532,19 @@ cmd_start() {
   [[ -n $dir || -n $repo ]] || fail 2 "start: --dir or --repo"
   [[ -z $prompt || -z $prompt_file ]] || fail 2 "start: --prompt or --prompt-file, not both"
   [[ -z $prompt_file || -r $prompt_file ]] || fail 2 "start: can't read $prompt_file"
+  [[ -z $account || -n $agent ]] || fail 2 "start: --account goes with --agent"
+  if [[ -n $agent ]]; then
+    [[ -r $AGENT_CONF ]] || fail 2 "start: --agent, but $AGENT_CONF is missing (devboxes agent_user: true, then devbox sync)"
+    is_claude "${cmd[0]}" || fail 2 "start: --agent runs claude only"
+    [[ -z $repo ]] || fail 2 "start: --agent takes --dir, a worktree prepared for the agent user, not --repo"
+    local e
+    for e in ${envs[@]+"${envs[@]}"}; do
+      [[ $e =~ ^TICKET_[A-Z0-9_]+= ]] || fail 2 "start: --agent passes only TICKET_* --env values (the wrapper's rule), not ${e%%=*}"
+    done
+    agent_json="$(jq -cn --arg u "$(agent_conf AGENT_USER)" --arg g "$(agent_conf GROUP)" --arg a "$account" \
+      '{user: $u, group: (if $g == "" then "tkwork" else $g end), account: (if $a == "" then null else $a end)}')"
+    [[ -n $(jq -r .user <<<"$agent_json") && -n $(agent_conf STATE) ]] || fail 2 "start: $AGENT_CONF lacks AGENT_USER or STATE"
+  fi
 
   tmux_conf
   lock "$name"
@@ -449,7 +564,18 @@ cmd_start() {
   dir="$(cd -- "$dir" && pwd -P)"
 
   d="$(sdir "$name")"
+  h="$d"
+  if [[ -n $agent ]]; then
+    local group
+    group="$(jq -r .group <<<"$agent_json")"
+    h="$(agent_conf STATE)/devbox-run/$name"
+    mkdir -p "$h"
+    if ! { chgrp "$group" "${h%/*}" "$h" && chmod 750 "${h%/*}" "$h"; }; then
+      die "can't give $h to group $group: are you in it? (devbox sync adds you; log in again after)"
+    fi
+  fi
   if is_claude "${cmd[0]}"; then
+    claude=true
     sid="$(claude_sid "${cmd[@]:1}")"
     if [[ -z $sid ]] && ! has_arg --continue "${cmd[@]:1}" && ! has_arg -c "${cmd[@]:1}"; then
       sid="$(cat /proc/sys/kernel/random/uuid)"
@@ -458,13 +584,16 @@ cmd_start() {
     if has_arg --settings "${cmd[@]:1}"; then
       printf 'devbox-run: %s passes its own --settings, so it gets no runner hooks (no turn or notice in status)\n' "$name" >&2
     else
-      hook_settings "$name" >"$d/settings.json"
-      cmd=("${cmd[0]}" --settings "$d/settings.json" "${cmd[@]:1}")
+      hooks=true
+      hook_settings "$h" >"$h/settings.json"
+      if [[ -n $agent ]]; then chgrp "$(jq -r .group <<<"$agent_json")" "$h/settings.json" && chmod 640 "$h/settings.json"; fi
+      cmd=("${cmd[0]}" --settings "$h/settings.json" "${cmd[@]:1}")
     fi
   fi
   # The caller's claude config root, unless --env names one: the pane's
-  # environment comes from the tmux server, not from this call.
-  if [[ -n ${CLAUDE_CONFIG_DIR:-} ]] && ! printf '%s\n' "${envs[@]}" | grep -q '^CLAUDE_CONFIG_DIR='; then
+  # environment comes from the tmux server, not from this call. An agent's
+  # is the wrapper's choice.
+  if [[ -z $agent && -n ${CLAUDE_CONFIG_DIR:-} ]] && ! printf '%s\n' "${envs[@]}" | grep -q '^CLAUDE_CONFIG_DIR='; then
     envs+=("CLAUDE_CONFIG_DIR=$CLAUDE_CONFIG_DIR")
   fi
 
@@ -475,19 +604,22 @@ cmd_start() {
     printf '%s' "$prompt" >"$d/prompt"
   fi
   printf '%s\0' "${cmd[@]}" >"$d/cmd"
-  cp "$d/cmd" "$d/cmd.run"
   : >"$d/env"
-  ((${#envs[@]})) && printf '%s\0' "${envs[@]}" >"$d/env"
+  # An agent's environment goes through the wrapper (wrap_cmd), not the pane.
+  [[ -z $agent ]] && ((${#envs[@]})) && printf '%s\0' "${envs[@]}" >"$d/env"
   chmod 600 "$d/env"
 
   jq -n --arg name "$name" --arg dir "$dir" --arg repo "$repo" --arg branch "$branch" \
     --arg base "$base" --arg sid "$sid" --arg t "$(now_iso)" --argjson trust "$([[ -n $trust ]] && echo true || echo false)" \
+    --argjson agent "$agent_json" --arg hookdir "$h" --argjson hooks "$hooks" --argjson claude "$claude" \
     --argjson cmd "$(printf '%s\0' "${cmd[@]}" | jq -Rs 'split("\u0000")[:-1]')" \
     --argjson env "$( ((${#envs[@]})) && printf '%s\0' "${envs[@]}" | jq -Rs 'split("\u0000")[:-1] | map(capture("^(?<k>[^=]+)=(?<v>.*)$"; "s")) | map({(.k): .v}) | add' || echo '{}')" \
     '{name: $name, dir: $dir, repo: ($repo | if . == "" then null else . end), branch: ($branch | if . == "" then null else . end),
       base: ($base | if . == "" then null else . end), command: $cmd, env: $env,
-      session_id: ($sid | if . == "" then null else . end), trust: $trust, created_at: $t, started_at: $t, state: "running", runs: 0}' \
+      session_id: ($sid | if . == "" then null else . end), trust: $trust, agent: $agent, hookdir: $hookdir,
+      hooks: $hooks, claude: $claude, created_at: $t, started_at: $t, state: "running", runs: 0}' \
     >"$d/meta.json"
+  wrap_cmd "$name" <"$d/cmd" >"$d/cmd.run"
   launch "$name" prompt
   status_json "$name" | jq '.sessions[0]'
 }
@@ -498,7 +630,7 @@ resume_cmd() {
   local name="$1" sid prev="" a
   local -a orig out
   mapfile -d '' -t orig <"$(sdir "$name")/cmd"
-  sid="$(meta "$name" | jq -r '.session_id // empty')"
+  sid="$(sid_of "$name")"
   out=("${orig[0]}")
   for a in "${orig[@]:1}"; do
     if [[ -n $prev ]]; then prev=""; continue; fi
@@ -524,17 +656,17 @@ resume_one() {
   d="$(sdir "$name")"
   local -a first
   mapfile -d '' -t first <"$d/cmd"
-  sid="$(meta "$name" | jq -r '.session_id // empty')"
+  sid="$(sid_of "$name")"
   tr="$(transcript "$name" "$sid")"
   printf '%s' "$note" >"$d/note"
   if is_claude "${first[0]}" && [[ -n $tr ]]; then
     # cmd stays the record of how it first started; the pane runs cmd.run.
-    resume_cmd "$name" >"$d/cmd.run"
+    resume_cmd "$name" | wrap_cmd "$name" >"$d/cmd.run"
     launch "$name" note
   else
     # Nothing to resume (not claude, or no transcript yet): start it again as
     # it first started, prompt included.
-    cp "$d/cmd" "$d/cmd.run"
+    wrap_cmd "$name" <"$d/cmd" >"$d/cmd.run"
     launch "$name" prompt
   fi
 }
@@ -585,9 +717,9 @@ cmd_say() {
   lock "$name"
   # A claude session takes typing once its SessionStart hook ran: before it,
   # bracketed paste may not be on yet and a newline would submit early.
-  if [[ -f $(sdir "$name")/settings.json ]]; then
+  if has_hooks "$name"; then
     for ((i = 0; i < 60; i++)); do
-      [[ -f $(sdir "$name")/session.json ]] && break
+      [[ -s $(hdir "$name")/session.json ]] && break
       sleep 0.5
     done
   fi
@@ -641,7 +773,7 @@ cmd_log() {
     tm capture-pane -p -J -t "=$name:" -S - | drop_blank_tail | tail -n "$lines"
     return 0
   fi
-  sid="$(meta "$name" | jq -r '.session_id // empty')"
+  sid="$(sid_of "$name")"
   tr="$(transcript "$name" "$sid")"
   [[ -n $tr ]] || die "$name: no pane (box restarted?) and no transcript"
   render_transcript "$tr" | tail -n "$lines"
@@ -735,11 +867,9 @@ session_json() {
     read -r dead pid act <<<"$info"
     [[ $dead == 0 ]] && alive=true
   fi
-  sid="$(jq -r '.session_id // empty' <<<"$m")"
+  sid="$(sid_of "$name")"
   tr="$(transcript "$name" "$sid")"
-  if [[ -f $d/turn.json ]]; then
-    last_turn="$(jq -r 'if .turn == "done" then "assistant_done" else "working" end' "$d/turn.json")"
-  fi
+  last_turn="$(hook_json "$name" turn.json | jq -r 'if . == null then "" elif .turn == "done" then "assistant_done" else "working" end')"
   if [[ -n $tr ]]; then
     tr_at="$(epoch_iso "$(stat -c %Y "$tr")")"
   fi
@@ -762,17 +892,18 @@ session_json() {
     --arg act "$([[ -n $act ]] && epoch_iso "$act")" --arg tr "$tr" --arg tr_at "$tr_at" \
     --arg last_turn "$last_turn" --argjson git "$git" --argjson pr "$pr" --arg with_pr "$with_pr" \
     --argjson exit "$(cat "$d/exit.json" 2>/dev/null || echo '{}')" \
-    --argjson notice "$(cat "$d/notice.json" 2>/dev/null || echo null)" --arg dialog "$dialog" \
+    --argjson notice "$(hook_json "$name" notice.json)" --arg dialog "$dialog" --arg sid "$sid" \
+    --argjson run "$(jq -Rs 'split("\u0000")[:-1]' "$d/cmd.run" 2>/dev/null || echo null)" \
     --argjson pending "$([[ -f $d/pending ]] && echo true || echo false)" \
     '{name, alive: $alive,
       state: (if .state == "stopped" then "stopped" elif $alive then "running"
               elif $exit.exit_code != null then "exited" else "lost" end),
       pid: ($pid | if . == "" then null else tonumber end),
-      dir, repo, branch, base, command, started_at, created_at, runs,
+      dir, repo, branch, base, command: ($run // .command), agent: (.agent.user // null), started_at, created_at, runs,
       ended_at: (if $alive then null else $exit.ended_at end),
       exit_code: (if $alive then null else $exit.exit_code end),
       last_output_at: ($act | if . == "" then null else . end),
-      session_id, transcript: ($tr | if . == "" then null else . end), transcript_at: ($tr_at | if . == "" then null else . end),
+      session_id: ($sid | if . == "" then null else . end), transcript: ($tr | if . == "" then null else . end), transcript_at: ($tr_at | if . == "" then null else . end),
       prompt_pending: $pending,
       last_turn: ($last_turn | if . == "" then null else . end), dialog: ($dialog | if . == "" then null else . end),
       notice: $notice, git: $git}
@@ -823,6 +954,7 @@ cmd_forget() {
   need_session "$name"
   alive "$name" && die "$name is running; stop it first"
   tm kill-session -t "=$name:" 2>/dev/null || true
+  [[ $(hdir "$name") == "$(sdir "$name")" ]] || rm -rf -- "$(hdir "$name")"
   rm -rf -- "$(sdir "$name")"
 }
 
