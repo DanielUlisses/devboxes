@@ -259,6 +259,9 @@ TELEGRAF_UNIT_FILE=$USER_HOME/.config/systemd/user/$TELEGRAF_UNIT
 # waiting for the first herdr command: before, that was the next devbox sync.
 HERDR_UNIT=devbox-herdr.service
 HERDR_UNIT_FILE=$USER_HOME/.config/systemd/user/$HERDR_UNIT
+# Resumes the runner's sessions at boot (devbox-run resume --all).
+RUN_RESUME_UNIT=devbox-run-resume.service
+RUN_RESUME_UNIT_FILE=$USER_HOME/.config/systemd/user/$RUN_RESUME_UNIT
 TELEGRAF_PORT=8094
 
 usage() {
@@ -2632,6 +2635,8 @@ finish() {
   say "plugins: all installed"
   isolated herdr_server "$config"
   ((STATUS == 0)) || say "herdr-server: failed; rerun devbox update"
+  isolated run_resume_unit "$config"
+  ((STATUS == 0)) || say "devbox-run: failed; rerun devbox update"
   herdr_plugins
   say "herdr: plugins installed"
   isolated install_ovis "$config"
@@ -2899,6 +2904,42 @@ WantedBy=default.target"
   if ! user_systemctl is-active -q "$HERDR_UNIT" && ! herdr workspace list >/dev/null 2>&1; then
     user_systemctl start "$HERDR_UNIT"
     changed "herdr-server: started"
+  fi
+}
+
+# At boot, brings back the runner's sessions a reboot ended: RUN_RESUME_UNIT
+# runs `devbox-run resume --all` once (every session neither running nor
+# stopped by hand), with linger so it runs without a login. The tmux server
+# it starts lives in a scope of its own, not in this unit. Enabled, never
+# started here: an update must not resume what someone left ended. Runs as
+# the box user.
+run_resume_unit() {
+  local config="$1" unit
+  [[ $(jq -r .role <<<"$config") == devbox ]] || return 0
+  if [[ ! -d /run/systemd/system ]]; then
+    say "devbox-run: no systemd, sessions won't resume at boot"
+    return 0
+  fi
+  unit="[Unit]
+Description=devbox-run: resume the runner's sessions after a boot
+After=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+Environment=PATH=%h/.local/bin:%h/.local/share/mise/shims:/usr/local/bin:/usr/bin
+WorkingDirectory=%h
+ExecStart=/usr/local/bin/devbox-run resume --all
+
+[Install]
+WantedBy=default.target"
+  ! write_if_changed "$RUN_RESUME_UNIT_FILE" "$unit" 644 || changed "devbox-run: wrote ${RUN_RESUME_UNIT_FILE/#$USER_HOME/\~}"
+  [[ $(loginctl show-user "$USER_NAME" -p Linger --value 2>/dev/null) == yes ]] ||
+    sudo loginctl enable-linger "$USER_NAME"
+  user_systemctl daemon-reload
+  if ! user_systemctl is-enabled -q "$RUN_RESUME_UNIT" 2>/dev/null; then
+    user_systemctl enable -q "$RUN_RESUME_UNIT"
+    changed "devbox-run: sessions resume at boot"
   fi
 }
 
@@ -3249,6 +3290,7 @@ update() {
   run_step plugins install_new_plugins "$config"
   run_step plugin-versions update_plugins
   run_step herdr-server herdr_server "$config"
+  run_step devbox-run run_resume_unit "$config"
   run_step herdr herdr_plugins
   run_step ovis install_ovis "$config"
   if [[ -n $no_upgrade ]]; then

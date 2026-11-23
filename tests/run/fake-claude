@@ -39,7 +39,7 @@ turn() {
 }
 hook SessionStart
 banner() {
-  printf 'fake claude resume=%s FOO=%s CLAUDECODE=%s\n' "${resume:-no}" "${FOO:-}" "${CLAUDECODE:-unset}"
+  printf 'fake claude resume=%s FOO=%s CLAUDECODE=%s AGENT=%s TICKET_X=%s\n' "${resume:-no}" "${FOO:-}" "${CLAUDECODE:-unset}" "${AGENT:-no}" "${TICKET_X:-}"
 }
 if [[ -n ${FAKE_TRUST:-} ]]; then
   sel=1
