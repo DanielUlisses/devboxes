@@ -261,11 +261,13 @@ drop_blank_tail() {
 }
 
 # What the pane shows that blocks typing: trust, permission, limit, or empty.
+# trust is the folder-trust dialog and also the one claude shows for each
+# --add-dir it hasn't been trusted with ("Adding a new directory").
 pane_dialog() {
   local screen
   screen="$(tm capture-pane -p -t "=$1:" 2>/dev/null | drop_blank_tail | tail -n 25)" || return 0
   case $screen in
-    *"trust this folder"* | *"Quick safety check"* | *"trust the files"* | *"Do you trust"*) printf trust ;;
+    *"trust this folder"* | *"Quick safety check"* | *"trust the files"* | *"Do you trust"* | *"Adding a new directory"*) printf trust ;;
     *"Do you want to proceed?"* | *"Do you want to make this edit"* | *"Do you want to create"* | *"Do you want to allow"*) printf permission ;;
     *"usage limit"* | *"limit reached"* | *"Limit reached"*) printf limit ;;
   esac
@@ -382,15 +384,23 @@ launch() {
 }
 
 # Answers claude's folder-trust dialog with its trust choice ("Yes, I trust
-# this folder", or "Yes, proceed" on older versions), wherever the cursor
-# starts: Down until that line carries the cursor, then Enter.
+# this folder", "Yes, proceed" on older versions, or "Yes, add it" for an
+# --add-dir), wherever the cursor starts: Down until that line carries the
+# cursor, then Enter. Then waits (up to 5 s) for the screen to change, so the
+# next dialog, which starts on "No, exit" again, isn't answered with keys
+# meant for this one.
 answer_trust() {
-  local name="$1" i line
+  local name="$1" i j line before
   for ((i = 0; i < 4; i++)); do
-    line="$(tm capture-pane -p -t "=$name:" 2>/dev/null | grep -E 'Yes, (I trust|proceed)' | head -n1)"
+    line="$(tm capture-pane -p -t "=$name:" 2>/dev/null | grep -E 'Yes, (I trust|proceed|add it)' | head -n1)"
     [[ -n $line ]] || return 1
     if [[ $line =~ ^[[:space:]]*(❯|›|>) ]]; then
+      before="$(tm capture-pane -p -t "=$name:" 2>/dev/null)"
       tm send-keys -t "=$name:" Enter
+      for ((j = 0; j < 25; j++)); do
+        sleep 0.2
+        [[ $(tm capture-pane -p -t "=$name:" 2>/dev/null) != "$before" ]] && break
+      done
       return 0
     fi
     tm send-keys -t "=$name:" Down

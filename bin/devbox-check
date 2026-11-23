@@ -332,6 +332,22 @@ check_run() {
   fi
   "$r" stop w3
 
+  mkdir -p "$dir/added" "$dir/extra1" "$dir/extra2"
+  "$r" start w4 --dir "$dir/added" --env FAKE_TRUST=1 -- "$fake" --add-dir "$dir/extra1" "$dir/extra2" >/dev/null
+  wait_for w4 "Quick safety check" || true
+  "$r" keys w4 Down Enter
+  wait_for w4 "Adding a new directory" || true
+  sleep 0.5
+  expect_status w4 '.dialog' trust "run/an --add-dir dialog shows in status as trust"
+  "$r" stop w4
+  "$r" start w5 --trust --dir "$dir/added" --env FAKE_TRUST=1 --prompt "after dirs" -- "$fake" --add-dir "$dir/extra1" "$dir/extra2" >/dev/null
+  if wait_for w5 "got: after dirs" || wait_for w5 "got: after dirs"; then
+    pass "run/--trust answers each --add-dir dialog, then the prompt goes in"
+  else
+    fail "run/--trust answers each --add-dir dialog, then the prompt goes in" "pane shows" "$("$r" log w5 2>&1)"
+  fi
+  "$r" stop w5
+
   "$r" stop w2
   "$r" status w1 >/dev/null
   "$r" resume --all >/dev/null 2>&1
