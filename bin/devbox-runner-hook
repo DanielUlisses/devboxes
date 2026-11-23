@@ -6,8 +6,9 @@
 # label could race a real deploy to it; this fails such a job before it runs
 # anything. It passes a job only when all of these hold:
 #   - GITHUB_EVENT_NAME is push or workflow_dispatch;
-#   - GITHUB_REF is refs/heads/<the repo's default branch>, read from the
-#     event GitHub sent (GITHUB_EVENT_PATH);
+#   - GITHUB_REF is the branch GITHUB_WORKFLOW_REF names (its @refs/heads/<b>),
+#     so a trusted entry decides the branch: `@refs/heads/main` takes main only,
+#     `@refs/heads/next` (ticket-board's second hub, docs/hub-next.md) next only;
 #   - GITHUB_WORKFLOW_REF is in TRUSTED_FILE, which root wrote from the box's
 #     settings before the runner started (case-insensitively, as owner and
 #     repo names are).
@@ -31,12 +32,9 @@ workflow="${GITHUB_WORKFLOW_REF:-}"
 [[ $event == push || $event == workflow_dispatch ]] ||
   refuse "event '$event' is not push or workflow_dispatch"
 
-default="$(jq -r '.repository.default_branch // empty' "${GITHUB_EVENT_PATH:-/dev/null}" 2>/dev/null)" || default=""
-[[ -n $default ]] || refuse "no default branch in the event payload"
-[[ $ref == "refs/heads/$default" ]] ||
-  refuse "ref '$ref' is not the default branch (refs/heads/$default)"
-
 [[ -n $workflow ]] || refuse "no GITHUB_WORKFLOW_REF"
+[[ $ref == refs/heads/* && $ref == "${workflow##*@}" ]] ||
+  refuse "ref '$ref' is not the branch its workflow ref names (${workflow##*@})"
 [[ -r $TRUSTED_FILE ]] || refuse "no list of trusted workflows ($TRUSTED_FILE)"
 grep -qixF -- "$workflow" "$TRUSTED_FILE" ||
   refuse "workflow '$workflow' is not in runners.trusted_workflows"

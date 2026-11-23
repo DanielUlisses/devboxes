@@ -211,7 +211,7 @@ api() {
 # its concurrency group stays "pending" after its job is queued), their jobs
 # that are queued and whose labels are all among the runner's. On a deploy box
 # (trusted_workflows set) only runs of a listed workflow, started by a push or
-# workflow_dispatch on the repo's default branch, count; the job-started hook
+# workflow_dispatch on the branch its trusted entry names, count; the job-started hook
 # (bin/devbox-runner-hook) checks the same inside the job, since a
 # just-in-time runner takes any queued job with its labels.
 matching_jobs() {
@@ -239,7 +239,7 @@ matching_jobs() {
     done < <(jq -r --arg repo "$repo" --arg default "$default" --argjson trusted "$TRUSTED_JSON" '
       .workflow_runs[] | select(.status != "completed")
       | select(($trusted | length) == 0
-               or ((.event == "push" or .event == "workflow_dispatch") and .head_branch == $default
+               or ((.event == "push" or .event == "workflow_dispatch")
                    and ("\($repo)/\(.path)@refs/heads/\(.head_branch)" | ascii_downcase | IN($trusted[]))))
       | .id' <<<"$runs")
   done <<<"$repos"
@@ -503,7 +503,7 @@ dry_run() {
   queued="$(grep -c . <<<"$jobs" || true)"
   printf 'org %s, runner labels %s, max_jobs %s, runner group %s\n' "$ORG" "$(jq -r 'join(",")' <<<"$LABELS_JSON")" "$MAX_JOBS" "$RUNNER_GROUP"
   if trusted_only; then
-    printf 'deploy box: only push or workflow_dispatch runs on the default branch of\n'
+    printf 'deploy box: only push or workflow_dispatch runs on the branch each entry names:\n'
     jq -r '"  \(.[])"' <<<"$TRUSTED_JSON"
   fi
   $USE_OP || printf 'no 1Password: the App from %s, jobs get no OP_SERVICE_ACCOUNT_TOKEN\n' "$APP_ID_FILE"
