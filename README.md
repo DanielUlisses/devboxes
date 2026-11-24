@@ -955,7 +955,7 @@ what tells them apart is what each box has, not a rule inside one box:
 | | PR box | Deploy box |
 | --- | --- | --- |
 | `labels` | `[homelab]` | `[homelab-deploy]` |
-| Takes | any queued job asking for its label: pull requests, nightly and weekly runs, compat | only `trusted_workflows`, run by a `push` or `workflow_dispatch` on the branch the entry names, checked twice (see [The dispatcher](#the-dispatcher)) |
+| Takes | any queued job asking for its label: pull requests, nightly and weekly runs, compat | only `trusted_workflows`, run by a `push`, `workflow_dispatch` or `schedule` on the branch the entry names, checked twice (see [The dispatcher](#the-dispatcher)) |
 | 1Password | none (`op_token: false`); the GitHub App's id and key are stored on the box | the `homelab-ci` service account, as before; deploy jobs get the token |
 | GitHub App | its own App (`homelab-ci-pr`), which can register runners and read Actions, nothing else | the `homelab-ci` App, from 1Password |
 | Tailnet | `tailscale_tag: tag:ci`, which no grant or ssh rule names as a source | `tag:runner`, which the hub's deploy grant names |
@@ -1096,7 +1096,7 @@ Every 20 seconds or so it:
    queued ones whose `runs-on` labels are all among the box's `labels` plus
    `self-hosted` (case-insensitively). On a deploy box (`trusted_workflows`
    set) it looks only at repos a listed workflow belongs to, and keeps a run
-   only when its `event` is `push` or `workflow_dispatch` and
+   only when its `event` is `push`, `workflow_dispatch` or `schedule` and
    `<repo>/<run's path>@refs/heads/<branch>` is in the list
    (case-insensitively): an entry names the one branch it may run from;
 3. starts min(matching jobs − runners still waiting for one, `max_jobs` −
@@ -1228,7 +1228,9 @@ box. So the boxes are split by what a job may reach:
 - **The deploy box** (`homelab-deploy`) holds the `homelab-ci` service
   account (and with it the `homelab-ci` App's key) and the tailnet
   identity that may deploy. It runs only `trusted_workflows`, and only for
-  a push or `workflow_dispatch` on the branch its entry names: the dispatcher starts
+  a push, `workflow_dispatch` or `schedule` on the branch its entry names (GitHub
+  runs a schedule only from the default branch's copy of the workflow, so the
+  branch check still holds): the dispatcher starts
   a runner only for such a run, and `bin/devbox-runner-hook`, installed as
   `/usr/local/libexec/devbox-runner-hook.sh` (the runner takes a hook only
   with a `.sh`, `.ps1` or `.js` name) and set as the runner's

@@ -5,7 +5,8 @@
 # any queued job whose labels match, so a pull request asking for the deploy
 # label could race a real deploy to it; this fails such a job before it runs
 # anything. It passes a job only when all of these hold:
-#   - GITHUB_EVENT_NAME is push or workflow_dispatch;
+#   - GITHUB_EVENT_NAME is push, workflow_dispatch or schedule (GitHub runs a
+#     schedule only from the default branch's copy of the workflow);
 #   - GITHUB_REF is the branch GITHUB_WORKFLOW_REF names (its @refs/heads/<b>),
 #     so a trusted entry decides the branch: `@refs/heads/main` takes main only,
 #     `@refs/heads/next` (ticket-board's second hub, docs/hub-next.md) next only;
@@ -29,8 +30,8 @@ event="${GITHUB_EVENT_NAME:-}"
 ref="${GITHUB_REF:-}"
 workflow="${GITHUB_WORKFLOW_REF:-}"
 
-[[ $event == push || $event == workflow_dispatch ]] ||
-  refuse "event '$event' is not push or workflow_dispatch"
+[[ $event == push || $event == workflow_dispatch || $event == schedule ]] ||
+  refuse "event '$event' is not push, workflow_dispatch or schedule"
 
 [[ -n $workflow ]] || refuse "no GITHUB_WORKFLOW_REF"
 [[ $ref == refs/heads/* && $ref == "${workflow##*@}" ]] ||
