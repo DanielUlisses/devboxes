@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # A stand-in for claude, for bin/devbox-check's run section: takes the flags
 # devbox-run passes, runs the runner's hooks from --settings as claude would,
-# writes a transcript, answers each submitted message with "got: <message>"
-# and exits 7 on "exit". With FAKE_TRUST set it first shows claude's
+# runs its statusLine command once, writes a transcript, answers each
+# submitted message with "got: <message>" and exits 7 on "exit". With
+# FAKE_TRUST set it first shows claude's
 # folder-trust dialog, cursor on "No, exit" (exits 1 when that is chosen), as
 # claude 2.x does, after its SessionStart hook (the order that loses an
 # argument prompt). Then, as claude does for a directory it hasn't been
@@ -47,6 +48,11 @@ turn() {
   hook Stop
 }
 hook SessionStart
+# Claude runs the statusLine command as it draws: once here, with a model and
+# the plan's windows, as claude 2.x hands them.
+if [[ -n $settings ]] && c="$(jq -re '.statusLine.command // empty' "$settings")"; then
+  jq -nc '{model: {id: "claude-fake-1", display_name: "Fake 1"}, rate_limits: {five_hour: {used_percentage: 12.5, resets_at: 1900000000}, seven_day: {used_percentage: 72, resets_at: 1900500000}}}' | bash -c "$c" >/dev/null
+fi
 banner() {
   printf 'fake claude resume=%s FOO=%s CLAUDECODE=%s AGENT=%s TICKET_X=%s\n' "${resume:-no}" "${FOO:-}" "${CLAUDECODE:-unset}" "${AGENT:-no}" "${TICKET_X:-}"
 }

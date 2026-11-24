@@ -1588,13 +1588,17 @@ devbox-run stop <name> | forget <name> | attach <name> | list
   resume doesn't send it again. A claude command gets `--session-id <uuid>`
   (unless it names one) and `--settings` with the runner's hooks, which write
   the current session id and transcript (following `/clear`), whether a turn
-  is under way and claude's last notification into the session's directory.
+  is under way and claude's last notification into the session's directory,
+  plus a `statusLine` that records the model and the plan's rate limits
+  claude hands it (and shows them as the pane's status line).
 - `status` reports per session: `alive`, `state` (`running`, `exited` with its
   `exit_code`, `stopped` by `devbox-run stop`, `lost` when the pane went away
   without an exit, as after a reboot), `last_turn` (`assistant_done` when
   claude waits at its prompt, `working`), `dialog` (`trust`, `permission`,
   `limit`, `hook` for a prompt hook asking first, as cache-tax's "Send it
-  anyway?", read off the pane), `notice`, the transcript, and `git` (branch,
+  anyway?", read off the pane), `notice`, `model` (`{id, name}`, as the
+  status line last saw it), `rate_limits` (`five_hour`/`seven_day`:
+  `used_percentage`, `resets_at`) with `status_at`, the transcript, and `git` (branch,
   head, base, ahead/behind, dirty, upstream, pushed). `--pr` adds the pull
   request from `gh` (github.com or the remote's Enterprise host) or `az`,
   cached 60 s.
