@@ -39,8 +39,8 @@
 #   labels: [homelab]    # the box's labels (letters, digits, . _ -)
 #   max_jobs: 2          # jobs run at once (>= 1); default 2
 #   # Empty (the default): the box takes any queued job with its labels (a PR
-#   # box). Set: a deploy box, which takes only these workflows, run by a push
-#   # or workflow_dispatch on the repo's default branch, each entry exactly as
+#   # box). Set: a deploy box, which takes only these workflows, run by a push,
+#   # workflow_dispatch or schedule on the repo's default branch, each entry exactly as
 #   # GITHUB_WORKFLOW_REF reads: <owner>/<repo>/.github/workflows/<file>@refs/heads/<branch>.
 #   # Its jobs also pass a job-started hook that checks the same.
 #   trusted_workflows:
