@@ -1813,6 +1813,92 @@ agent_tfc_token_from_ref() {
   say "agent-user: saved the agent's Terraform Cloud token from $ref"
 }
 
+# mcp_servers: one Claude --mcp-config file per server, mode 600, for the box
+# user in ~/.config/devbox/mcp/<name>.json and, with agent_user on and unless
+# the entry says agent: false, for the agent in its ~/.config/tk-agent/mcp/.
+# A url_ref or token_ref is read with op as the box user (its service account).
+# Files of servers no longer listed are removed; a failed read keeps a server's
+# files as they were. Nothing here loads them: ticket-skill passes the ones a
+# project's policy `mcp` names (README.md, MCP servers).
+MCP_USER_DIR=.config/devbox/mcp
+MCP_AGENT_DIR=.config/tk-agent/mcp
+sync_mcp_servers() {
+  local config="$1" udir adir="" ahome="" agent_on=false n i e name ref url token json keep_u=() keep_a=() f
+  [[ $(box_role "$config") == devbox ]] || return 0
+  udir="$USER_HOME/$MCP_USER_DIR"
+  if [[ $(jq -r '.agent_user == true' <<<"$config") == true ]] && id "$AGENT_USER" &>/dev/null; then
+    agent_on=true
+    ahome="$(getent passwd "$AGENT_USER" | cut -d: -f6)"
+    adir="$ahome/$MCP_AGENT_DIR"
+  fi
+  n="$(jq '.mcp_servers // [] | length' <<<"$config")"
+  for ((i = 0; i < n; i++)); do
+    e="$(jq -c ".mcp_servers[$i]" <<<"$config")"
+    name="$(jq -r .name <<<"$e")"
+    keep_u+=("$name")
+    [[ $agent_on == true && $(jq -r '.agent != false' <<<"$e") == true ]] && keep_a+=("$name")
+    url="$(jq -r '.url // ""' <<<"$e")"
+    ref="$(jq -r '.url_ref // ""' <<<"$e")"
+    token=""
+    if [[ -n $ref || -n $(jq -r '.token_ref // ""' <<<"$e") ]] && [[ ! -s $USER_HOME/.config/op/service-account-token ]]; then
+      say "mcp: $name needs op, but there's no 1Password token yet (devbox login); its files are unchanged"
+      continue
+    fi
+    if [[ -n $ref ]]; then
+      # shellcheck disable=SC2016 # for the box user's shell, as agent_token_from_ref's
+      if ! url="$(as_user bash -c 'OP_SERVICE_ACCOUNT_TOKEN="$(<"$HOME/.config/op/service-account-token")" op read "$1"' _ "$ref")"; then
+        say "mcp: op could not read $name's url_ref ($ref); its files are unchanged"
+        continue
+      fi
+      url="${url//[[:space:]]/}"
+      if [[ ! $url =~ ^https?://[^[:space:]]+$ ]]; then
+        say "mcp: $name's url_ref ($ref) doesn't hold an http(s) URL; its files are unchanged"
+        continue
+      fi
+    fi
+    ref="$(jq -r '.token_ref // ""' <<<"$e")"
+    if [[ -n $ref ]]; then
+      # shellcheck disable=SC2016 # for the box user's shell, as agent_token_from_ref's
+      if ! token="$(as_user bash -c 'OP_SERVICE_ACCOUNT_TOKEN="$(<"$HOME/.config/op/service-account-token")" op read "$1"' _ "$ref")"; then
+        say "mcp: op could not read $name's token_ref ($ref); its files are unchanged"
+        continue
+      fi
+      token="${token//[[:space:]]/}"
+    fi
+    json="$(jq -n --arg n "$name" --arg t "$(jq -r .type <<<"$e")" --arg u "$url" --arg tok "$token" \
+      '{mcpServers: {($n): ({type: $t, url: $u} + if $tok == "" then {} else {headers: {Authorization: "Bearer \($tok)"}} end)}}')"
+    install -d -o "$USER_NAME" -g "$USER_NAME" -m 700 "$USER_HOME/.config/devbox" "$udir"
+    if write_if_changed "$udir/$name.json" "$json" 600; then
+      chown "$USER_NAME:$USER_NAME" "$udir/$name.json"
+      say "mcp: wrote $name for $USER_NAME"
+    fi
+    if [[ $agent_on == true && $(jq -r '.agent != false' <<<"$e") == true ]]; then
+      install -d -o "$AGENT_USER" -g "$AGENT_USER" -m 700 "$ahome/.config" "$ahome/.config/tk-agent" "$adir"
+      if write_if_changed "$adir/$name.json" "$json" 600; then
+        chown "$AGENT_USER:$AGENT_USER" "$adir/$name.json"
+        say "mcp: wrote $name for $AGENT_USER"
+      fi
+    fi
+  done
+  # What the list no longer names (for the agent: what it may no longer have).
+  shopt -s nullglob
+  for f in "$udir"/*.json; do
+    name="$(basename "$f" .json)"
+    printf '%s\n' "${keep_u[@]}" | grep -qxF -- "$name" && continue
+    rm -f "$f"
+    say "mcp: removed $name for $USER_NAME (no longer in mcp_servers)"
+  done
+  if [[ -n $ahome ]]; then
+    for f in "$adir"/*.json; do
+      name="$(basename "$f" .json)"
+      printf '%s\n' "${keep_a[@]}" | grep -qxF -- "$name" && continue
+      rm -f "$f"
+      say "mcp: removed $name for $AGENT_USER (no longer in mcp_servers, or agent: false)"
+    done
+  fi
+  shopt -u nullglob
+}
+
 # The agent's Claude login for one account: a token from `claude setup-token`,
 # pasted (the terminal wraps it, so line breaks and spaces are dropped), saved
 # in the agent's home mode 600. The wrapper passes it as CLAUDE_CODE_OAUTH_TOKEN.
@@ -2009,6 +2095,7 @@ sync() {
   fi
   sync_repos "$config"
   sync_agent_user "$config"
+  sync_mcp_servers "$config"
   # Runs the checkout's devbox, which the pull above may have just changed.
   if [[ ! -f $FINISHED ]]; then
     say "update: skipped until devbox finish has run"

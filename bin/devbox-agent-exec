@@ -12,6 +12,9 @@
 # Cloud token, when sync saved one, is passed as TF_TOKEN_app_terraform_io.
 #
 #   tk-agent-claude [--account <name>] --cwd <worktree> [--setenv TICKET_X=v]... -- <claude args>
+#
+# --setenv TICKET_MCP=<name>[,<name>] adds --mcp-config for each of the agent's
+# MCP server files (~/.config/tk-agent/mcp/<name>.json, from mcp_servers).
 #   tk-agent-run --cwd <worktree> [--setenv TICKET_X=v]... -- <command> [args]
 #
 # --cwd must be a ticket worktree: a directory <work>/<repo>--<branch> whose
@@ -45,7 +48,7 @@ mode=claude
 [[ ${0##*/} != tk-agent-run ]] || mode=run
 
 account=default cwd=""
-setenv=()
+setenv=() mcp_args=()
 while (($#)); do
   case $1 in
     --account)
@@ -153,6 +156,22 @@ if [[ $mode == claude ]]; then
   [[ $(stat -c %a "$token") == 600 ]] || die "$token must be mode 600"
   env+=(CLAUDE_CODE_OAUTH_TOKEN="$(<"$token")")
   seed_config "$config" "$WORK/$top"
+  # TICKET_MCP=<name>[,<name>...] (a --setenv, so devbox-run's --env reaches it):
+  # the MCP servers the project's policy turns on, each from the agent's own
+  # copy that devbox sync wrote (mcp_servers). One not on this box is skipped
+  # with a note, never a failed start.
+  mcp=""
+  for e in ${setenv[@]+"${setenv[@]}"}; do [[ $e == TICKET_MCP=* ]] && mcp="${e#TICKET_MCP=}"; done
+  IFS=, read -r -a mcp_names <<<"$mcp"
+  for m in ${mcp_names[@]+"${mcp_names[@]}"}; do
+    [[ $m =~ ^[a-z0-9][a-z0-9_-]{0,63}$ ]] || die "TICKET_MCP names an invalid MCP server '$m'"
+    f="$home/.config/tk-agent/mcp/$m.json"
+    if [[ -s $f ]]; then
+      mcp_args+=(--mcp-config "$f")
+    else
+      printf 'tk-agent: MCP server %s is not on this box (devboxes mcp_servers, then devbox sync); starting without it\n' "$m" >&2
+    fi
+  done
 fi
 # A read-only Terraform Cloud token (agent_tfc_token_ref), for private modules.
 tfc_token="$home/.config/tk-agent/tfc-token"
@@ -168,6 +187,7 @@ if command -v mise >/dev/null 2>&1; then
   env -i "${env[@]}" mise trust --yes --quiet -C "$real" </dev/null >/dev/null 2>&1 || true
 fi
 if [[ $mode == claude ]]; then
-  exec env -i "${env[@]}" claude "$@"
+  # Last: --mcp-config takes several values, so a prompt after it would be read as one.
+  exec env -i "${env[@]}" claude "$@" ${mcp_args[@]+"${mcp_args[@]}"}
 fi
 exec env -i "${env[@]}" "$@"

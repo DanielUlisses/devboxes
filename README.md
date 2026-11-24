@@ -793,6 +793,24 @@ sync saves it as `~/.config/tk-agent/tfc-token` (mode 600) and the wrapper
 passes it as `TF_TOKEN_app_terraform_io`. `devbox doctor` says when one is
 saved.
 
+**MCP servers.** A client file's `mcp_servers` lists the MCP servers its
+box's sessions may use (Home Assistant's add-on, a docs server), each with a
+name, a transport and a URL: `url`, or `url_ref` when the URL itself holds a
+secret, plus an optional `token_ref` for a bearer token (see
+`clients/_template.yaml`). Sync reads the references with op and writes one
+Claude `--mcp-config` file per server, mode 600: yours in
+`~/.config/devbox/mcp/<name>.json`, the agent's in its own
+`~/.config/tk-agent/mcp/<name>.json` (not for an entry with `agent: false`).
+Writing them turns nothing on: ticket-skill loads the ones a project's
+policy `mcp` names, in its coordinator (with `--mcp-config`, next to its
+`--strict-mcp-config`) and in its ticket threads (`TICKET_MCP=<names>`, which
+the wrapper turns into `--mcp-config` for the agent's copies). A server not
+on the box is skipped with a note. Nothing pre-approves its tools: a thread
+in bypass-permissions mode may call them, so turn on for a project only the
+servers its tickets should touch. The network is the box's own: a LAN
+server must be reachable from the box (dev-daniel reaches Home Assistant on
+its LAN address).
+
 The wrapper also answers, in the agent's config root, what a new one would
 ask before Herdr's prompt gets through: onboarding, the bypass-permissions
 warning (`skipDangerousModePermissionPrompt`) and the worktree's folder trust.

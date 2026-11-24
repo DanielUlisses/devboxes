@@ -1,0 +1,6 @@
+# expect: mcp_servers[0]: needs exactly one of url and url_ref
+claude_account: example
+mcp_servers:
+  - name: homeassistant
+    url: http://homeassistant.lan:9583/mcp
+    url_ref: op://work/homeassistant-mcp/url

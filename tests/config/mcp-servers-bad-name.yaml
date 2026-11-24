@@ -1,0 +1,5 @@
+# expect: mcp_servers[0].name: must be an MCP server name
+claude_account: example
+mcp_servers:
+  - name: Home Assistant
+    url_ref: op://work/homeassistant-mcp/url

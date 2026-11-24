@@ -248,6 +248,27 @@ skills: []
 # is (none: agents can't fetch private modules). Devbox only. Default: "".
 # agent_tfc_token_ref: op://work/terraform-agent-read-token/credential
 
+# MCP servers for the box's Claude sessions (project coordinators and ticket
+# threads), so a project can use one without anyone adding it by hand. Each
+# has a name, a transport (`type`: http, the default, or sse) and a URL:
+# `url` when it holds no secret, else `url_ref`, an op://<vault>/<item>/<field>
+# reference to the whole URL (Home Assistant's MCP add-on puts its secret in
+# the path). `token_ref`, also op://, adds an `Authorization: Bearer` header.
+# `devbox sync` reads them with op (the box's service account) and writes one
+# file per server, mode 600: ~/.config/devbox/mcp/<name>.json for you and,
+# unless `agent: false`, the agent user's own copy under its
+# ~/.config/tk-agent/mcp/ (agent_user on). A server dropped from the list has
+# its files removed. Writing them loads nothing: a session loads only the
+# servers its project's ticket-skill policy `mcp` names. A failed op read keeps
+# the files as they were. Devbox only. Default: none.
+# mcp_servers:
+#   - name: homeassistant
+#     url_ref: op://work/homeassistant-mcp/url
+#   - name: docs
+#     url: https://docs.example.com/mcp
+#     token_ref: op://work/docs-mcp/token
+#     agent: false
+
 # Repos to clone into ~/work/<repo>: GitHub ones as <owner>/<repo>, Azure
 # DevOps ones as their SSH URL, git@ssh.dev.azure.com:v3/<org>/<project>/<repo>.
 # `devbox finish` and `devbox sync` clone newly listed ones; removed ones are
