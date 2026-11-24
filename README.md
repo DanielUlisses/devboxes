@@ -1593,12 +1593,18 @@ devbox-run stop <name> | forget <name> | attach <name> | list
   `exit_code`, `stopped` by `devbox-run stop`, `lost` when the pane went away
   without an exit, as after a reboot), `last_turn` (`assistant_done` when
   claude waits at its prompt, `working`), `dialog` (`trust`, `permission`,
-  `limit`, read off the pane), `notice`, the transcript, and `git` (branch,
+  `limit`, `hook` for a prompt hook asking first, as cache-tax's "Send it
+  anyway?", read off the pane), `notice`, the transcript, and `git` (branch,
   head, base, ahead/behind, dirty, upstream, pushed). `--pr` adds the pull
   request from `gh` (github.com or the remote's Enterprise host) or `az`,
   cached 60 s.
 - `say` pastes the text as one bracketed paste and presses Enter; it refuses
-  (exit 5) a dead pane or one showing a dialog. `keys` answers a dialog.
+  (exit 5) a dead pane or one showing a dialog. For a claude session it then
+  watches the transcript and the pane for up to 5 s (`SAY_CHECK_S`): a hook
+  that dropped the message ("Prompt dropped by a hook") is exit 6, and a
+  dialog the message raised (a hook asking before the turn) is exit 5, since
+  the message waits on whoever answers it. A message claude queued behind a
+  running turn is taken as said. `keys` answers a dialog.
   `--trust` answers claude's folder-trust dialog for a new worktree by itself
   ("Yes, I trust this folder"), and the "Adding a new directory" one claude
   shows for each `--add-dir` ("Yes, add it"); `status` reports either as
@@ -1611,7 +1617,7 @@ devbox-run stop <name> | forget <name> | attach <name> | list
   `resume --all`, for after a reboot, does every session that isn't running
   and wasn't stopped.
 - Exit codes: 1 failure, 2 usage, 3 no such session, 4 already running (start
-  prints its status anyway), 5 not deliverable.
+  prints its status anyway), 5 not deliverable, 6 dropped by a hook.
 - `--agent [--account <name>]` runs claude as the box's agent user
   (`agent_user: true`, see Ticket agents as their own user) through
   `sudo -n -u <user>-agent /usr/local/libexec/tk-agent-claude --cwd <dir>`,

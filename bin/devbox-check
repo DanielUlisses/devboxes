@@ -295,6 +295,24 @@ check_run() {
     fail "run/say pastes a multi-line message as one" "pane shows" "$("$r" log w1 2>&1)"
   fi
 
+  "$r" say w1 hello 2>/dev/null && code=0 || code=$?
+  expect_code 0 "$code" "run/say reports a message the transcript took (0)"
+
+  mkdir -p "$dir/hooked"
+  "$r" start w5 --dir "$dir/hooked" --env FAKE_HOOK=drop -- "$fake" >/dev/null
+  wait_for w5 "fake claude" || true
+  "$r" say w5 cold one 2>/dev/null && code=0 || code=$?
+  expect_code 6 "$code" "run/say reports a message a hook dropped (6)"
+  "$r" stop w5 >/dev/null 2>&1 || true
+  mkdir -p "$dir/asked"
+  "$r" start w6 --dir "$dir/asked" --env FAKE_HOOK=ask -- "$fake" >/dev/null
+  wait_for w6 "fake claude" || true
+  "$r" say w6 cold two 2>/dev/null && code=0 || code=$?
+  expect_code 5 "$code" "run/say reports a message left at a hook's dialog (5)"
+  "$r" say w6 more 2>/dev/null && code=0 || code=$?
+  expect_code 5 "$code" "run/say refuses to type into a hook's dialog (5)"
+  "$r" stop w6 >/dev/null 2>&1 || true
+
   "$r" start w1 --dir "$dir" -- "$fake" >/dev/null 2>&1 && code=0 || code=$?
   expect_code 4 "$code" "run/start refuses a running name (4)"
 

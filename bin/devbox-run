@@ -41,7 +41,9 @@
 #
 # Exit codes: 1 failure, 2 usage, 3 no such session, 4 already running (start
 # prints its status anyway), 5 not deliverable (say into a dead pane or one
-# showing a dialog).
+# showing a dialog, or a message left waiting at a dialog it raised), 6 a hook
+# dropped the message (claude's "Prompt dropped by a hook", cache-tax's "not
+# sent" among them): it never reached the conversation.
 set -euo pipefail
 
 SELF="$(readlink -f "${BASH_SOURCE[0]}")"
@@ -270,6 +272,9 @@ pane_dialog() {
     *"trust this folder"* | *"Quick safety check"* | *"trust the files"* | *"Do you trust"* | *"Adding a new directory"*) printf trust ;;
     *"Do you want to proceed?"* | *"Do you want to make this edit"* | *"Do you want to create"* | *"Do you want to allow"*) printf permission ;;
     *"usage limit"* | *"limit reached"* | *"Limit reached"*) printf limit ;;
+    # A prompt hook asking before the turn starts (cache-tax on a cold cache):
+    # the message waits on its answer, and typing into it would answer it.
+    *"Send it anyway?"*) printf hook ;;
   esac
 }
 
@@ -741,7 +746,40 @@ cmd_say() {
     text="$*"
   fi
   [[ -n ${text//[[:space:]]/} ]] || die "say: nothing to say"
+  local tr="" before=0
+  if has_hooks "$name"; then
+    tr="$(hook_json "$name" session.json | jq -r '.transcript_path // empty' 2>/dev/null)" || tr=""
+    [[ -f $tr ]] && before="$(wc -l <"$tr")"
+  fi
   paste_text "$name" "$text"
+  [[ -n $tr ]] && said_check "$name" "$tr" "$before"
+  return 0
+}
+
+# Whether what say typed reached the conversation, from the transcript (lines
+# after $3) and the pane, for up to SAY_CHECK_S (default 5) seconds: a user
+# entry is taken; a hook's "Prompt dropped" is exit 6; a dialog the message
+# raised (a hook asking first) is exit 5, since the message waits on whoever
+# answers it. Nothing in that time is taken too: claude queues a message typed
+# while a turn runs and writes it when the turn ends.
+said_check() {
+  local name="$1" tr="$2" before="$3" i new dialog
+  local wait_s="${SAY_CHECK_S:-5}"
+  for ((i = 0; i < wait_s * 4; i++)); do
+    sleep 0.25
+    new="$(tail -n +"$((before + 1))" "$tr" 2>/dev/null | jq -r '
+      if .type == "user" and (.isMeta | not) and (.message.content | type) == "string" then "said"
+      elif .type == "user" and (.isMeta | not) and ([.message.content[]? | select(.type == "text")] | length) > 0 then "said"
+      elif .type == "system" and ((.content // "") | startswith("Prompt dropped by a hook")) then "dropped\t" + .content
+      else empty end' 2>/dev/null | head -n1)" || new=""
+    case $new in
+      said) return 0 ;;
+      dropped*) fail 6 "$name: a hook dropped the message, it never reached the conversation (${new#dropped$'\t'}); its text may still be in the input box" ;;
+    esac
+    dialog="$(pane_dialog "$name")"
+    [[ -z $dialog ]] || fail 5 "$name: the message waits at a $dialog dialog it raised; answer it (devbox-run keys, attach), or it is never sent"
+  done
+  return 0
 }
 
 # Raw tmux keys into the pane (Enter, Down, 1, Escape...): how a caller

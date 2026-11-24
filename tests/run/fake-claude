@@ -7,7 +7,9 @@
 # claude 2.x does, after its SessionStart hook (the order that loses an
 # argument prompt). Then, as claude does for a directory it hasn't been
 # trusted with, an "Adding a new directory" dialog for each --add-dir, cursor
-# on "No, exit" too.
+# on "No, exit" too. With FAKE_HOOK, a message starting "cold" meets a
+# prompt hook like cache-tax: drop writes claude's "Prompt dropped by a hook"
+# entry and no turn; ask shows "Send it anyway?" until a key, then drops it.
 set -uo pipefail
 sid="" settings="" resume="" prompt=""
 adds=()
@@ -88,6 +90,15 @@ while IFS= read -r -N1 c; do
     msg="${buf%?}"
     buf=""
     [[ $msg == exit ]] && exit 7
+    if [[ -n ${FAKE_HOOK:-} && $msg == cold* ]]; then
+      if [[ $FAKE_HOOK == ask ]]; then
+        printf ' cache-tax: the prompt cache went cold. Send it anyway?\n ❯ 1. Send anyway\n   2. Don'"'"'t send\n'
+        IFS= read -r -N1 c
+        printf '\e[2J\e[H'
+      fi
+      jq -nc '{type: "system", subtype: "informational", content: "Prompt dropped by a hook: cache-tax: not sent, nothing paid."}' >>"$tr"
+      continue
+    fi
     turn "$(tr '\r' '\n' <<<"$msg")"
   fi
 done
