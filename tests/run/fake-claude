@@ -1,0 +1,104 @@
+#!/usr/bin/env bash
+# A stand-in for claude, for bin/devbox-check's run section: takes the flags
+# devbox-run passes, runs the runner's hooks from --settings as claude would,
+# writes a transcript, answers each submitted message with "got: <message>"
+# and exits 7 on "exit". With FAKE_TRUST set it first shows claude's
+# folder-trust dialog, cursor on "No, exit" (exits 1 when that is chosen), as
+# claude 2.x does, after its SessionStart hook (the order that loses an
+# argument prompt). Then, as claude does for a directory it hasn't been
+# trusted with, an "Adding a new directory" dialog for each --add-dir, cursor
+# on "No, exit" too. With FAKE_HOOK, a message starting "cold" meets a
+# prompt hook like cache-tax: drop writes claude's "Prompt dropped by a hook"
+# entry and no turn; ask shows "Send it anyway?" until a key, then drops it.
+set -uo pipefail
+sid="" settings="" resume="" prompt=""
+adds=()
+while (($#)); do
+  case $1 in
+    --session-id) sid="$2"; shift 2 ;;
+    --resume) resume="$2"; sid="$2"; shift 2 ;;
+    --settings) settings="$2"; shift 2 ;;
+    --model) shift 2 ;;
+    --add-dir)
+      shift
+      while (($#)) && [[ $1 != -* ]]; do adds+=("$1"); shift; done
+      ;;
+    -*) shift ;;
+    *) prompt="$1"; shift ;;
+  esac
+done
+cfg="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+tr="$cfg/projects/$(pwd | tr -c 'A-Za-z0-9\n' -)/$sid.jsonl"
+mkdir -p "$(dirname "$tr")"
+hook() {
+  [[ -n $settings ]] || return 0
+  local c
+  c="$(jq -r --arg e "$1" '.hooks[$e][0].hooks[0].command' "$settings")"
+  jq -nc --arg s "$sid" --arg t "$tr" '{session_id: $s, transcript_path: $t, source: "startup"}' | bash -c "$c"
+}
+entry() {
+  jq -nc --arg ty "$1" --arg tx "$2" '{type: $ty, message: {role: $ty, content: [{type: "text", text: $tx}]}}' >>"$tr"
+}
+turn() {
+  hook UserPromptSubmit
+  entry user "$1"
+  printf 'got: %s\n' "$1"
+  entry assistant "reply to: $1"
+  hook Stop
+}
+hook SessionStart
+banner() {
+  printf 'fake claude resume=%s FOO=%s CLAUDECODE=%s AGENT=%s TICKET_X=%s\n' "${resume:-no}" "${FOO:-}" "${CLAUDECODE:-unset}" "${AGENT:-no}" "${TICKET_X:-}"
+}
+# Shows a two-choice dialog, question $1 and yes-choice $2, cursor on "No,
+# exit", until Enter: exits 1 on No.
+dialog() {
+  local sel=1 keys="" c
+  draw() {
+    printf '\e[2J\e[H %s\n' "$1"
+    if ((sel == 1)); then printf ' ❯ 1. No, exit\n   2. %s\n' "$2"; else printf '   1. No, exit\n ❯ 2. %s\n' "$2"; fi
+  }
+  draw "$1" "$2"
+  while IFS= read -r -N1 c; do
+    keys+="$c"
+    if [[ $keys == *$'\e[B' ]]; then sel=2; keys=""; draw "$1" "$2"; continue; fi
+    if [[ $keys == *$'\e[A' ]]; then sel=1; keys=""; draw "$1" "$2"; continue; fi
+    if [[ $c == $'\r' || $c == $'\n' ]]; then
+      ((sel == 2)) || exit 1
+      printf '\e[2J\e[H'
+      return 0
+    fi
+  done
+}
+if [[ -n ${FAKE_TRUST:-} ]]; then
+  dialog "Quick safety check: Is this a project you created or one you trust?" "Yes, I trust this folder"
+  # Like claude: an argument prompt is gone after the dialog.
+  prompt=""
+  for a in "${adds[@]}"; do
+    dialog "Adding a new directory: $a. Claude Code will be able to read files in it." "Yes, add it"
+  done
+fi
+banner
+[[ -n $prompt ]] && turn "$prompt"
+printf '\e[?2004h'
+buf="" inpaste=0
+while IFS= read -r -N1 c; do
+  buf+="$c"
+  if [[ $buf == *$'\e[200~' ]]; then buf="${buf%$'\e[200~'}"; inpaste=1; continue; fi
+  if [[ $buf == *$'\e[201~' ]]; then buf="${buf%$'\e[201~'}"; inpaste=0; continue; fi
+  if [[ ($c == $'\r' || $c == $'\n') && $inpaste == 0 ]]; then
+    msg="${buf%?}"
+    buf=""
+    [[ $msg == exit ]] && exit 7
+    if [[ -n ${FAKE_HOOK:-} && $msg == cold* ]]; then
+      if [[ $FAKE_HOOK == ask ]]; then
+        printf ' cache-tax: the prompt cache went cold. Send it anyway?\n ❯ 1. Send anyway\n   2. Don'"'"'t send\n'
+        IFS= read -r -N1 c
+        printf '\e[2J\e[H'
+      fi
+      jq -nc '{type: "system", subtype: "informational", content: "Prompt dropped by a hook: cache-tax: not sent, nothing paid."}' >>"$tr"
+      continue
+    fi
+    turn "$(tr '\r' '\n' <<<"$msg")"
+  fi
+done

@@ -19,6 +19,7 @@ bin/devbox-host        this machine's side of the boxes: ssh config entries, her
 bin/devbox             runs inside a box: `devbox bootstrap`, `sync`, `login`, `finish`, `update`, `upgrade`, `maintenance`, `logout`, `rc`
 bin/devbox-agent-instructions  prints a box's agent instructions (~/.claude/CLAUDE.md, ~/AGENTS.md) from a resolved config
 bin/devbox-browser     $BROWSER in a box: prints URLs instead of opening them
+bin/devbox-run         the runner: detached Claude Code sessions in tmux (start, status, log, say, resume)
 bin/devbox-runner-dispatch  a runner box's dispatcher: one just-in-time Actions runner per queued job
 bin/devbox-runner-job  what a job's sandbox runs: its own /etc, dockerd and copy of the runner
 bin/devbox-runner-hook  a deploy box's job-started hook: fails any job but a trusted deploy
@@ -1556,3 +1557,79 @@ keys or email addresses, except `git_email`, the address commits are made
 with. `claude_account` is a label, not the account's email. `devbox-config`
 rejects any other value that looks like an email address (an Azure DevOps
 SSH URL, `git@ssh.dev.azure.com:...`, is not one).
+
+## The runner
+
+`devbox-run` (linked to `/usr/local/bin/devbox-run` by `devbox sync`) runs
+commands, Claude Code sessions mostly, detached in tmux on a box, as the box
+user and so on the box's own Claude account. It is the thin layer the on-box
+coordinator and the tk daemon drive threads through, in place of Herdr: it
+keeps no ticket state, and reports facts as JSON for others to derive state
+from. It has its own tmux server (socket `devbox-run`), started in a systemd
+user scope of its own so a restart of the service that called it doesn't take
+the sessions down, and keeps one directory per session in
+`~/.local/state/devbox-run/<name>/`.
+
+```
+devbox-run start <name> --dir <path> [--env K=V]... [--prompt <text> | --prompt-file <f>] [--trust] [--agent [--account <a>]] -- claude [args...]
+devbox-run start <name> --repo <path> [--branch <b>] [--base <b>] ... -- claude [args...]
+devbox-run status [<name>...] [--pr]        JSON: {"schema": 1, "sessions": [...]}
+devbox-run log <name> [--lines N] [--transcript]
+devbox-run say <name> [--force] <text>|-
+devbox-run keys <name> <tmux key>...
+devbox-run resume <name> [--note <text>] | resume --all
+devbox-run stop <name> | forget <name> | attach <name> | list
+```
+
+- `--repo` makes the worktree (`<repo>/../.worktrees/<repo>-<name>`, branch
+  `<name>` from origin's default branch unless `--branch`/`--base` say
+  otherwise; an existing branch or worktree is reused).
+- The prompt goes in `--prompt`/`--prompt-file`, not in the command, so a
+  resume doesn't send it again. A claude command gets `--session-id <uuid>`
+  (unless it names one) and `--settings` with the runner's hooks, which write
+  the current session id and transcript (following `/clear`), whether a turn
+  is under way and claude's last notification into the session's directory.
+- `status` reports per session: `alive`, `state` (`running`, `exited` with its
+  `exit_code`, `stopped` by `devbox-run stop`, `lost` when the pane went away
+  without an exit, as after a reboot), `last_turn` (`assistant_done` when
+  claude waits at its prompt, `working`), `dialog` (`trust`, `permission`,
+  `limit`, `hook` for a prompt hook asking first, as cache-tax's "Send it
+  anyway?", read off the pane), `notice`, the transcript, and `git` (branch,
+  head, base, ahead/behind, dirty, upstream, pushed). `--pr` adds the pull
+  request from `gh` (github.com or the remote's Enterprise host) or `az`,
+  cached 60 s.
+- `say` pastes the text as one bracketed paste and presses Enter; it refuses
+  (exit 5) a dead pane or one showing a dialog. For a claude session it then
+  watches the transcript and the pane for up to 5 s (`SAY_CHECK_S`): a hook
+  that dropped the message ("Prompt dropped by a hook") is exit 6, and a
+  dialog the message raised (a hook asking before the turn) is exit 5, since
+  the message waits on whoever answers it. A message claude queued behind a
+  running turn is taken as said. `keys` answers a dialog.
+  `--trust` answers claude's folder-trust dialog for a new worktree by itself
+  ("Yes, I trust this folder"), and the "Adding a new directory" one claude
+  shows for each `--add-dir` ("Yes, add it"); `status` reports either as
+  `dialog: trust`. A claude session's prompt is typed in once
+  claude is ready, after any dialog, never passed as an argument (claude drops
+  one when the trust dialog comes first); `status` shows `prompt_pending`
+  until then, and `say` waits for it.
+- `resume` runs `claude --resume <session id>` in the same directory with the
+  same environment (the original command again when there is no transcript);
+  `resume --all`, for after a reboot, does every session that isn't running
+  and wasn't stopped.
+- Exit codes: 1 failure, 2 usage, 3 no such session, 4 already running (start
+  prints its status anyway), 5 not deliverable, 6 dropped by a hook.
+- `--agent [--account <name>]` runs claude as the box's agent user
+  (`agent_user: true`, see Ticket agents as their own user) through
+  `sudo -n -u <user>-agent /usr/local/libexec/tk-agent-claude --cwd <dir>`,
+  in a worktree the caller prepared for it (`$WORK/<repo>--<branch>`, group
+  `tkwork`: ticket-skill's `agent_prepare_worktree`). Only `TICKET_*` `--env`
+  values reach it, as `--setenv`. The hooks and their `--settings` then live
+  in the shared state directory, `/var/lib/tk-agent/<user>/devbox-run/<name>/`,
+  made by the box user and group-writable file by file; the transcript is the
+  agent's, which the box user reads through the ACL sync sets. Without
+  `--agent`, sessions run as the box user whatever `agent_user` says.
+- At boot, the box user's `devbox-run-resume.service` (installed and enabled
+  by `devbox update`, never started by it) runs `devbox-run resume --all`.
+
+`bin/devbox-check`'s `run` section drives it against `tests/run/fake-claude`
+(and `tests/run/fake-agent-wrapper` for `--agent`).

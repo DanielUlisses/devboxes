@@ -32,7 +32,7 @@ export LC_ALL=C # one collation for sort and comm
 # Installed by bootstrap, and by sync when missing; sync never removes them.
 # tree-sitter-cli builds nvim-treesitter's parsers (LazyVim otherwise fetches
 # it through mason on nvim's first start, racing the parser installs).
-BASE_PACKAGES=(base-devel git openssh sudo acl inotify-tools stow jq go-yq unzip less mise github-cli tailscale bash-completion starship zoxide neovim tree-sitter-cli ripgrep fd docker docker-buildx docker-compose)
+BASE_PACKAGES=(base-devel git openssh sudo acl inotify-tools stow jq go-yq unzip less mise github-cli tailscale bash-completion starship zoxide neovim tree-sitter-cli ripgrep fd docker docker-buildx docker-compose tmux)
 
 # A runner box's base packages instead: no developer tooling, but what a job
 # finds on PATH (git, ssh, curl, jq, gh, docker; op comes from mise) and
@@ -259,6 +259,9 @@ TELEGRAF_UNIT_FILE=$USER_HOME/.config/systemd/user/$TELEGRAF_UNIT
 # waiting for the first herdr command: before, that was the next devbox sync.
 HERDR_UNIT=devbox-herdr.service
 HERDR_UNIT_FILE=$USER_HOME/.config/systemd/user/$HERDR_UNIT
+# Resumes the runner's sessions at boot (devbox-run resume --all).
+RUN_RESUME_UNIT=devbox-run-resume.service
+RUN_RESUME_UNIT_FILE=$USER_HOME/.config/systemd/user/$RUN_RESUME_UNIT
 TELEGRAF_PORT=8094
 
 usage() {
@@ -1997,6 +2000,7 @@ sync() {
     return
   fi
   sync_tools "$config"
+  run_link
   # Before the repos, so a failed clone doesn't hold back an identity change.
   if [[ -f $FINISHED ]]; then
     git_identity "$config"
@@ -2011,6 +2015,16 @@ sync() {
     die "synced, but some update steps failed (above)"
   fi
   say "synced"
+}
+
+# The runner (bin/devbox-run) on every devbox's PATH, for the box user, the
+# tk daemon and the coordinator alike. It uses tmux (a base package) and
+# nothing else of Herdr's.
+run_link() {
+  if [[ $(readlink /usr/local/bin/devbox-run 2>/dev/null) != "$ROOT/bin/devbox-run" ]]; then
+    ln -sfn "$ROOT/bin/devbox-run" /usr/local/bin/devbox-run
+    say "devbox-run: /usr/local/bin/devbox-run -> $ROOT/bin/devbox-run"
+  fi
 }
 
 gh_logged_in() {
@@ -2619,11 +2633,15 @@ finish() {
     install_listed_plugin "$repo" "$id" </dev/null
   done < <(jq -r '(.plugins // [])[] | "\(.marketplace) \(.plugin)"' <<<"$config")
   say "plugins: all installed"
-  isolated herdr_server "$config"
+  isolated old_loop_only "$config" herdr-server herdr_server "$config"
   ((STATUS == 0)) || say "herdr-server: failed; rerun devbox update"
-  herdr_plugins
-  say "herdr: plugins installed"
-  isolated install_ovis "$config"
+  isolated run_resume_unit "$config"
+  ((STATUS == 0)) || say "devbox-run: failed; rerun devbox update"
+  if [[ $(box_loop "$config") != short ]]; then
+    herdr_plugins
+    say "herdr: plugins installed"
+  fi
+  isolated old_loop_only "$config" ovis install_ovis "$config"
   ((STATUS == 0)) || say "ovis: failed; rerun devbox update"
   install_agy || true
   install_cursor_agent || true
@@ -2671,22 +2689,51 @@ run_step() {
 # itself. Nothing at all without tk_hub.
 install_tk_hub() {
   local config="$1" url ip ref repo=UlissesTech/ticket-board
-  local dest="$SKILL_REPOS/ticket-board" head want="" have=""
+  local dest="$SKILL_REPOS/ticket-board" head want="" have="" loop flags=() name="tk daemon"
   IFS=$'\t' read -r url ip ref < <(jq -r '(.tk_hub // empty) | [.url, .ip, .token_ref] | @tsv' <<<"$config") || true
   [[ -n ${url:-} ]] || return 0
+  loop="$(box_loop "$config")"
+  if [[ $loop == short ]]; then
+    flags=(--slim)
+    name="slim tk daemon (tk-slim)"
+  fi
   fetch_skill_repo "$repo"
+  if [[ $loop == short ]] && ! grep -q -- '--slim)' "$dest/install.sh"; then
+    die "tk-hub: loop is short, but ticket-board's install.sh in ${dest/#$USER_HOME/\~} has no --slim yet (its main predates the rollout)"
+  fi
   head="$(git -C "$dest" rev-parse HEAD)"
-  want="$head $url $ip $ref"
+  want="$head $url $ip $ref $loop"
   local stamp="$dest/.git/devbox-tk-daemon"
   [[ ! -f $stamp ]] || have="$(<"$stamp")"
   [[ $have != "$want" ]] || return 0
-  bash "$dest/install.sh" daemon --url "$url" --ip "$ip" --token-ref "$ref" >/dev/null
+  bash "$dest/install.sh" daemon "${flags[@]}" --url "$url" --ip "$ip" --token-ref "$ref" >/dev/null
   printf '%s\n' "$want" >"$stamp"
   if [[ -z $have ]]; then
-    changed "tk-hub: installed the tk daemon"
+    changed "tk-hub: installed the $name"
+  elif [[ ${have##* } != "$loop" ]]; then
+    changed "tk-hub: the $name is this box's daemon now (loop: $loop)"
   else
-    changed "tk-hub: updated the tk daemon (${head:0:7})"
+    changed "tk-hub: updated the $name (${head:0:7})"
   fi
+}
+
+# The client's `loop`: old (Herdr, tk-daemon and ticket-skill's board session)
+# or short (ticket-skill's short loop: devbox-run, tk-slim, no Herdr).
+box_loop() {
+  jq -r '.loop // "old"' <<<"$1"
+}
+
+# Runs "$@" unless the box is on the short loop, which leaves Herdr and Ovis
+# as they are: not installed, updated or started (an old agent still finishing
+# in Herdr keeps running; removing Herdr comes with the old loop's retirement).
+old_loop_only() {
+  local config="$1" name="$2"
+  shift 2
+  if [[ $(box_loop "$config") == short ]]; then
+    say "$name: skipped (loop: short)"
+    return 0
+  fi
+  "$@"
 }
 
 # The box policy's remote_control and remote_control_tickets, both false: Remote
@@ -2888,6 +2935,42 @@ WantedBy=default.target"
   if ! user_systemctl is-active -q "$HERDR_UNIT" && ! herdr workspace list >/dev/null 2>&1; then
     user_systemctl start "$HERDR_UNIT"
     changed "herdr-server: started"
+  fi
+}
+
+# At boot, brings back the runner's sessions a reboot ended: RUN_RESUME_UNIT
+# runs `devbox-run resume --all` once (every session neither running nor
+# stopped by hand), with linger so it runs without a login. The tmux server
+# it starts lives in a scope of its own, not in this unit. Enabled, never
+# started here: an update must not resume what someone left ended. Runs as
+# the box user.
+run_resume_unit() {
+  local config="$1" unit
+  [[ $(jq -r .role <<<"$config") == devbox ]] || return 0
+  if [[ ! -d /run/systemd/system ]]; then
+    say "devbox-run: no systemd, sessions won't resume at boot"
+    return 0
+  fi
+  unit="[Unit]
+Description=devbox-run: resume the runner's sessions after a boot
+After=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+Environment=PATH=%h/.local/bin:%h/.local/share/mise/shims:/usr/local/bin:/usr/bin
+WorkingDirectory=%h
+ExecStart=/usr/local/bin/devbox-run resume --all
+
+[Install]
+WantedBy=default.target"
+  ! write_if_changed "$RUN_RESUME_UNIT_FILE" "$unit" 644 || changed "devbox-run: wrote ${RUN_RESUME_UNIT_FILE/#$USER_HOME/\~}"
+  [[ $(loginctl show-user "$USER_NAME" -p Linger --value 2>/dev/null) == yes ]] ||
+    sudo loginctl enable-linger "$USER_NAME"
+  user_systemctl daemon-reload
+  if ! user_systemctl is-enabled -q "$RUN_RESUME_UNIT" 2>/dev/null; then
+    user_systemctl enable -q "$RUN_RESUME_UNIT"
+    changed "devbox-run: sessions resume at boot"
   fi
 }
 
@@ -3237,9 +3320,10 @@ update() {
   run_step skills-catalog install_skills_catalog "$config"
   run_step plugins install_new_plugins "$config"
   run_step plugin-versions update_plugins
-  run_step herdr-server herdr_server "$config"
-  run_step herdr herdr_plugins
-  run_step ovis install_ovis "$config"
+  run_step herdr-server old_loop_only "$config" herdr-server herdr_server "$config"
+  run_step devbox-run run_resume_unit "$config"
+  run_step herdr old_loop_only "$config" herdr herdr_plugins
+  run_step ovis old_loop_only "$config" ovis install_ovis "$config"
   if [[ -n $no_upgrade ]]; then
     say "pacman: skipped (--no-pacman-upgrade)"
   else
