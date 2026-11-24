@@ -880,9 +880,18 @@ pr_json() {
          url: "\(.repository.webUrl)/pullrequest/\(.pullRequestId)",
          state: ({active: "open", completed: "merged", abandoned: "closed"}[.status] // .status),
          draft: (.isDraft // false),
+         mergeable: ({succeeded: "MERGEABLE", conflicts: "CONFLICTING"}[.mergeStatus // ""] // "UNKNOWN"),
          review: ([.reviewers[]?.vote] as $v
            | if any($v[]; . < 0) then "CHANGES_REQUESTED"
              elif any($v[]; . >= 5) then "APPROVED" else null end)} end' <<<"$out")"
+      # An open PR's checks are its build and status policies' evaluations (not reviewer rules).
+      local id pol
+      id="$(jq -r 'if . != null and .state == "open" then .number else empty end' <<<"$out")"
+      if [[ -n $id ]] && pol="$(cd -- "$dir" && timeout 30 az repos pr policy list --detect true --id "$id" -o json 2>/dev/null)"; then
+        out="$(jq -c --argjson p "$pol" '.checks = [$p[]? | select(.status != "notApplicable" and (.configuration.type.displayName | IN("Build", "Status")))
+          | {n: (.configuration.settings.displayName // .configuration.type.displayName // "policy"),
+             s: ({approved: "ok", running: "pending", queued: "pending"}[.status] // "bad")}]' <<<"$out")"
+      fi
     else
       out="$(jq -cn --arg e "${out:0:300}" '{error: $e}')"
     fi
@@ -892,9 +901,15 @@ pr_json() {
     local -a ghenv=()
     [[ $host == github.com ]] || ghenv=(GH_HOST="$host")
     if out="$(cd -- "$dir" && env "${ghenv[@]}" timeout 30 gh pr view "$branch" \
-      --json number,url,state,isDraft,reviewDecision 2>&1)"; then
+      --json number,url,state,isDraft,reviewDecision,mergeable,statusCheckRollup 2>&1)"; then
+      # checks: each check run or commit status, {n: name, s: ok|pending|bad}.
       out="$(jq -c '{number, url, state: (.state | ascii_downcase), draft: .isDraft,
-        review: (.reviewDecision | if . == "" then null else . end)}' <<<"$out")"
+        mergeable: (.mergeable // "UNKNOWN"),
+        review: (.reviewDecision | if . == "" then null else . end),
+        checks: [.statusCheckRollup[]? | {n: (.name // .context // "check"),
+          s: (if .__typename == "StatusContext" then ({SUCCESS: "ok", PENDING: "pending", EXPECTED: "pending"}[.state] // "bad")
+              elif .status != "COMPLETED" then "pending"
+              elif (.conclusion | IN("SUCCESS", "NEUTRAL", "SKIPPED")) then "ok" else "bad" end)}]}' <<<"$out")"
     elif [[ $out == *"no pull requests found"* ]]; then
       out=null
     else
