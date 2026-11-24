@@ -1926,9 +1926,10 @@ STATE=$AGENT_STATE"
   agent_acl_service
 
   # The agent's git: it trusts the box user's repos (git refuses another
-  # user's otherwise). The box user never trusts the agent's.
-  runuser -u "$AGENT_USER" -- env HOME="$home" git config --global --replace-all safe.directory '*'
-  runuser -u "$AGENT_USER" -- env HOME="$home" git config --global core.hooksPath /dev/null
+  # user's otherwise). The box user never trusts the agent's. From its home:
+  # sync runs from /root, which the agent can't read, and git stops there.
+  runuser -u "$AGENT_USER" -- env -C "$home" HOME="$home" git config --global --replace-all safe.directory '*'
+  runuser -u "$AGENT_USER" -- env -C "$home" HOME="$home" git config --global core.hooksPath /dev/null
 
   # Its own Claude Code and mise tools (the box user's, by config).
   if [[ ! -x $home/.local/bin/claude ]]; then
