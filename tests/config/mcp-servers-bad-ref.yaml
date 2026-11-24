@@ -1,0 +1,5 @@
+# expect: mcp_servers[0].url_ref: must be an op://<vault>/<item>/<field> reference
+claude_account: example
+mcp_servers:
+  - name: homeassistant
+    url_ref: http://homeassistant.lan:9583/secret-path

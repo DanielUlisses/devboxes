@@ -1,0 +1,10 @@
+# expect: ok
+claude_account: example
+mcp_servers:
+  - name: homeassistant
+    url_ref: op://work/homeassistant-mcp/url
+  - name: docs
+    type: sse
+    url: https://docs.example.com/mcp
+    token_ref: op://work/docs-mcp/token
+    agent: false

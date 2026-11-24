@@ -1,0 +1,8 @@
+# expect: mcp_servers: allowed only when role is devbox
+role: runner
+runners:
+  org: example-org
+  labels: [homelab]
+mcp_servers:
+  - name: homeassistant
+    url_ref: op://work/homeassistant-mcp/url
