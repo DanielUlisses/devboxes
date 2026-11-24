@@ -1,0 +1,6 @@
+# expect: loop: allowed only when role is devbox
+role: runner
+runners:
+  org: example-org
+  labels: [homelab]
+loop: short
