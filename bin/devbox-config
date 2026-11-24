@@ -375,12 +375,13 @@ def strip_nulls: if type == "object" then with_entries(select(.value != null) | 
 | ($d * $c)
 | .hostname //= "dev-\($name)"
 | .skills = (reduce (($d.skills // []) + ($c.skills // []))[] as $s ([]; if IN(.[]; $s) then . else . + [$s] end))
-| {hostname, host, role, claude_account, git_name, git_email, resources, packages, tools, skills, repos, plugins, timezone, backup, backup_schedule, backup_keep, runners, tk_hub, metrics, remote_control, remote_control_tickets, skills_catalog, agent_user, agent_token_ref, agent_tfc_token_ref, ovis, ovis_owner, ovis_token_ref}
+| {hostname, host, role, claude_account, git_name, git_email, resources, packages, tools, skills, repos, plugins, timezone, backup, backup_schedule, backup_keep, runners, tk_hub, metrics, remote_control, remote_control_tickets, loop, skills_catalog, agent_user, agent_token_ref, agent_tfc_token_ref, ovis, ovis_owner, ovis_token_ref}
 | if .role == "runner" then . else del(.runners) end
 | if .role == "devbox" then .remote_control = false | .remote_control_tickets = false
   else del(.remote_control, .remote_control_tickets) end
 | if .role == "devbox" then .ovis //= true | .ovis_owner //= "" | .ovis_token_ref //= "" else del(.ovis, .ovis_owner, .ovis_token_ref) end
 | if .role == "devbox" then .skills_catalog //= false else del(.skills_catalog) end
+| if .role == "devbox" then .loop //= "old" else del(.loop) end
 | if .role == "devbox" then (if .agent_user == null then .agent_user = true else . end) | .agent_token_ref //= "" | .agent_tfc_token_ref //= "" else del(.agent_user, .agent_token_ref, .agent_tfc_token_ref) end
 | if .role == "devbox" and .tk_hub != null then . else del(.tk_hub) end
 | if .role == "devbox" and .metrics != null then . else del(.metrics) end
