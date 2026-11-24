@@ -187,6 +187,7 @@ if command -v mise >/dev/null 2>&1; then
   env -i "${env[@]}" mise trust --yes --quiet -C "$real" </dev/null >/dev/null 2>&1 || true
 fi
 if [[ $mode == claude ]]; then
-  exec env -i "${env[@]}" claude ${mcp_args[@]+"${mcp_args[@]}"} "$@"
+  # Last: --mcp-config takes several values, so a prompt after it would be read as one.
+  exec env -i "${env[@]}" claude "$@" ${mcp_args[@]+"${mcp_args[@]}"}
 fi
 exec env -i "${env[@]}" "$@"
