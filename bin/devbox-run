@@ -242,19 +242,22 @@ has_arg() {
 # can't run this script, which lives in the box user's home). They print
 # nothing (SessionStart and UserPromptSubmit output would reach the model) and
 # never fail the session. They write in place: the agent may rewrite these
-# files but not make new ones.
+# files but not make new ones. The statusLine command records the model and
+# the plan's rate limits claude hands it (status.json), and shows them as the
+# pane's status line: the only place claude says either.
 hook_settings() {
-  local h="$1" ev c
+  local h="$1" ev c sl
   local -A cmds=(
     [SessionStart]="jq -c '{session_id, transcript_path, source, at: (now | todate)}' > $(printf %q "$h/session.json")"
     [UserPromptSubmit]="cat >/dev/null; jq -nc '{turn: \"working\", at: (now | todate)}' > $(printf %q "$h/turn.json"); : > $(printf %q "$h/notice.json")"
     [Stop]="cat >/dev/null; jq -nc '{turn: \"done\", at: (now | todate)}' > $(printf %q "$h/turn.json")"
     [Notification]="jq -c '{message: (.message // \"\"), at: (now | todate)}' > $(printf %q "$h/notice.json")"
   )
+  sl="in=\$(cat); printf '%s' \"\$in\" | jq -c '{model: (.model // null), rate_limits: (.rate_limits // null), at: (now | todate)}' > $(printf %q "$h/status.json") 2>/dev/null; printf '%s' \"\$in\" | jq -r '[.model.display_name // \"claude\"] + ([[\"5h\", .rate_limits.five_hour.used_percentage], [\"wk\", .rate_limits.seven_day.used_percentage]] | map(select(.[1] != null) | \"\\(.[0]) \\(.[1] | floor)%\")) | join(\" · \")' 2>/dev/null || echo claude"
   for ev in "${!cmds[@]}"; do
     c="{ ${cmds[$ev]}; } >/dev/null 2>&1 || true"
     jq -n --arg ev "$ev" --arg c "$c" '{($ev): [{hooks: [{type: "command", command: $c, timeout: 10}]}]}'
-  done | jq -s '{hooks: add}'
+  done | jq -s --arg c "$sl" '{hooks: add, statusLine: {type: "command", command: $c}}'
 }
 
 # Its input without the trailing blank rows of a screen.
@@ -350,7 +353,7 @@ reset_hook_files() {
   local name="$1" h group="" f
   h="$(hdir "$name")"
   group="$(meta "$name" | jq -r '.agent.group // empty')"
-  for f in session.json turn.json notice.json; do
+  for f in session.json turn.json notice.json status.json; do
     : >"$h/$f"
     if [[ -n $group ]]; then chgrp "$group" "$h/$f" && chmod 660 "$h/$f"; else chmod 600 "$h/$f"; fi
   done
@@ -941,6 +944,7 @@ session_json() {
     --arg last_turn "$last_turn" --argjson git "$git" --argjson pr "$pr" --arg with_pr "$with_pr" \
     --argjson exit "$(cat "$d/exit.json" 2>/dev/null || echo '{}')" \
     --argjson notice "$(hook_json "$name" notice.json)" --arg dialog "$dialog" --arg sid "$sid" \
+    --argjson sl "$(hook_json "$name" status.json)" \
     --argjson run "$(jq -Rs 'split("\u0000")[:-1]' "$d/cmd.run" 2>/dev/null || echo null)" \
     --argjson pending "$([[ -f $d/pending ]] && echo true || echo false)" \
     '{name, alive: $alive,
@@ -954,7 +958,10 @@ session_json() {
       session_id: ($sid | if . == "" then null else . end), transcript: ($tr | if . == "" then null else . end), transcript_at: ($tr_at | if . == "" then null else . end),
       prompt_pending: $pending,
       last_turn: ($last_turn | if . == "" then null else . end), dialog: ($dialog | if . == "" then null else . end),
-      notice: $notice, git: $git}
+      notice: $notice,
+      model: ($sl.model // null | if type == "object" and (.id | type) == "string" then {id, name: (.display_name // null)} else null end),
+      rate_limits: ($sl.rate_limits // null | if type == "object" then . else null end),
+      status_at: ($sl.at // null), git: $git}
      | with_entries(.value //= null)
      | .alive = $alive | .prompt_pending = $pending
      | if $with_pr != "" then .pr = $pr else . end' <<<"$m"

@@ -282,6 +282,8 @@ check_run() {
     fail "run/start passes --env, drops CLAUDECODE" "pane shows" "$("$r" log w1 2>&1)"
   fi
 
+  expect_status w1 '[.model.id, .model.name, .rate_limits.seven_day.used_percentage] | join(" ")' "claude-fake-1 Fake 1 72" "run/status reports the model and rate limits the status line recorded"
+
   printf 'line one\nline two' | "$r" say w1 - 2>&1
   local i turn=""
   for ((i = 0; i < 30; i++)); do
