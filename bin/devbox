@@ -3240,25 +3240,39 @@ install_new_plugins() {
   ((failed == 0))
 }
 
-# User-scope plugins, "<id> <version>" sorted by id.
+# User-scope plugins from a marketplace, "<id> <version>" sorted by id.
+# Claude Code's own bundled plugins (<name>@builtin) list in user scope too,
+# with version "unknown", but no marketplace has them: `claude plugin update`
+# answers "not found" and exits 1, so they are left out.
 plugin_versions() {
-  claude plugin list --json | jq -r '.[] | select(.scope == "user") | "\(.id) \(.version // "?")"' | sort
+  claude plugin list --json |
+    jq -r '.[] | select(.scope == "user" and (.id | endswith("@builtin") | not)) | "\(.id) \(.version // "?")"' | sort
 }
 
 # Refreshes the marketplaces, then `claude plugin update`s every plugin
-# installed in user scope.
+# installed in user scope. A plugin that fails to update has its output shown
+# and doesn't stop the others; the step fails at the end.
 update_plugins() {
-  local before id version old
-  claude plugin marketplace update >/dev/null
+  local before id version old out failed=0
+  if ! out="$(claude plugin marketplace update 2>&1 </dev/null)"; then
+    printf '%s\n' "$out" >&2
+    return 1
+  fi
   before="$(plugin_versions)"
   # With no plugins, <<< still feeds one empty line, and `claude plugin update ""` fails.
   while read -r id _; do
-    [[ -z $id ]] || claude plugin update "$id" >/dev/null </dev/null
+    [[ -n $id ]] || continue
+    if ! out="$(claude plugin update "$id" 2>&1 </dev/null)"; then
+      printf '%s\n' "$out" >&2
+      say "plugin-versions: $id failed"
+      failed=1
+    fi
   done <<<"$before"
   while read -r id version; do
     old="$(awk -v id="$id" '$1 == id { print $2 }' <<<"$before")"
     [[ $old == "$version" ]] || changed "plugin-versions: updated $id (${old:-none} -> $version)"
   done < <(plugin_versions)
+  ((failed == 0))
 }
 
 # pacman -Syu: Arch upgrades the whole system together, base packages with it.
