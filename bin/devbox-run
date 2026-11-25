@@ -596,7 +596,8 @@ cmd_start() {
     claude=true
     sid="$(claude_sid "${cmd[@]:1}")"
     if [[ -z $sid ]] && ! has_arg --continue "${cmd[@]:1}" && ! has_arg -c "${cmd[@]:1}"; then
-      sid="$(cat /proc/sys/kernel/random/uuid)"
+      # No /proc on macOS (a client's machine running an offline board).
+      sid="$(cat /proc/sys/kernel/random/uuid 2>/dev/null || uuidgen | tr '[:upper:]' '[:lower:]')"
       cmd=("${cmd[0]}" --session-id "$sid" "${cmd[@]:1}")
     fi
     if has_arg --settings "${cmd[@]:1}"; then

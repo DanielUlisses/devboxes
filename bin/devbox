@@ -259,6 +259,9 @@ TELEGRAF_UNIT_FILE=$USER_HOME/.config/systemd/user/$TELEGRAF_UNIT
 # waiting for the first herdr command: before, that was the next devbox sync.
 HERDR_UNIT=devbox-herdr.service
 HERDR_UNIT_FILE=$USER_HOME/.config/systemd/user/$HERDR_UNIT
+# Pulls the config's bridge repos every minute (see sync_bridges).
+BRIDGE_UNIT=devbox-bridge-pull
+BRIDGE_UNIT_DIR=$USER_HOME/.config/systemd/user
 # Resumes the runner's sessions at boot (devbox-run resume --all).
 RUN_RESUME_UNIT=devbox-run-resume.service
 RUN_RESUME_UNIT_FILE=$USER_HOME/.config/systemd/user/$RUN_RESUME_UNIT
@@ -2725,6 +2728,8 @@ finish() {
   ((STATUS == 0)) || say "herdr-server: failed; rerun devbox update"
   isolated run_resume_unit "$config"
   ((STATUS == 0)) || say "devbox-run: failed; rerun devbox update"
+  isolated sync_bridges "$config"
+  ((STATUS == 0)) || say "bridges: failed; rerun devbox update"
   if [[ $(box_loop "$config") != short ]]; then
     herdr_plugins
     say "herdr: plugins installed"
@@ -3059,6 +3064,84 @@ WantedBy=default.target"
   if ! user_systemctl is-enabled -q "$RUN_RESUME_UNIT" 2>/dev/null; then
     user_systemctl enable -q "$RUN_RESUME_UNIT"
     changed "devbox-run: sessions resume at boot"
+  fi
+}
+
+# bridges: boards another machine runs, which this box only shows (a client's
+# machine tk-hub can't reach pushes its ticket files to a bridge repo;
+# ticket-skill docs/agents/bridge.md). Each listed repo is cloned into
+# ~/work/<as> when missing, and one timer of the box user pulls them all every
+# minute, fast-forward only: nothing here writes to a bridge clone, so a pull
+# that can't fast-forward means someone did, and it fails until that is undone.
+# With none listed the timer is stopped and removed; clones are left in place.
+# From finish or update, as the box user.
+sync_bridges() {
+  local config="$1" repo as dest execs="" n=0 service timer wrote=false
+  [[ $(jq -r .role <<<"$config") == devbox ]] || return 0
+  while IFS=$'\t' read -r repo as; do
+    dest="$WORK/$as"
+    n=$((n + 1))
+    if [[ ! -e $dest ]]; then
+      if ! gh auth status -h github.com &>/dev/null; then
+        say "bridges: skipped $repo, gh is not logged in (devbox login, then devbox finish)"
+        continue
+      fi
+      mkdir -p "$WORK"
+      gh repo clone "$repo" "$dest" -- -q
+      changed "bridges: cloned $repo into ${dest/#$USER_HOME/\~}"
+    elif [[ $(origin_repo "$dest") != "${repo,,}" ]]; then
+      say "bridges: not pulling $repo: ${dest/#$USER_HOME/\~} holds $(origin_repo "$dest" || echo "something else")"
+      continue
+    fi
+    # "-": one bridge that fails doesn't keep the others from pulling.
+    execs+="ExecStart=-/usr/bin/git -C %h/work/$as pull --ff-only --quiet"$'\n'
+  done < <(jq -r '(.bridges // [])[] | [.repo, .as] | @tsv' <<<"$config")
+  if [[ ! -d /run/systemd/system ]]; then
+    ((n == 0)) || say "bridges: no systemd, no pull timer"
+    return 0
+  fi
+  if [[ -z $execs ]]; then
+    if [[ -f $BRIDGE_UNIT_DIR/$BRIDGE_UNIT.timer ]]; then
+      user_systemctl disable -q --now "$BRIDGE_UNIT.timer" 2>/dev/null || true
+      rm -f "$BRIDGE_UNIT_DIR/$BRIDGE_UNIT.timer" "$BRIDGE_UNIT_DIR/$BRIDGE_UNIT.service"
+      user_systemctl daemon-reload
+      changed "bridges: removed $BRIDGE_UNIT.timer (no bridge to pull)"
+    fi
+    return 0
+  fi
+  service="[Unit]
+Description=devbox: pull the bridge repos
+After=network-online.target
+
+[Service]
+Type=oneshot
+Nice=19
+Environment=PATH=%h/.local/bin:%h/.local/share/mise/shims:/usr/local/bin:/usr/bin
+Environment=GIT_TERMINAL_PROMPT=0
+TimeoutStartSec=120
+${execs%$'\n'}"
+  timer="[Unit]
+Description=devbox: pull the bridge repos every minute
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=1min
+AccuracySec=10s
+
+[Install]
+WantedBy=timers.target"
+  ! write_if_changed "$BRIDGE_UNIT_DIR/$BRIDGE_UNIT.service" "$service" 644 || wrote=true
+  ! write_if_changed "$BRIDGE_UNIT_DIR/$BRIDGE_UNIT.timer" "$timer" 644 || wrote=true
+  [[ $(loginctl show-user "$USER_NAME" -p Linger --value 2>/dev/null) == yes ]] ||
+    sudo loginctl enable-linger "$USER_NAME"
+  if $wrote; then
+    user_systemctl daemon-reload
+    changed "bridges: wrote $BRIDGE_UNIT.service and .timer ($n bridge(s))"
+  fi
+  if ! user_systemctl is-enabled -q "$BRIDGE_UNIT.timer" 2>/dev/null ||
+    ! user_systemctl is-active -q "$BRIDGE_UNIT.timer"; then
+    user_systemctl enable -q --now "$BRIDGE_UNIT.timer"
+    changed "bridges: enabled $BRIDGE_UNIT.timer (every minute)"
   fi
 }
 
@@ -3424,6 +3507,7 @@ update() {
   run_step plugin-versions update_plugins
   run_step herdr-server old_loop_only "$config" herdr-server herdr_server "$config"
   run_step devbox-run run_resume_unit "$config"
+  run_step bridges sync_bridges "$config"
   run_step herdr old_loop_only "$config" herdr herdr_plugins
   run_step ovis old_loop_only "$config" ovis install_ovis "$config"
   if [[ -n $no_upgrade ]]; then

@@ -811,6 +811,18 @@ servers its tickets should touch. The network is the box's own: a LAN
 server must be reachable from the box (dev-daniel reaches Home Assistant on
 its LAN address).
 
+**Bridges.** A client file's `bridges` lists the bridge repos of boards
+another machine runs: a client's machine tk-hub can't reach works its
+tickets with its own coordinator and pushes only the ticket files to a
+private repo (ticket-skill's `docs/agents/bridge.md`). Each entry is
+`{repo: <owner>/<repo>, as: <folder>}` (`as` defaults to the repo's name);
+sync clones it into `~/work/<as>` and one user timer,
+`devbox-bridge-pull.timer`, pulls them all every minute, fast-forward only.
+The box never writes there: ticket-skill reads such a board (its
+`.scratch/<board>/offline` file names the machine that runs it) as its
+ticket files say and refuses to act on it, and tk-hub shows it the same way.
+Removing the entry stops the timer and leaves the clone.
+
 The wrapper also answers, in the agent's config root, what a new one would
 ask before Herdr's prompt gets through: onboarding, the bypass-permissions
 warning (`skipDangerousModePermissionPrompt`) and the worktree's folder trust.
