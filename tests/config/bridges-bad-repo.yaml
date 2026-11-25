@@ -1,0 +1,4 @@
+# expect: bridges[0].repo: must be a GitHub <owner>/<repo>
+claude_account: example
+bridges:
+  - repo: example-bridge

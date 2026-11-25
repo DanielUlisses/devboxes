@@ -1,0 +1,6 @@
+# expect: bridges: clones into example-repo more than once
+claude_account: example
+bridges:
+  - repo: example-org/example-bridge
+    as: example-repo
+  - repo: example-org/example-repo

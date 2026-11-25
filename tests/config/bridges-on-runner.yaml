@@ -1,0 +1,7 @@
+# expect: bridges: allowed only when role is devbox
+role: runner
+runners:
+  org: example-org
+  labels: [homelab]
+bridges:
+  - repo: example-org/example-bridge

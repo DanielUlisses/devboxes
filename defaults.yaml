@@ -116,6 +116,10 @@ agent_tfc_token_ref: ""
 # clients/_template.yaml).
 mcp_servers: []
 
+# Bridge repos, pulled every minute for the hub daemon to read: none by
+# default (see clients/_template.yaml).
+bridges: []
+
 repos: []
 
 # Proxmox backup job for the box (vzdump, snapshot mode, zstd), to the

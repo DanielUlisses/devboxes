@@ -1,0 +1,5 @@
+# expect: bridges[0].
+claude_account: example
+bridges:
+  - repo: example-org/example-bridge
+    branch: main

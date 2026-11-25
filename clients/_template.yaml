@@ -269,6 +269,19 @@ skills: []
 #     token_ref: op://work/docs-mcp/token
 #     agent: false
 
+# Bridge repos: boards another machine runs and this box only shows. A box
+# tk-hub can't reach (a client's machine that only calls out) pushes its
+# boards' ticket files to a small private GitHub repo (ticket-skill
+# docs/agents/bridge.md); listed here, that repo is cloned into ~/work/<as>
+# (default: the repo's name; name it after the working repo the tickets are
+# for) by `devbox finish`, `sync` and `update`, and pulled every minute by the
+# box user's devbox-bridge-pull timer (fast-forward only: nothing on this box
+# writes there), so the box's hub daemon reports its boards. Removing an entry
+# stops its pulls and leaves the clone in place. Devbox only. Default: none.
+# bridges:
+#   - repo: example-org/example-bridge
+#     as: example-repo
+
 # Repos to clone into ~/work/<repo>: GitHub ones as <owner>/<repo>, Azure
 # DevOps ones as their SSH URL, git@ssh.dev.azure.com:v3/<org>/<project>/<repo>.
 # `devbox finish` and `devbox sync` clone newly listed ones; removed ones are
